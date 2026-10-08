@@ -20,7 +20,7 @@ class PlatformShellBridge {
   }
 
   static const MethodChannel _channel = MethodChannel(
-    'io.github.georgexie2333.usque/engine',
+    'com.usque.dfathu/engine',
   );
 
   final AppController _controller;

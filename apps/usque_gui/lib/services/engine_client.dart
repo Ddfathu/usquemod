@@ -234,7 +234,7 @@ abstract interface class ChainProfileClient {
 }
 
 Future<List<ChainConfigurationFile>> pickChainConfigurationFiles() async {
-  const channel = MethodChannel('io.github.georgexie2333.usque/engine');
+  const channel = MethodChannel('com.usque.dfathu/engine');
   List<Object?>? files;
   try {
     files = await channel.invokeListMethod<Object?>('readChainConfigurations');
@@ -442,10 +442,10 @@ class MethodChannelEngineClient
             const {},
       );
   static const MethodChannel _channel = MethodChannel(
-    'io.github.georgexie2333.usque/engine',
+    'com.usque.dfathu/engine',
   );
   static const EventChannel _events = EventChannel(
-    'io.github.georgexie2333.usque/engine_events',
+    'com.usque.dfathu/engine_events',
   );
 
   static EngineSnapshot _snapshotFromMap(Map<Object?, Object?>? value) {

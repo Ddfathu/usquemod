@@ -21,7 +21,7 @@ class WindowFrame extends ChangeNotifier {
   static final WindowFrame instance = WindowFrame._();
 
   static const MethodChannel _channel = MethodChannel(
-    'io.github.georgexie2333.usque/window_frame',
+    'com.usque.dfathu/window_frame',
   );
 
   bool _enabled = false;

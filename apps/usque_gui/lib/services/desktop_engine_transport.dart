@@ -10,7 +10,7 @@ import 'control_codec.dart';
 import 'engine_client.dart';
 
 const String _pipePrefix =
-    r'\\.\pipe\io.github.georgexie2333.usque.engine.v1-ui-';
+    r'\\.\pipe\com.usque.dfathu.engine.v1-ui-';
 const Duration _windowsEngineReadyTimeout = Duration(seconds: 30);
 const int _maximumStartupStderrBytes = 4096;
 
@@ -86,10 +86,10 @@ class DesktopEngineTransport {
        _endpoint = 'test-endpoint';
 
   static const MethodChannel _nativeTransport = MethodChannel(
-    'io.github.georgexie2333.usque/engine',
+    'com.usque.dfathu/engine',
   );
   static const EventChannel _nativeEvents = EventChannel(
-    'io.github.georgexie2333.usque/engine_events',
+    'com.usque.dfathu/engine_events',
   );
 
   final Future<Uint8List> Function(Uint8List request)? _testExchange;

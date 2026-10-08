@@ -1,0 +1,434 @@
+# Reliability test environments
+
+Usque separates deterministic pull-request evidence from destructive or
+network-observer release evidence. Missing infrastructure is never converted
+to a pass, and protected-runner availability does not gate publication.
+
+## Pull-request gate
+
+The normal CI workflow runs locked Rust tests and Clippy, protobuf wire
+fixtures, the diagnostic runner and fault-injection tests, Android JVM tests,
+Flutter analysis, controller tests, responsive widget tests, and diagnostic
+bundle privacy tests. It also runs the performance-v2 parser, JSON-schema
+contract, fixture reproduction, budget-boundary arithmetic, and deterministic
+microbenchmark correctness tests. Shared-runner wall-clock timings are never
+treated as performance truth. These jobs do not require a public endpoint and
+do not change host routes, DNS, firewall, proxy, or TUN state.
+
+## Windows Geo DNS and orphaned TUN regression coverage
+
+Windows physical DNS discovery uses `GetAdaptersAddresses` for effective
+per-interface servers, including DHCP. `GetInterfaceDnsSettings` remains a
+separate static-configuration snapshot for rollback; DHCP values must not be
+persisted as static DNS. Bounded native-buffer fixtures cover IPv4/IPv6,
+missing interfaces, malformed pointers/lengths, cycles and duplicate LUIDs.
+
+Recovery uses journal schema v5, reads v2/v3/v4 conservatively, and retains the
+operation/owner/generation guards. Device ownership and connection receipts
+are recorded in the same atomically replaced protected journal. Legacy versions
+cannot claim the new automatic endpoint policy or WFP metadata receipts. The
+automatic policy validates exact leased targets; it never installs prefix
+permissions. Recovery closes dynamic leases before removing journal-owned WFP
+metadata. The adapter GUID is the RequestedGUID passed to pinned Wintun 0.14.1;
+its exact `SWD\Wintun\{GUID}` device-instance identity is checked using SetupAPI,
+including non-present devices. Recovery does not call `WintunOpenAdapter` as
+an existence probe. A registry-read failure is no longer convertible into
+device absence. Both PnP and IP Helper must confirm absence before adapter
+cleanup succeeds; lingering rows remain pending, and query/identity failures
+retain recovery evidence.
+
+Schema v4 introduced automatic-endpoint and WFP-metadata receipts. Schema v5
+adds a write-ahead protected-replacement record outside ordinary connection
+cleanup steps. Legacy journals migrate without inventing either kind of new
+receipt; a pre-v5 journal containing a replacement record is rejected.
+Older Agents cannot read schema v5. The Agent protocol stays at version 3,
+with an explicit `protected_tunnel_replacement` capability. See the
+[protected replacement contract](NETWORK_SETTINGS.md#protected-windows-operation-replacement).
+
+A released LUID can identify another VPN's adapter. DNS/address/MTU rollback
+therefore receives the original adapter identity and never writes through an
+unverified retired LUID. Default-route receipts are handled individually:
+physical exclusions still require explicit cleanup, and a route still present
+on a reused tunnel LUID remains a conflict rather than being deleted. Adapter
+removal cannot supersede route, WFP, proxy or persistence failures.
+
+Engine startup failures retain both the original typed error and any rollback
+error. A compound failure uses the existing recovery error channel with no
+transport fallback. New startup log fields and displayed compound summaries
+contain allowlisted stage/error codes only, not remote messages, credentials,
+adapter identifiers or network addresses. The Agent's existing sanitized
+step/API/Win32 recovery diagnostics remain available locally. No automatic
+diagnostic upload is added.
+
+Run Windows deterministic tests with the pinned build helper in
+`CONTRIBUTING.md`; the existing Windows x64-v2 Build job also runs these tests.
+The Ubuntu Rust CI job does not execute `cfg(windows)` tests.
+These fixtures are not lifecycle or leak evidence. In a snapshot VM, cover
+DHCP/static DNS, Geo off/CN, Kill Switch and system proxy, reattachment,
+reboot/full shutdown/Fast Startup, abrupt termination and a second VPN reusing
+a freed LUID. Verify first connection, rollback and old phase-7 journals; use
+the independent observer for leak claims. Those isolated scenarios are
+`not_run` for this workstation change. They remain supplemental, not a new
+publication prerequisite.
+
+## Windows bootstrap egress and Kill Switch ordering
+
+The Prepared phase has no WFP provider or sublayer. It authorizes only the
+planned MASQUE TCP/UDP endpoints and TCP registration API endpoints; physical
+interface binding, exact network-generation checks and authenticated pipe
+ownership still apply. Those same endpoints have persistent Engine-scoped
+permits at commit, so bootstrap socket leases remain valid across activation
+without creating dynamic filters. Other direct targets are rejected before
+commit and require a dynamic permit while the active Kill Switch is enabled.
+
+Deterministic Windows tests cover the shared bootstrap/committed allowlist,
+IPv4/IPv6 and port/protocol restrictions, pre-commit rejection, active permit
+failure propagation, invalid phases and sanitized egress error codes/stages.
+They do not call native WFP mutation APIs. No journal schema, protobuf field,
+terminal block rule or dynamic-session cleanup contract changes.
+
+In a snapshot VM with an independent management channel, additionally validate
+clean-state cold connections with Kill Switch on/off, H2/H3 and IPv4/IPv6;
+registration pin refresh; held endpoint sockets across commit; and startup
+failure followed by rollback and retry. Use the independent network observer
+to verify post-commit direct traffic, permit revocation and no unexpected
+physical packets. Missing protected infrastructure means `not_run`, not a pass.
+
+## Windows Wintun device and connection lifetimes
+
+The first TUN connection lazily creates one Agent-managed device. Its name and
+RequestedGUID come from a device ID, independent of the account Profile. The
+Agent retains the creator handle while the application holds its device lease.
+An idle device is normal, not pending cleanup. Ordinary disconnect, account or
+settings replacement, and VPN Gate node changes do not call
+`WintunCloseAdapter` or wait for interface-table disappearance. Each replacement
+still ends its packet session and restores that connection's address, DNS,
+route, WFP, dynamic-egress and proxy receipts before another session starts.
+For protected HTTP/SOCKS operation replacement, a separate journaled WFP guard
+bridges that restoration and the successor's commit, including when the saved
+Kill Switch is off. Unconfirmed cleanup retains protection and blocks reuse;
+an explicit user disconnect follows the authenticated abort path. The guard
+preserves only validated direct exceptions and never authorizes a WARP-only
+fallback. Deterministic replacement and abort fixtures do not prove native WFP
+restoration or absence of traffic leaks; those require the isolated environments.
+Hot Gate transitions retain their existing guard and refresh final configuration.
+
+Schema v3 separates the managed device (creating, idle, in use, retiring or
+recovery required; an absent record means absent) from each connection
+transaction. A transaction binds a device ID and generation. Creation, binding
+and retirement intents are saved before native work; failed idle or final saves
+bar reuse. A v2 adapter remains a legacy transaction receipt until recovered.
+An idle record from an earlier Agent process is never proof of a live creator
+handle. Existing Active reattachment still validates exact resources and owner.
+
+Protocol version 3 adds the `reusable_tun_device` capability, independent
+Acquire/ReleaseDeviceLease requests, lease ID/generation and expected journal
+generation in Prepare, and typed device status. Engine owns the long-lived
+device pipe in its application service, outside each VPN runtime. Other users
+and simultaneous owners cannot take over it. Stale replies, lease EOF and
+30-second orphan timers cannot retire a newer lease. Engine without prior TUN
+use creates no idle device. New TUN setup requires a matching Agent capability;
+diagnostics remain compatible with old Agents without that capability.
+
+On complete application exit, Engine finishes connection cleanup and explicitly
+releases the device lease. Final retirement retains the exact interface AND
+PnP absence check. One bounded retirement attempt may leave only a device
+record; after that record is durably saved, Agent can stop normally. This
+exception cannot bypass network cleanup or failed persistence, and performs
+no terminal-state sampling or recovery-budget restart. Startup retires the old
+device before permitting a new creation. Native deletion delays can still
+affect an immediate application restart; device reuse does not prove those
+delays are fixed. A native worker owns its resources until completion or process
+exit; a timeout never authorizes another native owner in that process.
+An Engine crash or broken lease retains the 30-second reattachment grace.
+If a retirement journal write fails with an I/O error, the existing service
+supervisor retries the outstanding write every five seconds until it succeeds
+or the service stops. It retains the native retirement result, so a completed
+or timed-out deletion is never started again by a persistence retry. A failed
+intent write must succeed before the single native attempt can start. These
+retries do not consume or refresh the connection recovery budget; reuse and
+idle exit remain blocked until the required record is durable.
+An unused service with no device, clients or recovery jobs keeps its 10-second
+idle-exit grace; an application-held idle device outlives it.
+
+Cold reconfiguration stops MASQUE, proxy and GEO producers as well as the
+Windows packet consumers before platform rollback. Hot TUN detach retains its
+separate platform-only stop path. Agent packet drains check shutdown after
+bounded batches even when the input ring never becomes empty. Authenticated
+rollback revokes dynamic egress only after packet-session quiescence and before
+removing persistent WFP resources; failed quiescence retains protection.
+
+Engine packet shutdown owns and joins the actual blocking notification task.
+The five-second join threshold records `PACKET_PUMPS_JOIN_PENDING` and retains
+unfinished work; it does not authorize a new packet session or claim that the
+worker exited. Cancelling a foreground connection wait leaves the background
+cleanup handle owned by the service, so later Connect/Retry requests still
+wait for the same cleanup.
+
+Wintun removal first observes the exact journaled interface and PnP identity.
+Both must be absent before cleanup succeeds. Closing a handle gets a two-second
+observation grace; an exact-device removal request then has a ten-second total
+observation window per pass. Successful requests are retained per adapter GUID
+in the running Agent, so later automatic passes observe rather than repeatedly
+issuing DIF_REMOVE. These are observation bounds, not a claim that Windows
+native calls can be forcibly cancelled. Inspection errors remain unknown,
+never absence. A request error followed by verified absence is idempotent
+success. A fresh Agent may safely retry the exact journaled device.
+
+Connect and Retry share a live Agent recovery preflight on connections that
+need the Agent. This includes the first connection after an Engine restart;
+it does not depend on a cached Engine error. Waiting/Running are observed,
+Blocked remains an explicit error, and an explicit request can restart an
+Exhausted recovery once. Background reconnection and monitoring cannot refresh
+the three-attempt budget. Cancellation invalidates the connection intent even
+when the Agent still needs to finish cleanup. VPN Gate hot retry retains its
+existing underlay and bypasses this cold-connection preflight.
+
+An authenticated restart first rechecks the operation, generation, caller and
+absence of live sessions. If
+the adapter is the only unfinished step and both resources are now absent,
+it completes only the journal save. No remaining route, DNS, WFP or proxy
+receipt may be skipped; a failed save retains RecoveryRequired.
+
+The Agent writes bounded, non-authoritative `recovery-events-v1.jsonl` beside
+its protected journal (at most 1 MiB). It records step results, durations,
+allowlisted API names, numeric errors and optional device/interface observations,
+not raw messages, receipts, addresses or identities. Logging failure never
+prevents cleanup. True uninstall removes the two allowlisted recovery evidence
+files (`recovery-events-v1.jsonl` and `recovery-trace-v1.jsonl`) only after
+the authoritative journal is clean. Engine logs mirror allowlisted adapter
+failure details, while the UI shows localized cleanup context without raw data.
+
+`InspectPlatformState` optionally includes `recovery_diagnostics` at field 18;
+the Agent protocol remains version 3. A current observation has its own sample
+time, journal generation, separate interface/PnP presence and typed identity/API
+results. History contains up to the latest 32 valid events with their original
+timestamps, generations, step durations and outcomes. A missing, corrupt,
+oversized or unreadable event file has an explicit status. Unknown JSON fields
+are discarded, and enum values are validated before reserialization.
+
+Sampling uses IP Helper, SetupAPI and read-only `CM_Get_DevNode_Status`. Interface
+operational/admin/media states and devnode status/problem codes supplement the
+presence results. `CONFIGRET` errors have a separate field from Win32 errors;
+neither can be interpreted as resource absence. A single
+blocking worker owns the sampling permit until native calls actually finish,
+including after the caller times out. Agent inspection is bounded below two
+seconds and the Engine waits at most two seconds. Busy, timeout, unavailable,
+missing receipt and generation change never mean absence; a generation change
+discards the sample's presence results. Neither inspection nor exporting opens
+Wintun, starts the Agent service, or performs recovery.
+
+Windows diagnostic exports include `windows-recovery.json` (schema version 2).
+Current observations, historical events, automatic recovery and typed device
+state are separate. Version 2 removes the trace and cached-evidence sections. An older Agent still permits export with `extension_unavailable`.
+Both sides reconstruct allowlisted fields with bounded history; the export
+excludes journal contents, arbitrary error text, adapter names/GUIDs/LUIDs,
+SIDs, addresses and credentials. Existing diagnostic result evidence shows
+sample status/time/generation and bounded event counts. These observations are
+non-authoritative and do not weaken the two-resource cleanup success check.
+
+Legacy protobuf trace fields remain deprecated with their occupied numbers.
+Current code does not produce/export native logger callbacks, reference-count
+or function-boundary traces, periodic exhausted-state samples, an Engine
+evidence recorder/cache, or a final shutdown capture. Only fixed-name legacy
+file deletion remains in uninstall/local-data clearing; source cleanup never
+deletes user diagnostic archives or the live recovery journal.
+
+Deterministic tests exercise at least 100 disconnect/reconnect cycles with one
+device creation, one session end per cycle, and one final close. Additional
+fixtures cover idle reuse, profile and Gate changes, independent proxy cleanup,
+bounded recovery, actual packet-thread joins, stale/parallel ownership,
+cancelled and late requests, v2/v3 persistence, failed writes, unknown identity,
+device-only deferred exit, and diagnostic compatibility/privacy. The two tests
+that load Wintun are ignored by default and require an isolated snapshot VM;
+function-pointer/backend fixtures are not native lifecycle evidence.
+
+In a snapshot VM with an independent management channel, additionally validate
+long-lived traffic followed by immediate reconnect, full queues at disconnect,
+process exit, sleep/resume, rapid reopen and another Wintun VPN. Use the network
+observer for leak claims. Workstation native scenarios are `not_run`; these
+supplemental checks are not a publication prerequisite.
+
+## Protected release runners
+
+Windows same-version MSI coverage includes compile-only, inert authoring
+fixtures for x64 and ARM64. `tool/test_windows_msi_replacement.ps1` verifies a
+valid fixture and rejects copies with an unscoped/weakened overwrite mode,
+missing UI/execute or late execute action, unsafe action condition, repair opt-in,
+NeverOverwrite component, or payload outside INSTALLFOLDER. It edits only
+temporary MSI databases and never installs them or runs their custom actions.
+
+Real same-version upgrade acceptance additionally needs the snapshot VM and
+independent management channel: install candidate A, then candidate B with the
+same SemVer but changed GUI/Agent/Engine bytes and signing identity. Compare
+the SHA-256 of every installed payload file with B, confirm the service signer
+pin matches B, and verify only B remains registered. Repeat with quiet install,
+an incoming `REINSTALLMODE=omus`, an intentionally modified unversioned Engine,
+connected maintenance shutdown, and injected installation/recovery failure.
+Rollback must restore A's matching files and registration; profiles and secrets
+must survive. These scenarios are `not_run` without isolated infrastructure.
+
+After the exact signed candidate has been staged, the release workflow selects
+four explicitly labelled self-hosted runners only in a private repository and
+when repository variable `RUN_PROTECTED_RELEASE_VALIDATION` is exactly `true`.
+The public repository always skips these jobs, including the evidence summary;
+enabling the variable alone cannot start them. Record this as `not_run`, not a
+pass. Publication does not wait for these supplemental jobs:
+
+| Runner label | Required isolation | Scope |
+| --- | --- | --- |
+| `usque-snapshot-vm` | Windows snapshot VM with an independent management channel | Clean install, upgrade, connected uninstall, Engine/Agent termination, sleep/network change, route/DNS/WFP/proxy restoration, Wintun residual checks |
+| `usque-android-device` | Dedicated physical Android device controlled by ADB | Wi-Fi/cellular changes, airplane mode, Doze, lock/unlock, UI/VPN process reclamation, Always-on, Lockdown, reboot, upgrade, TV background/foreground |
+| `usque-network-observer` | Controlled gateway outside the Engine process | H3/H2 endpoint behavior, separate IPv4/IPv6 assertions, DNS/Kill Switch/route/direct-rule packet observation |
+| `usque-performance-lab` | Stable host, endpoint, topology, load and thermal policy | Seven raw baseline and candidate samples for H2 high-BDP, H3 batch I/O and allocations, queue pressure, PMTU convergence, QUIC migration and encrypted DNS |
+
+Each runner supplies a protected `usque-reliability-runner` executable. The
+repository workflow passes it the exact candidate directory, commit and output
+directory. The workflow always sets `USQUE_ISOLATED_SNAPSHOT_VM=1` for the
+Windows command as the protected runner's own interlock. That variable is not
+evidence of isolation; isolation comes only from the snapshot VM and its
+independent management channel. Do not provision these runner labels or set
+that variable on a developer workstation.
+
+## Reliability report contract
+
+Every runner produces `report.json` with:
+
+- schema version, exact commit and SHA-256 of `release-manifest.json`;
+- an allowlisted environment class without a device identifier, SSID or user
+  path;
+- one result per required gate with `passed`, `failed`, `not_run` or
+  `unstable`. `unstable` is produced by the performance evaluator when baseline
+  or candidate samples exceed the stability budget, so no comparison is made;
+  like `failed` and `not_run`, it is never accepted as a pass;
+- JUnit, connection-timeline and platform-diff evidence references. Every
+  reference contains a relative `path` and SHA-256, and the file must be a
+  non-empty regular file below that runner class's evidence namespace;
+- for independent leak gates, an external-observer marker, a zero-unexpected-
+  packets assertion and a restricted PCAP path.
+
+Each report is downloaded under its fixed artifact name and is accepted only
+for the matching protected runner class: Windows, Android, independent network
+observer, or performance lab. Evidence paths must start with the same
+environment kind (for example `windows_snapshot_vm/`) and are resolved below a
+separate restricted evidence root; traversal, symlinks, missing files, digest
+mismatches, empty files, and oversized files fail closed.
+
+`tool/reliability_gate.py` rejects unknown gates, wrong environments,
+duplicates, missing or forged evidence, candidate digest mismatches, `failed`,
+`unstable`, and `not_run`. It emits the validated `reliability-report.json` and
+`device-matrix.md` only when all required gates pass. The release workflow keeps
+that validated summary in the private execution context; missing or failed
+optional runs produce no summary and do not block publication. Actions artifacts
+inherit repository read access: a `restricted` name, runner label, environment
+approval, or short retention period does not make a public artifact private.
+PCAPs, raw lab evidence, reports, and performance samples must remain in a
+private repository or another store with equivalent access controls. They are
+never copied into the public diagnostic bundle or GitHub release. Running
+supplemental validation for a public release requires a separately configured
+private execution context bound to the exact signed candidate. Any future
+public summary export must rebuild an allowlisted, sanitized summary inside
+that context; the public workflow does not currently import such summaries.
+
+The performance-lab report replaces the old
+`performance.informational_baseline` result with these required results:
+
+- `performance.h2_high_bdp`
+- `performance.h3_batch_io`
+- `performance.h3_allocation_rate`
+- `performance.queue_pressure`
+- `performance.pmtu_convergence`
+- `performance.quic_migration`
+- `performance.direct_dns`
+
+There is no compatibility alias: the legacy result is rejected as an unknown
+gate, including if marked passed. Historical PR-00 baseline documentation is
+not an active gate definition. The final [acceptance matrix](network-quality-acceptance.md)
+records ordinary checks separately from unavailable protected measurements.
+
+Each result binds five artifacts: JUnit, timeline, platform diff, a v3
+comparison report, and its raw-sample bundle. The reliability aggregator checks
+both artifact SHA-256 values, verifies the hashes of the embedded baseline and
+candidate reports, and recomputes the comparison from the checked-in scenario
+and budget contracts. A runner-authored summary cannot substitute for raw
+evidence.
+
+## Instance-local fault injection
+
+`usque-transport` extends its existing `FaultScript` (256 events) with H2
+PING/capacity, batch partial/unsupported/truncated/WouldBlock, pool exhaustion,
+CID/candidate setup/validation, EMSGSIZE/PMTU, DoH TLS/HTTP/body, DoT prefix/EOF
+and DNS-pool cancellation points. Each due event is consumed once at the real
+component boundary. Scripts are per telemetry/runtime instance, not global;
+capacity-delay injection is at most ten seconds and partial counts are 1–64.
+Unit tests may inject scripts; explicit `fault-injection` lab builds must
+retain debug assertions. Non-test release builds reject that feature at
+compile time. There is no Profile, environment, IPC or remote fault interface.
+Synthetic faults verify cleanup/state logic, not external packet observations
+or performance targets. The seven v2 gates still require actual lab samples.
+
+## Performance samples v2 and evidence bundles v3
+
+`tool/schemas/performance_report.schema.json` is the wire contract. A measured
+baseline or candidate report contains exactly seven ordered raw samples. Units
+are part of field names (`goodput_bps`, `latency_p95_us`, `cpu_time_ms`, and
+`rss_peak_bytes`); unknown or unit-substituted fields fail closed. Environment
+data is limited to an allowlisted network-profile ID, stable thermal and battery
+policies, and numeric tool versions. Hostname, username, SSID, IP address, and
+device-serial fields are forbidden. A report that could not be measured has
+status `not_run`, an allowlisted reason code, and no samples; it is never a
+pass.
+
+Baseline and candidate must use the same scenario, platform class, network
+profile, and major runner/Rust toolchain. `tool/performance_gate.py` calculates
+the median, minimum, maximum, and median absolute deviation (MAD) over the seven
+runs. Latency is the median of the seven per-run p95 values. Throughput
+MAD/median above 10% or latency MAD/median above 15% yields `unstable`, never a
+best-run selection.
+
+`tool/performance_budget.json` records the numeric contract. Steady-state
+limits are inclusive: throughput at least 95% of baseline, median p95 latency at
+most 110%, CPU per bit at most 105%, and RSS at most 110% with no more than a
+32 MiB absolute increase. The scenario-specific checks additionally require
+zero reference queue drops, no more than 0.5 UDP syscalls per datagram,
+allocation and feature-acceptance limits, PMTU stability within 30 seconds with
+no send-error spin or silent truncation, same-family migration p95 within one
+second and fallback within eight seconds, and encrypted-DNS success of at least
+99% with zero physical port-53 or plaintext-fallback observations.
+
+The protected job requires repository variable
+`PERFORMANCE_ACCEPTED_BASELINE_COMMIT` to contain a full lowercase commit. It
+runs both baseline and candidate seven times for every entry in
+`tool/performance_scenarios.json`, then the repository evaluator creates the
+bound reliability report. The evaluator independently receives the accepted
+baseline through required `--baseline-commit`; every raw baseline/candidate
+identity must match that value and the staged candidate. The evidence validator
+also binds every raw report's identities to its comparison and release candidate,
+not only to matching file digests.
+
+H2 high-BDP has two mandatory scenario entries, not two interchangeable profiles:
+the single-flow `h2-high-bdp` scenario uses network profile `h2-bdp-100ms`, and
+the four-flow `h2-high-bdp-four-flow` scenario uses `h2-bdp-500ms`. The
+repository treats these profile IDs as opaque allowlisted identifiers. It does
+not define or record their link rate, RTT or workload direction. Baseline and
+candidate reports must name the same profile. Each scenario requires its own
+seven-sample baseline and candidate file. There are sixteen input files across
+eight scenarios but still seven stable gate IDs. `performance.h2_high_bdp`
+passes only if both scenario comparisons pass;
+a missing, failed, unstable, or not-run scenario cannot be represented by the other.
+
+Version-3 evidence bundles contain `baseline_reports` and `candidate_reports`
+arrays covering every required scenario exactly once, plus corresponding array
+digests in the comparison. The validator recomputes the complete grouped gate.
+Raw measurement reports remain schema v2; obsolete singular-report evidence
+bundles cannot prove complete coverage under the new contract.
+
+Missing baseline configuration, a malformed report,
+six or eight samples, instability, a budget failure, or `not_run` makes that
+supplemental job fail. As with the other protected runners, absence or failure
+is not publication success but does not become a publication prerequisite.
+
+The final public release includes the signed packages, per-package SPDX SBOMs,
+`release-manifest.json`, and `SHA256SUMS`. Package checksums are calculated after
+signing and against the same immutable candidate offered to any enabled
+protected runners.

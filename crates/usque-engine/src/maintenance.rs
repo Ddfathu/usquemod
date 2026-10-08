@@ -1,0 +1,1431 @@
+use std::{
+    fs::{self, File},
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use crate::logging::{self, LogHealthSnapshot, log_directory, project_public_log};
+
+use chrono::Utc;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
+use thiserror::Error;
+use tokio::sync::Mutex;
+use usque_core::{
+    AppConfig, ConnectionSnapshot, DiagnosticSession, TransportFailure,
+    update::{UpdateChecker, UpdateError, UpdateInfo},
+};
+use usque_transport::{ConnectionEventType, ConnectionTimelineSnapshot};
+
+const MAX_DIAGNOSTIC_LOG_BYTES: usize = 2 * 1024 * 1024;
+const MAX_DIAGNOSTIC_LOG_RECORD_BYTES: usize = 256 * 1024;
+
+#[derive(Default, Serialize)]
+struct LogExportMetadata {
+    source_status: &'static str,
+    byte_limit: usize,
+    source_bytes_available: u64,
+    source_bytes_read: usize,
+    exported_bytes: usize,
+    files_available: usize,
+    files_read: usize,
+    unreadable_files: usize,
+    records_exported: usize,
+    invalid_records: usize,
+    partial_records: usize,
+    oversized_records: usize,
+    rejected_records: usize,
+    truncated: bool,
+    omission_reasons: Vec<&'static str>,
+    capture_status: &'static str,
+    writer_health: Option<LogHealthSnapshot>,
+}
+
+struct CollectedLogs {
+    bytes: Vec<u8>,
+    metadata: LogExportMetadata,
+}
+
+#[derive(Default)]
+pub struct DiagnosticTransportContext {
+    pub timeline: ConnectionTimelineSnapshot,
+    pub network_quality: Option<usque_transport::NetworkQualitySnapshot>,
+    pub socket_receive: Option<usque_transport::SocketReceiveQuality>,
+    pub platform_state: Option<usque_ipc::agent_v1::PlatformState>,
+    pub capture: Option<crate::connection_evidence::CaptureMetadata>,
+}
+
+pub struct Maintenance {
+    update_checker: UpdateChecker,
+    legacy_update_state_path: PathBuf,
+    log_directory: PathBuf,
+    flag_cache_directory: PathBuf,
+    config_backup_path: PathBuf,
+    update_lock: Mutex<()>,
+}
+
+impl Maintenance {
+    pub fn new(config_path: &Path) -> Self {
+        let parent = config_path.parent().unwrap_or_else(|| Path::new("."));
+        let legacy_update_state_path = parent.join("update-state-v1.json");
+        let _ = remove_file_if_present(&legacy_update_state_path);
+        Self {
+            update_checker: UpdateChecker::new()
+                .expect("the static GitHub update client configuration must be valid"),
+            legacy_update_state_path,
+            log_directory: log_directory(config_path),
+            flag_cache_directory: parent.join("cache").join("flag-icons-7.5.0"),
+            config_backup_path: config_path.with_extension("json.bak"),
+            update_lock: Mutex::new(()),
+        }
+    }
+
+    pub async fn check_update(
+        &self,
+        manual: bool,
+        enabled: bool,
+    ) -> Result<UpdateInfo, MaintenanceError> {
+        if !manual && !enabled {
+            return Ok(UpdateInfo::current());
+        }
+        let _guard = self.update_lock.lock().await;
+        // Older releases cached automatic checks for 24 hours. A launch now
+        // always performs a fresh request; remove the obsolete cache without
+        // allowing cleanup failure to block discovery.
+        let _ = remove_file_if_present(&self.legacy_update_state_path);
+        Ok(self.update_checker.check(env!("CARGO_PKG_VERSION")).await?)
+    }
+
+    pub async fn export_diagnostics(
+        &self,
+        destination: PathBuf,
+        config: AppConfig,
+        snapshot: ConnectionSnapshot,
+        diagnostic_session: Option<DiagnosticSession>,
+        transport: DiagnosticTransportContext,
+    ) -> Result<(), MaintenanceError> {
+        let log_directory = self.log_directory.clone();
+        tokio::task::spawn_blocking(move || {
+            write_diagnostic_bundle(
+                &destination,
+                &config,
+                &snapshot,
+                diagnostic_session.as_ref(),
+                &transport,
+                &log_directory,
+            )
+        })
+        .await
+        .map_err(|error| MaintenanceError::Worker(error.to_string()))?
+    }
+
+    pub async fn clear_local_state(&self) -> Result<(), MaintenanceError> {
+        let update_state_path = self.legacy_update_state_path.clone();
+        let log_directory = self.log_directory.clone();
+        let flag_cache_directory = self.flag_cache_directory.clone();
+        let config_backup_path = self.config_backup_path.clone();
+        tokio::task::spawn_blocking(move || {
+            remove_file_if_present(&update_state_path)?;
+            remove_file_if_present(&config_backup_path)?;
+            if flag_cache_directory.is_dir() {
+                fs::remove_dir_all(&flag_cache_directory)?;
+            }
+            logging::clear_logs(&log_directory, Duration::from_secs(5))
+        })
+        .await
+        .map_err(|error| MaintenanceError::Worker(error.to_string()))??;
+        Ok(())
+    }
+}
+
+fn remove_file_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn write_diagnostic_bundle(
+    destination: &Path,
+    config: &AppConfig,
+    snapshot: &ConnectionSnapshot,
+    diagnostic_session: Option<&DiagnosticSession>,
+    transport: &DiagnosticTransportContext,
+    log_directory: &Path,
+) -> Result<(), MaintenanceError> {
+    if !destination.is_absolute()
+        || !destination
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("zip"))
+    {
+        return Err(MaintenanceError::InvalidDestination(destination.to_owned()));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| MaintenanceError::InvalidDestination(destination.to_owned()))?;
+    if !parent.is_dir() {
+        return Err(MaintenanceError::InvalidDestination(destination.to_owned()));
+    }
+
+    let log = collect_logs_with_owner(log_directory);
+    let configuration = configuration_summary(config);
+    let connection = connection_summary(snapshot);
+    let timeline = connection_timeline_summary(&transport.timeline);
+    let platform = platform_health_summary(snapshot);
+    let readme = concat!(
+        "Usque diagnostic bundle\n\n",
+        "This archive is created locally and is never uploaded automatically.\n",
+        "Identity secrets, cryptographic material, full network addresses, and ",
+        "user-provided profile names are deliberately excluded.\n"
+    );
+
+    let mut entries = vec![
+        (
+            "log-export.json".to_owned(),
+            serde_json::to_vec_pretty(&log.metadata)?.into_boxed_slice(),
+        ),
+        (
+            "configuration-summary.json".to_owned(),
+            serde_json::to_vec_pretty(&configuration)?.into_boxed_slice(),
+        ),
+        (
+            "connection-summary.json".to_owned(),
+            serde_json::to_vec_pretty(&connection)?.into_boxed_slice(),
+        ),
+        (
+            "connection-timeline.json".to_owned(),
+            serde_json::to_vec_pretty(&timeline)?.into_boxed_slice(),
+        ),
+        (
+            "platform-health.json".to_owned(),
+            serde_json::to_vec_pretty(&platform)?.into_boxed_slice(),
+        ),
+        (
+            "README.txt".to_owned(),
+            readme.as_bytes().to_vec().into_boxed_slice(),
+        ),
+    ];
+    if let Some(capture) = &transport.capture {
+        entries.push((
+            "capture.json".to_owned(),
+            serde_json::to_vec_pretty(capture)?.into_boxed_slice(),
+        ));
+    }
+    if let Some(quality) = &transport.network_quality {
+        let value = serde_json::json!({
+            "connection_instance_id": quality.connection_id.map(|id| id.0.to_string()),
+            "transport_performance": quality.transport_performance.as_ref().map(usque_transport::TransportPerformanceSnapshot::to_json),
+            "queues": quality.queues.iter().map(|queue| serde_json::json!({
+                "kind": queue.kind.as_str(), "current_items": queue.current_items,
+                "current_bytes": queue.current_bytes, "drop_items": queue.drop_items,
+                "drop_bytes": queue.drop_bytes,
+                "backpressure": queue.backpressure.as_ref().map(usque_transport::QueueBackpressureSnapshot::to_json),
+            })).collect::<Vec<_>>(),
+        });
+        entries.push((
+            "transport-performance.json".to_owned(),
+            serde_json::to_vec_pretty(&value)?.into_boxed_slice(),
+        ));
+    }
+    if snapshot.transport == Some(usque_core::Transport::Http3)
+        && let Some(socket) = &transport.socket_receive
+    {
+        entries.push((
+            "udp-receive.json".to_owned(),
+            serde_json::to_vec_pretty(&socket_receive_summary(socket))?.into_boxed_slice(),
+        ));
+    }
+    if cfg!(windows) || transport.platform_state.is_some() {
+        entries.push((
+            "windows-recovery.json".to_owned(),
+            serde_json::to_vec_pretty(&crate::recovery_diagnostics::summary(
+                transport.platform_state.as_ref(),
+            ))?
+            .into_boxed_slice(),
+        ));
+    }
+    if let Some(session) = diagnostic_session {
+        entries.push((
+            "diagnostic-session.json".to_owned(),
+            serde_json::to_vec_pretty(&diagnostic_session_summary(
+                session,
+                transport
+                    .network_quality
+                    .as_ref()
+                    .and_then(|quality| quality.connection_id)
+                    .map(|id| id.0),
+            ))?
+            .into_boxed_slice(),
+        ));
+    }
+    if !log.bytes.is_empty() {
+        entries.push(("logs/engine.jsonl".to_owned(), log.bytes.into_boxed_slice()));
+    }
+    let contents = entries
+        .iter()
+        .map(|(name, bytes)| {
+            serde_json::json!({
+                "path": name,
+                "size": bytes.len(),
+                "sha256": sha256_hex(bytes),
+            })
+        })
+        .collect::<Vec<_>>();
+    let manifest = serde_json::json!({
+        "schema_version": 2,
+        "created_at": Utc::now(),
+        "app_version": env!("CARGO_PKG_VERSION"),
+        "native_build": usque_core::NativeBuildInfo::current(),
+        "operating_system": std::env::consts::OS,
+        "architecture": std::env::consts::ARCH,
+        "diagnostic_complete": diagnostic_session.is_some_and(|session| {
+            session.state == usque_core::DiagnosticSessionState::Completed
+        }),
+        "diagnostic_cancelled": diagnostic_session.is_some_and(|session| {
+            session.state == usque_core::DiagnosticSessionState::Cancelled
+        }),
+        "sanitization_policy": "typed-summaries-v2-public-logs-v1",
+        "contents": contents,
+        "excluded": [
+            "WARP Secret",
+            "private key",
+            "token and organization credential",
+            "Cloudflare Access assertion",
+            "Zero Trust callback URL",
+            "device identifier",
+            "license",
+            "endpoint pin",
+            "full IP address and hostname",
+            "custom endpoint and DNS address",
+            "profile name and split-exclusion CIDR",
+            "Windows user directory",
+            "Android package list and SSID"
+        ]
+    });
+    entries.insert(
+        0,
+        (
+            "manifest.json".to_owned(),
+            serde_json::to_vec_pretty(&manifest)?.into_boxed_slice(),
+        ),
+    );
+    let mut temporary = NamedTempFile::new_in(parent)?;
+    write_stored_zip(&mut temporary, &entries)?;
+    temporary.as_file().sync_all()?;
+    replace_file(temporary.path(), destination)?;
+    let _ = temporary.keep();
+    Ok(())
+}
+
+fn configuration_summary(config: &AppConfig) -> serde_json::Value {
+    let profiles = config
+        .runtime_profiles()
+        .into_iter()
+        .enumerate()
+        .map(|(index, profile)| {
+            serde_json::json!({
+                "profile": index + 1,
+                "active": config.active_profile_id == Some(profile.id),
+                "mode": profile.mode,
+                "transport": profile.transport,
+                "ip_policy": profile.ip_policy,
+                "mtu": profile.mtu,
+                "dns_mode": profile.dns_mode,
+                "dns_server_count": profile.dns_servers.len(),
+                "allow_lan": profile.allow_lan,
+                "split_exclusion_count": profile.split_exclusions.len(),
+                "kill_switch": profile.kill_switch,
+                "auto_connect": profile.auto_connect,
+                "endpoint": {
+                    "uses_default_ipv4": profile.endpoint.ipv4
+                        == usque_core::config::DEFAULT_ENDPOINT_V4,
+                    "uses_default_ipv6": profile.endpoint.ipv6
+                        == usque_core::config::DEFAULT_ENDPOINT_V6,
+                    "port": profile.endpoint.port,
+                    "uses_default_sni": profile.endpoint.sni
+                        == usque_core::config::DEFAULT_SNI,
+                },
+                "proxy": {
+                    "socks5_listener_count": profile.proxy.socks5_listeners.len(),
+                    "http_listener_count": profile.proxy.http_listeners.len(),
+                    "system_proxy": profile.proxy.system_proxy,
+                    "dns_mode": profile.proxy.dns_mode,
+                    "dns_server_count": profile.proxy.dns_servers.len(),
+                    "udp_idle_timeout_seconds": profile.proxy.udp_idle_timeout_seconds,
+                    "listener_auth": profile.proxy.listener_auth_username().is_some(),
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema_version": config.schema_version,
+        "profile_count": profiles.len(),
+        "preferences": {
+            "locale": config.preferences.locale,
+            "theme": config.preferences.theme,
+            "update_check_enabled": config.preferences.update_check_enabled,
+            "log_level": config.preferences.log_level,
+        },
+        "profiles": profiles,
+    })
+}
+
+fn socket_receive_summary(socket: &usque_transport::SocketReceiveQuality) -> serde_json::Value {
+    let mut observation = socket.observation.clone();
+    observation.buffer_request_status = observation.buffer_request_status.filter(|s| {
+        matches!(
+            s.as_str(),
+            "accepted" | "rejected" | "not_requested" | "already_sufficient"
+        )
+    });
+    observation.overflow_monitoring = observation.overflow_monitoring.filter(|s| {
+        matches!(
+            s.as_str(),
+            "enabled" | "unavailable" | "unavailable_backend"
+        )
+    });
+    observation.receive_backend = observation
+        .receive_backend
+        .filter(|s| matches!(s.as_str(), "portable" | "recvmmsg"));
+    observation.send_backend = observation
+        .send_backend
+        .filter(|s| matches!(s.as_str(), "portable" | "sendmmsg"));
+    observation.history.truncate(120);
+    serde_json::json!({"receive_buffer_bytes": socket.receive_buffer_bytes, "send_buffer_bytes": socket.send_buffer_bytes, "observation": observation})
+}
+
+fn connection_summary(snapshot: &ConnectionSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "phase": snapshot.phase,
+        "changed_at": snapshot.changed_at,
+        "transport": snapshot.transport,
+        "data_plane": snapshot.data_plane,
+        "l4": snapshot.l4,
+        "address_family": snapshot.address_family,
+        "ipv4_available": snapshot.ipv4_available,
+        "ipv6_available": snapshot.ipv6_available,
+        "statistics": snapshot.statistics,
+        "exit_ipv4_observed": snapshot.exit.as_ref().and_then(|exit| exit.ipv4).is_some(),
+        "exit_ipv6_observed": snapshot.exit.as_ref().and_then(|exit| exit.ipv6).is_some(),
+        "error": snapshot.error.as_ref().map(|error| serde_json::json!({
+            "code": error.code,
+            "retryable": error.retryable,
+        })),
+        "failure": snapshot.failure.as_ref().map(sanitized_failure_summary),
+        "kill_switch_state": snapshot.kill_switch_state,
+        "lockdown_state": snapshot.lockdown_state,
+        "reconnect_count": snapshot.reconnect_count,
+        "active_listener_count": snapshot.active_listeners.len(),
+        "warning_codes": snapshot
+            .warnings
+            .iter()
+            .map(|warning| warning.code.as_str())
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn connection_timeline_summary(timeline: &ConnectionTimelineSnapshot) -> serde_json::Value {
+    let events = timeline
+        .events
+        .iter()
+        .map(|event| {
+            serde_json::json!({
+                "sequence": event.sequence,
+                "elapsed_from_attempt_start_milliseconds": duration_milliseconds(
+                    event.elapsed_from_attempt_start,
+                ),
+                "event_type": connection_event_type_name(event.event_type),
+                "queue_kind": event.queue_kind.map(usque_transport::QueueKind::as_str),
+                "stage": event.stage.map(usque_core::TransportStage::as_str),
+                "transport": event.transport,
+                "address_family": event.address_family,
+                "duration_milliseconds": event.duration.map(duration_milliseconds),
+                "failure": event.failure.as_ref().map(sanitized_failure_summary),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schema_version": 1,
+        "events": events,
+        "dropped_event_count": timeline.dropped_event_count,
+        "metrics": {
+            "last_connect_duration_milliseconds": timeline.metrics.last_connect_duration.map(duration_milliseconds),
+            "last_h3_handshake_duration_milliseconds": timeline.metrics.last_h3_handshake_duration.map(duration_milliseconds),
+            "last_h2_handshake_duration_milliseconds": timeline.metrics.last_h2_handshake_duration.map(duration_milliseconds),
+            "current_smoothed_rtt_milliseconds": timeline.metrics.current_smoothed_rtt.map(duration_milliseconds),
+            "reconnect_count": timeline.metrics.reconnect_count,
+            "fallback_count": timeline.metrics.fallback_count,
+            "network_change_count": timeline.metrics.network_change_count,
+            "send_queue_high_watermark": timeline.metrics.send_queue_high_watermark,
+            "send_queue_drop_count": timeline.metrics.send_queue_drop_count,
+            "last_failure_code": timeline.metrics.last_failure_code.map(usque_core::TransportFailureCode::as_str),
+            "last_reconnect_code": timeline.metrics.last_reconnect_code.map(usque_core::TransportFailureCode::as_str),
+        }
+    })
+}
+
+fn platform_health_summary(snapshot: &ConnectionSnapshot) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "operating_system": std::env::consts::OS,
+        "architecture": std::env::consts::ARCH,
+        "kill_switch_state": snapshot.kill_switch_state,
+        "lockdown_state": snapshot.lockdown_state,
+        "frontends": snapshot.frontends.iter().map(|frontend| serde_json::json!({
+            "kind": frontend.kind,
+            "phase": frontend.phase,
+            "listener_count": frontend.listeners.len(),
+            "error_code": frontend.error.as_ref().map(|error| error.code),
+        })).collect::<Vec<_>>(),
+        "agent_state": "unknown",
+        "tun_state": "unknown",
+        "route_state": "unknown",
+        "dns_state": "unknown",
+        "system_proxy_state": "unknown",
+        "recovery_journal_state": "unknown",
+        "independent_leak_verification": false,
+    })
+}
+
+fn diagnostic_session_summary(
+    session: &DiagnosticSession,
+    expected_connection: Option<uuid::Uuid>,
+) -> serde_json::Value {
+    let mut projected = session.clone();
+    for finding in &mut projected.findings {
+        if finding
+            .observation
+            .as_ref()
+            .and_then(|observation| observation.connection_instance_id)
+            .is_some_and(|id| Some(id) != expected_connection)
+        {
+            finding.status = usque_core::DiagnosticCheckStatus::Skipped;
+            finding.severity = usque_core::FailureSeverity::Info;
+            finding.summary_key = "nq_finding_stale".into();
+            finding.remediation_key = "nq_retry".into();
+            finding.failure = None;
+            finding.sanitized_evidence.clear();
+            finding.evidence.clear();
+            if let Some(observation) = &mut finding.observation {
+                observation.availability = usque_core::DiagnosticObservationAvailability::Stale;
+            }
+        }
+    }
+    projected.summary = usque_core::DiagnosticSummary::from_findings(&projected.findings);
+    projected.current_check = projected.active_checks().first().cloned();
+    let session = &projected;
+    let completed_after_milliseconds = session.completed_at.map(|completed| {
+        completed
+            .signed_duration_since(session.started_at)
+            .num_milliseconds()
+            .max(0)
+    });
+    serde_json::json!({
+        "schema_version": 1,
+        "session_id": session.session_id,
+        "state": session.state,
+        "mode": session.mode,
+        "revision": session.revision,
+        "active_checks": session.active_checks().iter().filter(|id| known_diagnostic_check(id)).collect::<Vec<_>>(),
+        "completed_after_milliseconds": completed_after_milliseconds,
+        "current_check": session.current_check.as_deref().filter(|id| known_diagnostic_check(id)),
+        "progress_percent": session.progress_percent,
+        "summary": session.summary,
+        "findings": session.findings.iter().map(|finding| {
+            let started_after_milliseconds = finding.started_at.map(|started| {
+                started
+                    .signed_duration_since(session.started_at)
+                    .num_milliseconds()
+                    .max(0)
+            });
+            serde_json::json!({
+                "check_id": if known_diagnostic_check(&finding.check_id) {
+                    finding.check_id.as_str()
+                } else {
+                    "unknown"
+                },
+                "category": finding.category,
+                "status": finding.status,
+                "severity": finding.severity,
+                "summary_key": safe_summary_key(&finding.summary_key),
+                "remediation_key": safe_remediation_key(&finding.remediation_key),
+                "observation": finding.observation,
+                "evidence": finding.evidence.iter().filter(|evidence| evidence.is_export_safe()).take(16).collect::<Vec<_>>(),
+                "sanitized_evidence": finding.sanitized_evidence.iter()
+                    .filter(|value| safe_evidence(value))
+                    .take(16)
+                    .collect::<Vec<_>>(),
+                "started_after_milliseconds": started_after_milliseconds,
+                "duration_milliseconds": finding.duration_milliseconds,
+                "dependency_reason": finding.dependency_reason.as_deref()
+                    .filter(|id| known_diagnostic_check(id)),
+                "failure": finding.failure.as_ref().map(sanitized_failure_summary),
+            })
+        }).collect::<Vec<_>>(),
+    })
+}
+
+fn sanitized_failure_summary(failure: &TransportFailure) -> serde_json::Value {
+    serde_json::json!({
+        "code": failure.code.as_str(),
+        "stage": failure.stage.as_str(),
+        "transport": failure.transport,
+        "address_family": failure.address_family,
+        "retryable": failure.retryable,
+        "fallback_allowed": failure.fallback_allowed,
+        "severity": failure.severity,
+        "remediation_key": safe_remediation_key(&failure.remediation_key).unwrap_or("retry"),
+        "sanitized_detail": failure.sanitized_detail.as_deref()
+            .filter(|detail| TransportFailure::sanitized_detail_is_safe(detail)),
+    })
+}
+
+fn safe_remediation_key(value: &str) -> Option<&str> {
+    usque_core::diagnostics_contract_generated::REMEDIATION_KEYS
+        .contains(&value)
+        .then_some(value)
+}
+
+fn safe_summary_key(value: &str) -> Option<&str> {
+    usque_core::diagnostics_contract_generated::SUMMARY_KEYS
+        .contains(&value)
+        .then_some(value)
+}
+
+fn safe_evidence(value: &str) -> bool {
+    usque_core::DiagnosticEvidence::from_legacy(value).is_some()
+}
+
+fn known_diagnostic_check(value: &str) -> bool {
+    usque_core::diagnostics_contract_generated::CHECK_IDS.contains(&value)
+}
+
+const fn connection_event_type_name(event: ConnectionEventType) -> &'static str {
+    match event {
+        ConnectionEventType::AttemptStarted => "attempt_started",
+        ConnectionEventType::EndpointResolved => "endpoint_resolved",
+        ConnectionEventType::SocketConnected => "socket_connected",
+        ConnectionEventType::TlsReady => "tls_ready",
+        ConnectionEventType::QuicReady => "quic_ready",
+        ConnectionEventType::MasqueAccepted => "masque_accepted",
+        ConnectionEventType::PeerSettingsReceived => "peer_settings_received",
+        ConnectionEventType::AddressAssigned => "address_assigned",
+        ConnectionEventType::TunnelReady => "tunnel_ready",
+        ConnectionEventType::FirstPacketSent => "first_packet_sent",
+        ConnectionEventType::FirstPacketReceived => "first_packet_received",
+        ConnectionEventType::FallbackStarted => "fallback_started",
+        ConnectionEventType::ReconnectScheduled => "reconnect_scheduled",
+        ConnectionEventType::NetworkChanged => "network_changed",
+        ConnectionEventType::RecoveryProbeStarted => "recovery_probe_started",
+        ConnectionEventType::RecoveryProbeSucceeded => "recovery_probe_succeeded",
+        ConnectionEventType::RecoveryProbeFailed => "recovery_probe_failed",
+        ConnectionEventType::PathPromoted => "path_promoted",
+        ConnectionEventType::MigrationStarted => "migration_started",
+        ConnectionEventType::MigrationPathValidated => "migration_path_validated",
+        ConnectionEventType::MigrationPromoted => "migration_promoted",
+        ConnectionEventType::MigrationFailed => "migration_failed",
+        ConnectionEventType::QueueSaturated => "queue_saturated",
+        ConnectionEventType::QueueBackpressured => "queue_backpressured",
+        ConnectionEventType::PmtuChanged => "pmtu_changed",
+        ConnectionEventType::PmtuRevalidationStarted => "pmtu_revalidation_started",
+        ConnectionEventType::PmtuRevalidationFailed => "pmtu_revalidation_failed",
+        ConnectionEventType::Disconnected => "disconnected",
+        ConnectionEventType::Failed => "failed",
+    }
+}
+
+fn duration_milliseconds(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn write_stored_zip(
+    writer: &mut impl Write,
+    entries: &[(String, Box<[u8]>)],
+) -> Result<(), MaintenanceError> {
+    if entries.len() > usize::from(u16::MAX) {
+        return Err(MaintenanceError::BundleTooLarge);
+    }
+    let mut central_entries = Vec::with_capacity(entries.len());
+    let mut offset = 0_u32;
+    for (name, contents) in entries {
+        let name = name.as_bytes();
+        let name_length =
+            u16::try_from(name.len()).map_err(|_| MaintenanceError::BundleTooLarge)?;
+        let content_length =
+            u32::try_from(contents.len()).map_err(|_| MaintenanceError::BundleTooLarge)?;
+        let crc32 = crc32(contents);
+        write_u32(writer, 0x0403_4b50)?;
+        write_u16(writer, 20)?;
+        write_u16(writer, 0x0800)?;
+        write_u16(writer, 0)?;
+        write_u16(writer, 0)?;
+        write_u16(writer, 0)?;
+        write_u32(writer, crc32)?;
+        write_u32(writer, content_length)?;
+        write_u32(writer, content_length)?;
+        write_u16(writer, name_length)?;
+        write_u16(writer, 0)?;
+        writer.write_all(name)?;
+        writer.write_all(contents)?;
+
+        central_entries.push((name.to_vec(), crc32, content_length, offset));
+        offset = offset
+            .checked_add(30)
+            .and_then(|value| value.checked_add(u32::from(name_length)))
+            .and_then(|value| value.checked_add(content_length))
+            .ok_or(MaintenanceError::BundleTooLarge)?;
+    }
+
+    let central_offset = offset;
+    for (name, crc32, content_length, local_offset) in &central_entries {
+        let name_length =
+            u16::try_from(name.len()).map_err(|_| MaintenanceError::BundleTooLarge)?;
+        write_u32(writer, 0x0201_4b50)?;
+        write_u16(writer, 0x0314)?;
+        write_u16(writer, 20)?;
+        write_u16(writer, 0x0800)?;
+        write_u16(writer, 0)?;
+        write_u16(writer, 0)?;
+        write_u16(writer, 0)?;
+        write_u32(writer, *crc32)?;
+        write_u32(writer, *content_length)?;
+        write_u32(writer, *content_length)?;
+        write_u16(writer, name_length)?;
+        write_u16(writer, 0)?;
+        write_u16(writer, 0)?;
+        write_u16(writer, 0)?;
+        write_u16(writer, 0)?;
+        write_u32(writer, 0o100600 << 16)?;
+        write_u32(writer, *local_offset)?;
+        writer.write_all(name)?;
+        offset = offset
+            .checked_add(46)
+            .and_then(|value| value.checked_add(u32::from(name_length)))
+            .ok_or(MaintenanceError::BundleTooLarge)?;
+    }
+    let central_size = offset
+        .checked_sub(central_offset)
+        .ok_or(MaintenanceError::BundleTooLarge)?;
+    let entry_count =
+        u16::try_from(central_entries.len()).map_err(|_| MaintenanceError::BundleTooLarge)?;
+    write_u32(writer, 0x0605_4b50)?;
+    write_u16(writer, 0)?;
+    write_u16(writer, 0)?;
+    write_u16(writer, entry_count)?;
+    write_u16(writer, entry_count)?;
+    write_u32(writer, central_size)?;
+    write_u32(writer, central_offset)?;
+    write_u16(writer, 0)?;
+    Ok(())
+}
+
+fn collect_logs_with_owner(directory: &Path) -> CollectedLogs {
+    let owned_directory = directory.to_owned();
+    match logging::capture_logs(directory, Duration::from_secs(5), move || {
+        collect_sanitized_logs(&owned_directory)
+    }) {
+        Ok(logs) => logs,
+        Err(error) => {
+            let capture_status = match error.kind() {
+                io::ErrorKind::TimedOut => "timeout",
+                io::ErrorKind::WouldBlock => "busy",
+                _ => "unavailable",
+            };
+            CollectedLogs {
+                bytes: Vec::new(),
+                metadata: LogExportMetadata {
+                    source_status: "unavailable",
+                    capture_status,
+                    byte_limit: MAX_DIAGNOSTIC_LOG_BYTES,
+                    omission_reasons: vec![capture_status],
+                    writer_health: logging::log_health(directory),
+                    ..Default::default()
+                },
+            }
+        }
+    }
+}
+
+fn collect_sanitized_logs(directory: &Path) -> CollectedLogs {
+    let writer_health = logging::log_health(directory);
+    let mut metadata = LogExportMetadata {
+        source_status: "available",
+        byte_limit: MAX_DIAGNOSTIC_LOG_BYTES,
+        capture_status: if writer_health.as_ref().is_some_and(|health| health.running) {
+            "coordinated"
+        } else {
+            "no_live_writer"
+        },
+        writer_health,
+        ..Default::default()
+    };
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            metadata.source_status = if error.kind() == io::ErrorKind::NotFound {
+                "missing"
+            } else {
+                "unavailable"
+            };
+            metadata.omission_reasons.push(metadata.source_status);
+            return CollectedLogs {
+                bytes: Vec::new(),
+                metadata,
+            };
+        }
+    };
+    let mut files = Vec::new();
+    for (index, entry) in entries.enumerate() {
+        if index >= logging::MAX_LOG_DIRECTORY_ENTRIES {
+            metadata.truncated = true;
+            metadata.source_status = "partial";
+            metadata.omission_reasons.push("directory_entry_limit");
+            break;
+        }
+        let Ok(entry) = entry else {
+            metadata.unreadable_files += 1;
+            continue;
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name == "engine.jsonl" || (name.starts_with("engine-") && name.ends_with(".jsonl"))) {
+            continue;
+        }
+        let Ok(file_metadata) = fs::symlink_metadata(entry.path()) else {
+            metadata.unreadable_files += 1;
+            continue;
+        };
+        if !file_metadata.file_type().is_file() {
+            continue;
+        }
+        metadata.files_available += 1;
+        metadata.source_bytes_available = metadata
+            .source_bytes_available
+            .saturating_add(file_metadata.len());
+        files.push((
+            entry.path(),
+            name == "engine.jsonl",
+            file_metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        ));
+    }
+    // The active file is newest even when timestamps are tied or the wall clock
+    // moved backwards. Reserve the budget for its newest complete records first.
+    files.sort_by_key(|(path, active, modified)| (*active, *modified, path.clone()));
+    let mut records = Vec::new();
+    let mut output_bytes = 0_usize;
+    let mut output_limit_hit = false;
+    'files: for (path, _, _) in files.into_iter().rev() {
+        let remaining = MAX_DIAGNOSTIC_LOG_BYTES.saturating_sub(metadata.source_bytes_read);
+        if remaining == 0 {
+            break;
+        }
+        let source = read_log_tail(&path, remaining);
+        let Ok((source, starts_mid_record)) = source else {
+            metadata.unreadable_files += 1;
+            continue;
+        };
+        metadata.files_read += 1;
+        metadata.source_bytes_read += source.len();
+        let mut source = source.as_slice();
+        if starts_mid_record {
+            metadata.partial_records += 1;
+            source = source
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(&[], |newline| &source[newline + 1..]);
+        }
+        if !source.is_empty() && !source.ends_with(b"\n") {
+            metadata.partial_records += 1;
+            source = source
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(&[], |newline| &source[..=newline]);
+        }
+        for line in source.rsplit(|byte| *byte == b'\n') {
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            if line.len() > MAX_DIAGNOSTIC_LOG_RECORD_BYTES {
+                metadata.oversized_records += 1;
+                continue;
+            }
+            if serde_json::from_slice::<serde_json::Value>(line).is_err() {
+                metadata.invalid_records += 1;
+                continue;
+            }
+            let sanitized = project_public_log(line);
+            if sanitized.is_empty() {
+                metadata.rejected_records += 1;
+                continue;
+            }
+            if output_bytes.saturating_add(sanitized.len() + 1) > MAX_DIAGNOSTIC_LOG_BYTES {
+                metadata.truncated = true;
+                output_limit_hit = true;
+                break 'files;
+            }
+            output_bytes += sanitized.len() + 1;
+            records.push(sanitized);
+        }
+    }
+    let byte_limit_hit = output_limit_hit
+        || (metadata.source_bytes_available > metadata.source_bytes_read as u64
+            && metadata.source_bytes_read == MAX_DIAGNOSTIC_LOG_BYTES);
+    metadata.truncated |= byte_limit_hit;
+    if byte_limit_hit {
+        metadata.omission_reasons.push("byte_limit");
+    }
+    if metadata.unreadable_files != 0 {
+        metadata.omission_reasons.push("unreadable_files");
+    }
+    if metadata.partial_records != 0 {
+        metadata.omission_reasons.push("partial_records");
+    }
+    if metadata.invalid_records != 0 {
+        metadata.omission_reasons.push("invalid_records");
+    }
+    if metadata.oversized_records != 0 {
+        metadata.omission_reasons.push("oversized_records");
+    }
+    if metadata.rejected_records != 0 {
+        metadata.omission_reasons.push("rejected_records");
+    }
+    metadata.records_exported = records.len();
+    let mut bytes = Vec::with_capacity(output_bytes);
+    for record in records.into_iter().rev() {
+        bytes.extend_from_slice(&record);
+        bytes.push(b'\n');
+    }
+    metadata.exported_bytes = bytes.len();
+    CollectedLogs { bytes, metadata }
+}
+
+/// Read a bounded tail plus one boundary byte. Never serialize an incomplete
+/// record from either end, including an in-progress concurrent append.
+fn read_log_tail(path: &Path, limit: usize) -> io::Result<(Vec<u8>, bool)> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(limit as u64);
+    file.seek(SeekFrom::Start(start.saturating_sub(1)))?;
+    let mut source = Vec::with_capacity(limit + usize::from(start != 0));
+    file.take(limit as u64 + u64::from(start != 0))
+        .read_to_end(&mut source)?;
+    let starts_mid_record = start != 0 && source.first().is_some_and(|byte| *byte != b'\n');
+    if start != 0 && !source.is_empty() {
+        source.remove(0);
+    }
+    Ok((source, starts_mid_record))
+}
+
+fn write_u16(writer: &mut impl Write, value: u16) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn write_u32(writer: &mut impl Write, value: u32) -> io::Result<()> {
+    writer.write_all(&value.to_le_bytes())
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    // SAFETY: source and destination are null-terminated wide paths that outlive
+    // the synchronous MoveFileExW call.
+    let result = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if result == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum MaintenanceError {
+    #[error("update check failed: {0}")]
+    Update(#[from] UpdateError),
+    #[error(
+        "diagnostic destination must be an absolute path to an existing directory and end in .zip: {0}"
+    )]
+    InvalidDestination(PathBuf),
+    #[error("maintenance I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("maintenance JSON failed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("the diagnostic bundle exceeded the classic ZIP safety limit")]
+    BundleTooLarge,
+    #[error("maintenance worker failed: {0}")]
+    Worker(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_masks_findings_from_another_connection_without_changing_the_session() {
+        let mut finding =
+            DiagnosticFinding::pending("quality.rtt", usque_core::DiagnosticCategory::Transport);
+        finding.status = usque_core::DiagnosticCheckStatus::Passed;
+        finding.sanitized_evidence = vec!["rtt_ms=42".into()];
+        finding.evidence = vec![usque_core::DiagnosticEvidence::from_legacy("rtt_ms=42").unwrap()];
+        finding.observation = Some(usque_core::DiagnosticObservation {
+            source: usque_core::DiagnosticObservationSource::Runtime,
+            availability: usque_core::DiagnosticObservationAvailability::Observed,
+            connection_instance_id: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        });
+        let mut session =
+            DiagnosticSession::pending(usque_core::DiagnosticMode::Standard, vec![finding]);
+        session.recompute_summary();
+        let projected = diagnostic_session_summary(&session, Some(uuid::Uuid::new_v4()));
+        assert_eq!(projected["findings"][0]["status"], "skipped");
+        assert_eq!(
+            projected["findings"][0]["observation"]["availability"],
+            "stale"
+        );
+        assert_eq!(projected["findings"][0]["evidence"], serde_json::json!([]));
+        assert_eq!(projected["summary"]["passed"], 0);
+        assert_eq!(projected["summary"]["skipped"], 1);
+        assert_eq!(
+            session.findings[0].status,
+            usque_core::DiagnosticCheckStatus::Passed
+        );
+        assert_eq!(session.findings[0].evidence.len(), 1);
+    }
+
+    #[test]
+    fn log_export_flushes_preceding_events_and_reports_writer_health() {
+        use tracing_subscriber::fmt::MakeWriter;
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.json");
+        let factory = logging::LogWriterFactory::open(&config).unwrap();
+        factory
+            .make_writer()
+            .write_all(br#"{"level":"INFO","sequence":12,"message":"private"}"#)
+            .unwrap();
+        let logs = collect_logs_with_owner(&log_directory(&config));
+        assert_eq!(logs.metadata.capture_status, "coordinated");
+        assert_eq!(logs.metadata.records_exported, 1);
+        assert_eq!(logs.metadata.writer_health.unwrap().written_events, 1);
+        assert!(!String::from_utf8_lossy(&logs.bytes).contains("private"));
+        factory.shutdown(Duration::from_secs(5)).unwrap();
+    }
+
+    #[test]
+    fn log_export_marks_failed_writer_as_unavailable_without_failing_bundle() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.json");
+        fs::write(log_directory(&config), b"inert path blocker").unwrap();
+        let factory = logging::LogWriterFactory::open(&config).unwrap();
+        let logs = collect_logs_with_owner(&log_directory(&config));
+        assert_eq!(logs.metadata.source_status, "unavailable");
+        assert!(!logs.metadata.writer_health.unwrap().writer_available);
+        assert!(logs.bytes.is_empty());
+        write_diagnostic_bundle(
+            &directory.path().join("diagnostics.zip"),
+            &AppConfig::default(),
+            &ConnectionSnapshot::default(),
+            None,
+            &DiagnosticTransportContext::default(),
+            &log_directory(&config),
+        )
+        .unwrap();
+        assert!(factory.shutdown(Duration::from_secs(5)).is_err());
+    }
+
+    fn fixed_log_record(sequence: u64) -> Vec<u8> {
+        let mut value = serde_json::json!({"level": "INFO", "event_type": "failed", "sequence": sequence, "padding": ""});
+        let padding_length = 255 - serde_json::to_vec(&value).unwrap().len();
+        value["padding"] = serde_json::Value::String("x".repeat(padding_length));
+        let mut bytes = serde_json::to_vec(&value).unwrap();
+        bytes.push(b'\n');
+        assert_eq!(bytes.len(), 256);
+        bytes
+    }
+
+    #[test]
+    fn log_export_reserves_tail_budget_for_all_latest_active_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let older = fixed_log_record(999);
+        fs::write(
+            directory.path().join("engine-1-0.jsonl"),
+            older.repeat(16_384),
+        )
+        .unwrap();
+        let latest = (0..256).flat_map(fixed_log_record).collect::<Vec<_>>();
+        fs::write(directory.path().join("engine.jsonl"), latest).unwrap();
+
+        let collected = collect_sanitized_logs(directory.path());
+        let sequences = String::from_utf8(collected.bytes)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["fields"]["sequence"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &sequences[sequences.len() - 256..],
+            (0..256).collect::<Vec<_>>().as_slice()
+        );
+        assert!(
+            sequences[..sequences.len() - 256]
+                .iter()
+                .all(|sequence| *sequence == 999)
+        );
+        assert_eq!(
+            collected.metadata.source_bytes_read,
+            MAX_DIAGNOSTIC_LOG_BYTES
+        );
+        assert!(collected.metadata.exported_bytes <= MAX_DIAGNOSTIC_LOG_BYTES);
+        assert_eq!(collected.metadata.records_exported, 8_192);
+        assert!(collected.metadata.truncated);
+        assert_eq!(collected.metadata.omission_reasons, ["byte_limit"]);
+    }
+
+    #[test]
+    fn log_export_omits_incomplete_tail_and_invalid_records_without_invented_events() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("engine.jsonl"),
+            b"{\"message\":\"ready\"}\nnot-json\n{\"message\":\"unfinished\"",
+        )
+        .unwrap();
+        let collected = collect_sanitized_logs(directory.path());
+        assert!(!collected.bytes.is_empty());
+        assert!(!String::from_utf8_lossy(&collected.bytes).contains("ready"));
+        assert_eq!(collected.metadata.records_exported, 1);
+        assert_eq!(collected.metadata.partial_records, 1);
+        assert_eq!(collected.metadata.invalid_records, 1);
+        assert!(!collected.metadata.truncated);
+        assert_eq!(
+            collected.metadata.omission_reasons,
+            ["partial_records", "invalid_records"]
+        );
+    }
+
+    #[test]
+    fn log_tail_distinguishes_aligned_and_partial_first_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("engine.jsonl");
+        fs::write(&path, b"first\nsecond\n").unwrap();
+        assert_eq!(
+            read_log_tail(&path, 7).unwrap(),
+            (b"second\n".to_vec(), false)
+        );
+        assert_eq!(
+            read_log_tail(&path, 6).unwrap(),
+            (b"econd\n".to_vec(), true)
+        );
+        let missing = collect_sanitized_logs(&directory.path().join("missing"));
+        assert_eq!(missing.metadata.source_status, "missing");
+        assert!(missing.bytes.is_empty());
+    }
+
+    #[test]
+    fn quality_doctor_export_allowlist_accepts_numbers_but_no_private_text() {
+        for id in [
+            "quality.rtt",
+            "quality.packet_loss",
+            "quality.queue_pressure",
+            "quality.pmtu",
+            "transport.migration_capability",
+            "dns.direct_encrypted_configuration",
+            "dns.direct_encrypted_runtime_state",
+            "dns.direct_encrypted_reachability",
+            "transport.h3_path_validation_probe",
+        ] {
+            assert!(known_diagnostic_check(id));
+        }
+        assert_eq!(
+            safe_summary_key("nq_finding_dns_runtime"),
+            Some("nq_finding_dns_runtime")
+        );
+        assert_eq!(safe_remediation_key("nq_profile"), Some("nq_profile"));
+        for evidence in [
+            "rtt_ms=42",
+            "plaintext_fallback=0",
+            "probe_ms=300",
+            "queue_drops=0",
+        ] {
+            assert!(safe_evidence(evidence));
+        }
+        for evidence in [
+            "resolver=private.example",
+            "rtt_ms=192.0.2.1",
+            "probe_ms=",
+            "queue_drops=-1",
+            "probe_ms=99999999999999999999999",
+            "probe_ms=10\nsecret",
+        ] {
+            assert!(!safe_evidence(evidence));
+        }
+    }
+    use usque_core::{
+        DiagnosticCategory, DiagnosticCheckStatus, DiagnosticFinding, DiagnosticMode,
+        DiagnosticSessionState,
+    };
+
+    #[test]
+    fn socket_receive_export_is_optional_typed_and_allowlisted() {
+        let mut socket = usque_transport::SocketReceiveQuality {
+            receive_buffer_bytes: Some(4 << 20),
+            send_buffer_bytes: None,
+            observation: usque_core::L4ReceiveSnapshot {
+                buffer_target_bytes: Some(2 << 20),
+                buffer_request_status: Some("already_sufficient".into()),
+                receive_backend: Some("portable".into()),
+                ..Default::default()
+            },
+        };
+        let value = socket_receive_summary(&socket);
+        assert_eq!(value["receive_buffer_bytes"], 4 << 20);
+        assert!(value["send_buffer_bytes"].is_null());
+        assert_eq!(value["observation"]["buffer_target_bytes"], 2 << 20);
+        assert!(value["observation"]["requested_buffer_bytes"].is_null());
+        assert_eq!(
+            value["observation"]["buffer_request_status"],
+            "already_sufficient"
+        );
+        socket.observation.buffer_request_status = Some("private.example".into());
+        socket.observation.overflow_monitoring = Some("token=private".into());
+        socket.observation.receive_backend = Some("192.0.2.1".into());
+        socket.observation.send_backend = Some("private-secret".into());
+        let sanitized = socket_receive_summary(&socket).to_string();
+        for private in [
+            "private.example",
+            "token=private",
+            "192.0.2.1",
+            "private-secret",
+        ] {
+            assert!(!sanitized.contains(private));
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("diagnostics.zip");
+        let context = DiagnosticTransportContext {
+            socket_receive: Some(socket),
+            ..Default::default()
+        };
+        for transport in [
+            None,
+            Some(usque_core::Transport::Http2),
+            Some(usque_core::Transport::Http3),
+        ] {
+            let snapshot = ConnectionSnapshot {
+                transport,
+                ..Default::default()
+            };
+            write_diagnostic_bundle(
+                &destination,
+                &AppConfig::default(),
+                &snapshot,
+                None,
+                &context,
+                &directory.path().join("missing-logs"),
+            )
+            .unwrap();
+            let bytes = fs::read(&destination).unwrap();
+            let bundle = String::from_utf8_lossy(&bytes);
+            assert_eq!(
+                bundle.contains("udp-receive.json"),
+                transport == Some(usque_core::Transport::Http3)
+            );
+            assert!(!bundle.contains("private.example"));
+        }
+    }
+
+    #[test]
+    fn diagnostic_bundle_contains_only_sanitized_summaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("diagnostics.zip");
+        let mut config = AppConfig::default();
+        config.profiles[0].name = "private hotel name".to_owned();
+        config.network.endpoint.sni = "private.example".to_owned();
+        let log_directory = directory.path().join("logs");
+        fs::create_dir_all(&log_directory).unwrap();
+        fs::write(
+            log_directory.join("engine.jsonl"),
+            br#"{"peer":"192.0.2.1:443","message":"failed example.com"}"#,
+        )
+        .unwrap();
+        write_diagnostic_bundle(
+            &destination,
+            &config,
+            &ConnectionSnapshot::default(),
+            None,
+            &DiagnosticTransportContext::default(),
+            &log_directory,
+        )
+        .unwrap();
+
+        let combined = String::from_utf8_lossy(&fs::read(destination).unwrap()).into_owned();
+        assert!(!combined.contains("private hotel name"));
+        assert!(!combined.contains("private.example"));
+        assert!(!combined.contains("192.0.2.1"));
+        assert!(!combined.contains("example.com"));
+        assert!(combined.contains("uses_default_sni"));
+        assert!(combined.contains("WARP Secret"));
+    }
+
+    #[test]
+    fn diagnostic_archive_includes_versioned_recovery_evidence_for_an_old_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("recovery.zip");
+        write_diagnostic_bundle(
+            &destination,
+            &AppConfig::default(),
+            &ConnectionSnapshot::default(),
+            None,
+            &DiagnosticTransportContext {
+                platform_state: Some(usque_ipc::agent_v1::PlatformState::default()),
+                ..Default::default()
+            },
+            directory.path(),
+        )
+        .unwrap();
+        let bytes = fs::read(&destination).unwrap();
+        let archive = String::from_utf8_lossy(&bytes);
+        assert!(archive.contains("windows-recovery.json"));
+        assert!(archive.contains("extension_unavailable"));
+        assert!(archive.contains("current_observation") && archive.contains("schema_version"));
+    }
+
+    #[test]
+    fn diagnostic_bundle_rejects_relative_or_non_zip_destinations() {
+        assert!(matches!(
+            write_diagnostic_bundle(
+                Path::new("diagnostics.zip"),
+                &AppConfig::default(),
+                &ConnectionSnapshot::default(),
+                None,
+                &DiagnosticTransportContext::default(),
+                Path::new("missing-logs"),
+            ),
+            Err(MaintenanceError::InvalidDestination(_))
+        ));
+    }
+
+    #[test]
+    fn inv_export_sanitized_rejects_hostile_diagnostic_session_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("diagnostics.zip");
+        let mut finding =
+            DiagnosticFinding::pending("transport.h3_connect", DiagnosticCategory::Transport);
+        finding.status = DiagnosticCheckStatus::Failed;
+        finding.summary_key = "private.example".to_owned();
+        finding.remediation_key = r"C:\Users\private\secret".to_owned();
+        finding.sanitized_evidence = vec![
+            "active_path".to_owned(),
+            "192.0.2.44".to_owned(),
+            "token=supersecret".to_owned(),
+            "private.example".to_owned(),
+        ];
+        finding.dependency_reason = Some("private.example".to_owned());
+        let mut hostile_failure = TransportFailure::new(
+            usque_core::TransportFailureCode::Internal,
+            usque_core::TransportStage::Diagnostics,
+        );
+        hostile_failure.remediation_key = "private_remediation".to_owned();
+        hostile_failure.sanitized_detail = Some("rawsecret".to_owned());
+        finding.failure = Some(hostile_failure);
+        let mut session = DiagnosticSession::pending(DiagnosticMode::Deep, vec![finding]);
+        session.state = DiagnosticSessionState::Completed;
+        session.completed_at = Some(session.started_at + chrono::Duration::milliseconds(25));
+        session.current_check = Some("private.example".to_owned());
+        session.recompute_summary();
+
+        write_diagnostic_bundle(
+            &destination,
+            &AppConfig::default(),
+            &ConnectionSnapshot::default(),
+            Some(&session),
+            &DiagnosticTransportContext::default(),
+            directory.path().join("missing-logs").as_path(),
+        )
+        .unwrap();
+
+        let combined = String::from_utf8_lossy(&fs::read(destination).unwrap()).into_owned();
+        assert!(combined.contains("active_path"));
+        for private in [
+            "192.0.2.44",
+            "token=supersecret",
+            "private.example",
+            r"C:\Users\private\secret",
+            "private_remediation",
+            "rawsecret",
+        ] {
+            assert!(!combined.contains(private), "bundle leaked {private}");
+        }
+    }
+
+    #[tokio::test]
+    async fn clear_local_state_removes_caches_backups_and_rotated_logs() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.json");
+        let maintenance = Maintenance::new(&config_path);
+        fs::write(directory.path().join("update-state-v1.json"), b"cached").unwrap();
+        fs::write(config_path.with_extension("json.bak"), b"backup").unwrap();
+        let flag_cache = directory.path().join("cache").join("flag-icons-7.5.0");
+        fs::create_dir_all(&flag_cache).unwrap();
+        fs::write(flag_cache.join("us.svg"), b"<svg/>").unwrap();
+        let logs = directory.path().join("logs");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("engine.jsonl"), b"active").unwrap();
+        fs::write(logs.join("engine-1-0.jsonl"), b"rotated").unwrap();
+        fs::write(logs.join("windows-recovery-cache-v1.json"), b"historical").unwrap();
+
+        maintenance.clear_local_state().await.unwrap();
+
+        assert!(!directory.path().join("update-state-v1.json").exists());
+        assert!(!config_path.with_extension("json.bak").exists());
+        assert!(!flag_cache.exists());
+        assert_eq!(fs::read(logs.join("engine.jsonl")).unwrap(), b"");
+        assert!(!logs.join("engine-1-0.jsonl").exists());
+        assert!(!logs.join("windows-recovery-cache-v1.json").exists());
+    }
+}

@@ -1,0 +1,1003 @@
+package com.usque.dfathu
+
+import android.Manifest
+import android.app.Activity
+import android.app.StatusBarManager
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.graphics.drawable.Icon
+import android.net.VpnService
+import android.os.Build
+import android.os.Bundle
+import android.os.PersistableBundle
+import android.provider.Settings
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import androidx.core.content.edit
+import androidx.core.net.toUri
+import io.flutter.embedding.android.FlutterFragmentActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodChannel
+import java.io.File
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.TimeUnit
+
+/**
+ * Flutter host: channel adapters, VPN permission, and document-picker results.
+ * Engine method logic lives in [AndroidEngineMethodHandler]; Binder control
+ * traffic lives in [VpnControlClient].
+ */
+class MainActivity : FlutterFragmentActivity() {
+    internal companion object {
+        const val CHANNEL = "io.github.georgexie2333.usque/engine"
+        const val EVENT_CHANNEL = "io.github.georgexie2333.usque/engine_events"
+        const val CREATE_DIAGNOSTICS_REQUEST = 1049
+        const val ACTION_SHORTCUT_CONNECT = "io.github.georgexie2333.usque.SHORTCUT_CONNECT"
+        const val ACTION_SHORTCUT_DISCONNECT = "io.github.georgexie2333.usque.SHORTCUT_DISCONNECT"
+        const val ACTION_SHORTCUT_PROFILES = "io.github.georgexie2333.usque.SHORTCUT_PROFILES"
+    }
+
+    private val identityExecutor = Executors.newSingleThreadExecutor()
+
+    // Doctor cannot queue behind registration or account I/O. Only one active
+    // session and its cancellation completion can occupy this executor.
+    private val diagnosticsExecutor =
+        ThreadPoolExecutor(
+            1,
+            1,
+            0L,
+            TimeUnit.MILLISECONDS,
+            ArrayBlockingQueue(1),
+            { task -> Thread(task, "usque-doctor").apply { isDaemon = true } },
+            ThreadPoolExecutor.AbortPolicy(),
+        )
+    private val updateInstallExecutor = Executors.newSingleThreadExecutor()
+    private val updateInstallGate = UpdateInstallOperationGate()
+    private val identityStore by lazy { SecureIdentityStore(this) }
+    private val profileConfigPath by lazy {
+        File(noBackupFilesDir, "usque_config/profiles-v2.json").absolutePath
+    }
+    private val initialIdentityStateExecutor = Executors.newSingleThreadExecutor()
+    private val permissionCoordinator: OnboardingPermissionCoordinator =
+        OnboardingPermissionCoordinator(
+            object : OnboardingPermissionCoordinator.Host {
+                override fun vpnGranted(): Boolean = VpnService.prepare(this@MainActivity) == null
+
+                override fun notificationState(): String {
+                    if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return "notRequired"
+                    if (ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.POST_NOTIFICATIONS) ==
+                        PackageManager.PERMISSION_GRANTED
+                    ) {
+                        return "granted"
+                    }
+                    return if (getSharedPreferences("usque_ui_permissions", MODE_PRIVATE)
+                            .getBoolean("notification_requested", false)
+                    ) {
+                        "notGranted"
+                    } else {
+                        "notRequested"
+                    }
+                }
+
+                override fun launchVpn() {
+                    val permissionIntent = VpnService.prepare(this@MainActivity)
+                    if (permissionIntent == null) {
+                        permissionCoordinator.finishVpn(true)
+                    } else {
+                        vpnPermissionLauncher.launch(permissionIntent)
+                    }
+                }
+
+                override fun launchNotification() {
+                    val preferences = getSharedPreferences("usque_ui_permissions", MODE_PRIVATE)
+                    preferences.edit { putBoolean("notification_requested", true) }
+                    try {
+                        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                    } catch (error: Exception) {
+                        preferences.edit { putBoolean("notification_requested", false) }
+                        throw error
+                    }
+                }
+            },
+        )
+    private var pendingDiagnosticsResult: MethodChannel.Result? = null
+    private var pendingChainFileResult: MethodChannel.Result? = null
+    private val chainFilePicker =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            val result = pendingChainFileResult
+            if (result != null) {
+                if (uris.size > ChainConfigurationFiles.MAX_FILES) {
+                    pendingChainFileResult = null
+                    result.error("CHAIN_FILE_COUNT_LIMIT", "Select at most 128 files.", null)
+                } else {
+                    try {
+                        identityExecutor.execute {
+                            val files = uris.map { ChainConfigurationFiles.read(contentResolver, it) }
+                            runOnUiThread {
+                                try {
+                                    if (!isDestroyed && pendingChainFileResult === result) {
+                                        pendingChainFileResult = null
+                                        result.success(files)
+                                    }
+                                } finally {
+                                    ChainConfigurationFiles.clear(files)
+                                }
+                            }
+                        }
+                    } catch (_: RejectedExecutionException) {
+                        pendingChainFileResult = null
+                        result.error("CHAIN_FILE_READ_FAILED", "Unable to read configuration files.", null)
+                    }
+                }
+            }
+        }
+    private var pendingDiagnosticsPayload: AndroidEngineMethodHandler.DiagnosticExportPayload? = null
+    private var pendingWarpSecretResult: MethodChannel.Result? = null
+    private var pendingWarpSecretProfileId: String? = null
+    private var pendingUpdateResult: MethodChannel.Result? = null
+    private var pendingUpdateRequest: AndroidUpdateInstaller.Request? = null
+    private var pendingUpdateToken: Long? = null
+    private var pendingLaunchTarget: String? = null
+    private val zeroTrustCallbackSession = ZeroTrustCallbackSession()
+    private val updateInstaller by lazy { AndroidUpdateInstaller(this) }
+    private var eventSink: EventChannel.EventSink? = null
+    private var engineMethodChannel: MethodChannel? = null
+
+    private lateinit var controlClient: VpnControlClient
+    private lateinit var methodHandler: AndroidEngineMethodHandler
+
+    private val vpnPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { activityResult ->
+            permissionCoordinator.finishVpn(activityResult.resultCode == Activity.RESULT_OK)
+        }
+
+    private val warpSecretDestinationLauncher =
+        registerForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { destination ->
+            finishWarpSecretExport(destination)
+        }
+
+    private val notificationPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) {
+            permissionCoordinator.finishNotification()
+        }
+
+    private val updatePermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            finishUpdateInstallPermission()
+        }
+
+    private val activityCommands =
+        object : AndroidEngineMethodHandler.ActivityCommands {
+            override fun cancelPendingVpnConnection(
+                code: String,
+                message: String,
+            ) {
+                permissionCoordinator.cancelConnection(code, message)
+            }
+
+            override fun getOnboardingPermissions(result: MethodChannel.Result) {
+                try {
+                    result.success(permissionCoordinator.status())
+                } catch (_: Exception) {
+                    result.error("VPN_PERMISSION_LAUNCH_FAILED", "Android could not verify permissions.", null)
+                }
+            }
+
+            override fun prepareOnboardingPermissions(result: MethodChannel.Result) {
+                permissionCoordinator.prepare(result)
+            }
+
+            override fun connectAfterValidation(
+                profileJson: String,
+                mode: String,
+                result: MethodChannel.Result,
+            ) {
+                connectWithPermission(profileJson, mode, result)
+            }
+
+            override fun selectDiagnosticsDestination(
+                result: MethodChannel.Result,
+                payload: AndroidEngineMethodHandler.DiagnosticExportPayload,
+            ) {
+                this@MainActivity.selectDiagnosticsDestination(result, payload)
+            }
+
+            override fun selectWarpSecretDestination(
+                profileId: String,
+                result: MethodChannel.Result,
+            ) {
+                this@MainActivity.selectWarpSecretDestination(profileId, result)
+            }
+
+            override fun copySensitiveText(
+                label: String,
+                value: String,
+            ) {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val clip = ClipData.newPlainText(label, value)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    clip.description.extras =
+                        PersistableBundle().apply {
+                            putBoolean("android.content.extra.IS_SENSITIVE", true)
+                        }
+                }
+                clipboard.setPrimaryClip(clip)
+            }
+
+            override fun consumeLaunchTarget(): String? = pendingLaunchTarget.also { pendingLaunchTarget = null }
+
+            override fun beginZeroTrustLogin(team: String): String = zeroTrustCallbackSession.begin(team)
+
+            override fun consumeZeroTrustCallback(): String? = zeroTrustCallbackSession.consume()
+
+            override fun cancelZeroTrustLogin() {
+                zeroTrustCallbackSession.cancel()
+            }
+
+            override fun platformPreferences(): Map<String, Any?> {
+                val preferences = AndroidPolicyStore.startup(this@MainActivity)
+                return mapOf(
+                    "start_on_boot" to
+                        preferences.getBoolean(UsqueVpnService.START_ON_BOOT, false),
+                    "close_to_tray" to true,
+                )
+            }
+
+            override fun setStartOnBoot(enabled: Boolean) {
+                AndroidPolicyStore
+                    .startup(this@MainActivity)
+                    .edit { putBoolean(UsqueVpnService.START_ON_BOOT, enabled) }
+            }
+
+            override fun openAlwaysOnVpnSettings() {
+                startActivity(
+                    android.content.Intent(android.provider.Settings.ACTION_VPN_SETTINGS).addFlags(
+                        android.content.Intent.FLAG_ACTIVITY_NEW_TASK,
+                    ),
+                )
+            }
+
+            override fun listInstalledApps(): List<Map<String, Any?>> = InstalledAppCatalog.list(this@MainActivity)
+
+            override fun getAppIcon(packageName: String): ByteArray? =
+                InstalledAppCatalog.iconPng(this@MainActivity, packageName)
+
+            override fun loadPerAppProxy(): Map<String, Any?> = PerAppProxyStore.load(this@MainActivity).toMap()
+
+            override fun savePerAppProxy(
+                enabled: Boolean,
+                packageNames: List<String>,
+            ): Map<String, Any?> =
+                PerAppProxyStore
+                    .save(
+                        this@MainActivity,
+                        PerAppProxySettings(enabled = enabled, packageNames = packageNames),
+                    ).toMap() + mapOf("revision" to PerAppProxyStore.preferences(this@MainActivity).revision())
+
+            override fun getUpdateCacheDirectory(): String {
+                updateInstaller.prepareCache()
+                return updateInstaller.cacheDirectory.absolutePath
+            }
+
+            override fun verifyUpdatePackage(arguments: Map<String, Any?>) {
+                updateInstaller.verify(
+                    AndroidUpdateInstaller.fromArguments(arguments),
+                    allowPartial = true,
+                )
+            }
+
+            override fun installUpdatePackage(
+                arguments: Map<String, Any?>,
+                result: MethodChannel.Result,
+            ) {
+                beginUpdateInstall(arguments, result)
+            }
+
+            override fun publishEngineEvent(event: Map<String, Any?>) {
+                eventSink?.success(event)
+            }
+
+            override fun requestAddQuickSettingsTile(result: MethodChannel.Result) {
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                    result.success(null)
+                    return
+                }
+                val statusBar = getSystemService(StatusBarManager::class.java)
+                statusBar.requestAddTileService(
+                    android.content.ComponentName(this@MainActivity, UsqueTileService::class.java),
+                    "Usque",
+                    Icon.createWithResource(this@MainActivity, R.drawable.ic_stat_usque),
+                    mainExecutor,
+                ) {
+                    result.success(null)
+                }
+            }
+        }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        permissionCoordinator.restoreOutstandingDialog(savedInstanceState?.getString("usque_permission_dialog"))
+        // FlutterFragmentActivity may invoke configureFlutterEngine during
+        // super.onCreate; wire control + method handlers first.
+        ensureEngineComponents()
+        super.onCreate(savedInstanceState)
+        configureQuickSettingsTileAvailability()
+        AndroidShortcutController.sync(this)
+        AndroidMaintenance.cleanupLegacyUpdateState(this)
+        updateInstaller.prepareCache(recoverAbandonedOperation = true)
+        handleIncomingIntent(intent)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("usque_permission_dialog", permissionCoordinator.outstandingDialog())
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        AndroidShortcutController.sync(this)
+    }
+
+    private fun configureQuickSettingsTileAvailability() {
+        val state =
+            if (packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK)) {
+                PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+            } else {
+                PackageManager.COMPONENT_ENABLED_STATE_DEFAULT
+            }
+        packageManager.setComponentEnabledSetting(
+            ComponentName(this, UsqueTileService::class.java),
+            state,
+            PackageManager.DONT_KILL_APP,
+        )
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIncomingIntent(intent)
+    }
+
+    private fun handleIncomingIntent(intent: Intent?) {
+        handleZeroTrustCallbackIntent(intent)
+        handleShortcutIntent(intent)
+    }
+
+    private fun handleZeroTrustCallbackIntent(intent: Intent?) {
+        if (intent?.action != Intent.ACTION_VIEW) return
+        val callback = intent.data ?: return
+        // Never retain the Access assertion on the Activity's launch Intent.
+        intent.data = null
+        zeroTrustCallbackSession.accept(callback.toString())
+    }
+
+    private fun handleShortcutIntent(intent: Intent?) {
+        when (intent?.action) {
+            ACTION_SHORTCUT_CONNECT -> {
+                ContextCompat.startForegroundService(
+                    this,
+                    Intent(this, UsqueVpnService::class.java)
+                        .setAction(UsqueVpnService.ACTION_CONNECT_LAST),
+                )
+            }
+
+            ACTION_SHORTCUT_DISCONNECT -> {
+                ContextCompat.startForegroundService(
+                    this,
+                    Intent(this, UsqueVpnService::class.java)
+                        .setAction(UsqueVpnService.ACTION_DISCONNECT),
+                )
+            }
+
+            ACTION_SHORTCUT_PROFILES -> {
+                pendingLaunchTarget = "profiles"
+            }
+        }
+    }
+
+    private fun ensureEngineComponents() {
+        if (::controlClient.isInitialized && ::methodHandler.isInitialized) {
+            return
+        }
+        controlClient = VpnControlClient.create(this)
+        controlClient.eventListener =
+            VpnControlClient.EventListener { snapshot ->
+                if (::methodHandler.isInitialized) {
+                    methodHandler.observeSnapshot(snapshot)
+                }
+                eventSink?.success(snapshot)
+            }
+        methodHandler =
+            AndroidEngineMethodHandler(
+                profileConfigPath = profileConfigPath,
+                identityStore = AndroidEngineMethodHandler.SecureIdentityStoreAdapter(identityStore),
+                identityExecutor = identityExecutor,
+                diagnosticsExecutor = diagnosticsExecutor,
+                initialIdentityStateExecutor = initialIdentityStateExecutor,
+                mainScheduler = VpnControlClient.HandlerMainScheduler(android.os.Handler(mainLooper)),
+                controlClient = controlClient,
+                activityCommands = activityCommands,
+                maintenanceBridge = AndroidEngineMethodHandler.AndroidMaintenanceAdapter(this),
+            )
+        controlClient.clearAllAcknowledgedListener =
+            VpnControlClient.ClearAllAcknowledgedListener { result ->
+                methodHandler.finishClearAllData(result)
+            }
+    }
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        ensureEngineComponents()
+        engineMethodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        engineMethodChannel?.setMethodCallHandler { call, result ->
+            if (call.method == "readChainConfigurations") {
+                if (pendingChainFileResult != null) {
+                    result.error("CHAIN_FILE_BUSY", "A file picker is already open.", null)
+                } else {
+                    pendingChainFileResult = result
+                    try {
+                        chainFilePicker.launch(arrayOf("*/*"))
+                    } catch (_: Exception) {
+                        pendingChainFileResult = null
+                        result.error("CHAIN_FILE_UNAVAILABLE", "Paste the configuration text instead.", null)
+                    }
+                }
+            } else if (call.method == "updatePlatformLocale") {
+                updatePlatformLocale(call.argument<String>("catalog_id"), result)
+            } else {
+                methodHandler.handle(call, result)
+            }
+        }
+        AndroidUpdateInstaller.terminalListener = { success, message ->
+            runOnUiThread { publishUpdateInstallResult(success, message) }
+        }
+        updateInstaller.consumeTerminalResult()?.let { (success, message) ->
+            publishUpdateInstallResult(success, message)
+        }
+        EventChannel(flutterEngine.dartExecutor.binaryMessenger, EVENT_CHANNEL)
+            .setStreamHandler(
+                object : EventChannel.StreamHandler {
+                    override fun onListen(
+                        arguments: Any?,
+                        events: EventChannel.EventSink,
+                    ) {
+                        eventSink = events
+                        controlClient.setEventsWanted(true)
+                    }
+
+                    override fun onCancel(arguments: Any?) {
+                        controlClient.setEventsWanted(false)
+                        eventSink = null
+                    }
+                },
+            )
+    }
+
+    private fun updatePlatformLocale(
+        catalogId: String?,
+        result: MethodChannel.Result,
+    ) {
+        if (catalogId == null) {
+            result.error("INVALID_ARGUMENT", "The platform locale is missing.", null)
+            return
+        }
+        if (!AndroidLocaleController.persist(this, catalogId)) {
+            result.error("PLATFORM_LOCALE_SAVE_FAILED", "The platform locale could not be saved.", null)
+            return
+        }
+        AndroidShortcutController.sync(this)
+        controlClient.updateLocale(catalogId)
+        android.service.quicksettings.TileService.requestListeningState(
+            this,
+            ComponentName(this, UsqueTileService::class.java),
+        )
+        result.success(null)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        ensureEngineComponents()
+        controlClient.bind()
+        controlClient.setUiVisible(true)
+    }
+
+    override fun onStop() {
+        if (::controlClient.isInitialized) {
+            controlClient.setUiVisible(false)
+        }
+        super.onStop()
+    }
+
+    override fun onDestroy() {
+        pendingChainFileResult?.success(null)
+        pendingChainFileResult = null
+        permissionCoordinator.destroy()
+        pendingDiagnosticsResult?.error(
+            "DIAGNOSTICS_CANCELLED",
+            "The Android UI closed before the diagnostic bundle was saved.",
+            null,
+        )
+        pendingDiagnosticsResult = null
+        pendingDiagnosticsPayload = null
+        pendingWarpSecretResult?.error(
+            "SENSITIVE_OUTPUT_CANCELLED",
+            "The Android UI closed before the WARP Secret was saved.",
+            null,
+        )
+        pendingWarpSecretResult = null
+        pendingWarpSecretProfileId = null
+        cancelPendingUpdateOperation()
+        AndroidUpdateInstaller.terminalListener = null
+        engineMethodChannel = null
+        eventSink = null
+        if (::controlClient.isInitialized) {
+            controlClient.destroy()
+        }
+        updateInstallExecutor.shutdownNow()
+        diagnosticsExecutor.shutdownNow()
+        identityExecutor.shutdownNow()
+        initialIdentityStateExecutor.shutdownNow()
+        super.onDestroy()
+    }
+
+    private fun beginUpdateInstall(
+        arguments: Map<String, Any?>,
+        result: MethodChannel.Result,
+    ) {
+        if (pendingUpdateResult != null) {
+            result.error(
+                "UPDATE_INSTALL_IN_PROGRESS",
+                "Another Android update installation is already waiting for confirmation.",
+                null,
+            )
+            return
+        }
+        val request =
+            try {
+                AndroidUpdateInstaller.fromArguments(arguments)
+            } catch (error: AndroidUpdateInstaller.UpdateException) {
+                result.error(error.code, error.message, null)
+                return
+            }
+        try {
+            updateInstaller.trackPending(request)
+        } catch (error: AndroidUpdateInstaller.UpdateException) {
+            updateInstaller.discard(request)
+            result.error(error.code, error.message, null)
+            return
+        } catch (error: Exception) {
+            updateInstaller.discard(request)
+            result.error(
+                "UPDATE_INSTALL_SESSION_FAILED",
+                "Android could not persist the pending update installation.",
+                error.javaClass.simpleName,
+            )
+            return
+        }
+        val token = updateInstallGate.begin()
+        pendingUpdateToken = token
+        pendingUpdateRequest = request
+        pendingUpdateResult = result
+        try {
+            updateInstallExecutor.execute {
+                try {
+                    updateInstaller.verify(
+                        request,
+                        cancelled = { !updateInstallGate.isActive(token) },
+                    )
+                    runOnUiThread {
+                        if (!isUpdateOperationActive(token, request, result)) return@runOnUiThread
+                        val canInstall =
+                            try {
+                                updateInstaller.canRequestPackageInstalls()
+                            } catch (error: Exception) {
+                                failUpdateOperation(
+                                    token,
+                                    request,
+                                    result,
+                                    "UPDATE_INSTALL_PERMISSION_UNAVAILABLE",
+                                    "Android could not inspect the unknown-app installation permission.",
+                                    error.javaClass.simpleName,
+                                )
+                                return@runOnUiThread
+                            }
+                        if (canInstall) {
+                            commitUpdateInstall(token, request, result)
+                        } else {
+                            try {
+                                updatePermissionLauncher.launch(
+                                    Intent(
+                                        Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                                        "package:$packageName".toUri(),
+                                    ),
+                                )
+                            } catch (error: Exception) {
+                                failUpdateOperation(
+                                    token,
+                                    request,
+                                    result,
+                                    "UPDATE_INSTALL_PERMISSION_UNAVAILABLE",
+                                    "Android could not open the unknown-app installation settings.",
+                                    error.javaClass.simpleName,
+                                )
+                            }
+                        }
+                    }
+                } catch (error: AndroidUpdateInstaller.UpdateException) {
+                    runOnUiThread {
+                        failUpdateOperation(token, request, result, error.code, error.message, null)
+                    }
+                } catch (error: Exception) {
+                    runOnUiThread {
+                        failUpdateOperation(
+                            token,
+                            request,
+                            result,
+                            "UPDATE_PACKAGE_INVALID",
+                            "Android could not verify the update package.",
+                            error.javaClass.simpleName,
+                        )
+                    }
+                }
+            }
+        } catch (error: RejectedExecutionException) {
+            failUpdateOperation(
+                token,
+                request,
+                result,
+                "UPDATE_INSTALL_CANCELLED",
+                "The Android UI closed before the update installation could start.",
+                error.javaClass.simpleName,
+            )
+        }
+    }
+
+    private fun finishUpdateInstallPermission() {
+        val token = pendingUpdateToken ?: return
+        val result = pendingUpdateResult ?: return
+        val request = pendingUpdateRequest ?: return
+        val canInstall =
+            try {
+                updateInstaller.canRequestPackageInstalls()
+            } catch (error: Exception) {
+                failUpdateOperation(
+                    token,
+                    request,
+                    result,
+                    "UPDATE_INSTALL_PERMISSION_UNAVAILABLE",
+                    "Android could not inspect the unknown-app installation permission.",
+                    error.javaClass.simpleName,
+                )
+                return
+            }
+        if (!canInstall) {
+            failUpdateOperation(
+                token,
+                request,
+                result,
+                "UPDATE_INSTALL_PERMISSION_DENIED",
+                "Permission to install updates from Usque was not granted.",
+                null,
+            )
+            return
+        }
+        commitUpdateInstall(token, request, result)
+    }
+
+    private fun commitUpdateInstall(
+        token: Long,
+        request: AndroidUpdateInstaller.Request,
+        result: MethodChannel.Result,
+    ) {
+        if (!isUpdateOperationActive(token, request, result)) return
+        try {
+            updateInstallExecutor.execute {
+                try {
+                    val sessionId =
+                        updateInstaller.commit(
+                            request,
+                            cancelled = { !updateInstallGate.isActive(token) },
+                        )
+                    runOnUiThread {
+                        if (finishUpdateOperation(token, request, result)) {
+                            result.success(mapOf("session_id" to sessionId))
+                        }
+                    }
+                } catch (error: AndroidUpdateInstaller.UpdateException) {
+                    runOnUiThread {
+                        failUpdateOperation(token, request, result, error.code, error.message, null)
+                    }
+                } catch (error: Exception) {
+                    runOnUiThread {
+                        failUpdateOperation(
+                            token,
+                            request,
+                            result,
+                            "UPDATE_INSTALL_SESSION_FAILED",
+                            "Android could not hand the APK to the package installer.",
+                            error.javaClass.simpleName,
+                        )
+                    }
+                }
+            }
+        } catch (error: RejectedExecutionException) {
+            failUpdateOperation(
+                token,
+                request,
+                result,
+                "UPDATE_INSTALL_CANCELLED",
+                "The Android UI closed before the update installation could start.",
+                error.javaClass.simpleName,
+            )
+        }
+    }
+
+    private fun isUpdateOperationActive(
+        token: Long,
+        request: AndroidUpdateInstaller.Request,
+        result: MethodChannel.Result,
+    ): Boolean =
+        updateInstallGate.isActive(token) &&
+            pendingUpdateToken == token &&
+            pendingUpdateRequest == request &&
+            pendingUpdateResult === result
+
+    private fun finishUpdateOperation(
+        token: Long,
+        request: AndroidUpdateInstaller.Request,
+        result: MethodChannel.Result,
+    ): Boolean {
+        if (!isUpdateOperationActive(token, request, result)) return false
+        updateInstallGate.finish(token)
+        pendingUpdateToken = null
+        pendingUpdateRequest = null
+        pendingUpdateResult = null
+        return true
+    }
+
+    private fun failUpdateOperation(
+        token: Long,
+        request: AndroidUpdateInstaller.Request,
+        result: MethodChannel.Result,
+        code: String,
+        message: String,
+        details: String?,
+    ) {
+        if (!finishUpdateOperation(token, request, result)) return
+        updateInstaller.discard(request)
+        result.error(code, message, details)
+    }
+
+    private fun cancelPendingUpdateOperation() {
+        val request = pendingUpdateRequest
+        val result = pendingUpdateResult
+        pendingUpdateToken = null
+        pendingUpdateRequest = null
+        pendingUpdateResult = null
+        updateInstallGate.invalidateAll()
+        request?.let(updateInstaller::discard)
+        result?.error(
+            "UPDATE_INSTALL_CANCELLED",
+            "The Android UI closed before the update installation was handed off.",
+            null,
+        )
+    }
+
+    private fun publishUpdateInstallResult(
+        success: Boolean,
+        message: String?,
+    ) {
+        engineMethodChannel?.invokeMethod(
+            "updateInstallFinished",
+            mapOf("success" to success, "message" to message),
+        )
+    }
+
+    @Deprecated("The Storage Access Framework result is bridged to Flutter.")
+    override fun onActivityResult(
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent?,
+    ) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != CREATE_DIAGNOSTICS_REQUEST) return
+        val result = pendingDiagnosticsResult ?: return
+        val payload = pendingDiagnosticsPayload
+        pendingDiagnosticsResult = null
+        pendingDiagnosticsPayload = null
+        if (payload == null || !methodHandler.matchesExportCapture(payload)) {
+            result.error(
+                "DIAGNOSTICS_SESSION_MISMATCH",
+                "The diagnostic data selected for export is no longer available.",
+                null,
+            )
+            return
+        }
+        if (resultCode != Activity.RESULT_OK) {
+            result.success(null)
+            return
+        }
+        val destination = data?.data
+        if (destination == null) {
+            result.error(
+                "DIAGNOSTICS_DESTINATION_FAILED",
+                "The Android document provider returned no destination.",
+                null,
+            )
+            return
+        }
+        val mainHandler = android.os.Handler(mainLooper)
+        identityExecutor.execute {
+            try {
+                check(methodHandler.matchesExportCapture(payload)) { "The diagnostic capture was invalidated." }
+                AndroidMaintenance.writeDiagnostics(
+                    this,
+                    destination,
+                    payload.snapshot,
+                    payload.diagnosticSession,
+                    payload.connectionTimeline,
+                    payload.logSnapshot,
+                )
+                runOnUiThread { result.success(destination.toString()) }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    result.error(
+                        "DIAGNOSTICS_EXPORT_FAILED",
+                        "Android could not write the diagnostic bundle.",
+                        error.javaClass.simpleName,
+                    )
+                }
+            }
+        }
+    }
+
+    private fun selectDiagnosticsDestination(
+        result: MethodChannel.Result,
+        payload: AndroidEngineMethodHandler.DiagnosticExportPayload,
+    ) {
+        if (pendingDiagnosticsResult != null) {
+            result.error(
+                "DIAGNOSTICS_IN_PROGRESS",
+                "Another diagnostic export is already waiting for a destination.",
+                null,
+            )
+            return
+        }
+        pendingDiagnosticsResult = result
+        pendingDiagnosticsPayload = payload
+        val intent =
+            Intent(Intent.ACTION_CREATE_DOCUMENT)
+                .addCategory(Intent.CATEGORY_OPENABLE)
+                .setType("application/zip")
+                .putExtra(Intent.EXTRA_TITLE, "usque-diagnostics.zip")
+        try {
+            @Suppress("DEPRECATION")
+            startActivityForResult(intent, CREATE_DIAGNOSTICS_REQUEST)
+        } catch (error: Exception) {
+            pendingDiagnosticsResult = null
+            pendingDiagnosticsPayload = null
+            result.error(
+                "DIAGNOSTICS_DESTINATION_FAILED",
+                "No Android document provider is available.",
+                error.javaClass.simpleName,
+            )
+        }
+    }
+
+    private fun selectWarpSecretDestination(
+        profileId: String,
+        result: MethodChannel.Result,
+    ) {
+        if (pendingWarpSecretResult != null) {
+            result.error(
+                "SENSITIVE_OUTPUT_IN_PROGRESS",
+                "Another WARP Secret export is already waiting for a destination.",
+                null,
+            )
+            return
+        }
+        pendingWarpSecretResult = result
+        pendingWarpSecretProfileId = profileId
+        try {
+            warpSecretDestinationLauncher.launch("usque-warp-secret.json")
+        } catch (error: Exception) {
+            pendingWarpSecretResult = null
+            pendingWarpSecretProfileId = null
+            result.error(
+                "SENSITIVE_OUTPUT_FAILED",
+                "No Android document provider is available.",
+                error.javaClass.simpleName,
+            )
+        }
+    }
+
+    private fun finishWarpSecretExport(destination: android.net.Uri?) {
+        val result = pendingWarpSecretResult ?: return
+        val profileId = pendingWarpSecretProfileId
+        pendingWarpSecretResult = null
+        pendingWarpSecretProfileId = null
+        if (destination == null) {
+            result.success(null)
+            return
+        }
+        if (profileId == null) {
+            result.error("SENSITIVE_OUTPUT_FAILED", "The Profile identity is unavailable.", null)
+            return
+        }
+        val mainHandler = android.os.Handler(mainLooper)
+        identityExecutor.execute {
+            var secret: ByteArray? = null
+            try {
+                secret =
+                    identityStore.get(profileId, SecureIdentityStore.Record.WARP_SECRET)
+                        ?: throw IllegalStateException("The Profile identity is missing")
+                contentResolver.openOutputStream(destination, "wt").use { output ->
+                    checkNotNull(output) { "The document provider returned no output stream" }
+                    output.write(secret)
+                    output.flush()
+                }
+                runOnUiThread { result.success(destination.toString()) }
+            } catch (error: Exception) {
+                runOnUiThread {
+                    result.error(
+                        "SENSITIVE_OUTPUT_FAILED",
+                        "Android could not save the WARP Secret.",
+                        error.javaClass.simpleName,
+                    )
+                }
+            } finally {
+                secret?.fill(0)
+            }
+        }
+    }
+
+    private fun connectWithPermission(
+        profileJson: String,
+        mode: String,
+        result: MethodChannel.Result,
+    ) {
+        permissionCoordinator.connect(result, mode == "vpn") {
+            startNetworkService(profileJson, mode, result)
+        }
+    }
+
+    private fun startNetworkService(
+        profileJson: String,
+        mode: String,
+        result: MethodChannel.Result,
+    ) {
+        val intent =
+            Intent(this, UsqueVpnService::class.java)
+                .setAction(UsqueVpnService.ACTION_CONNECT)
+                .putExtra(UsqueVpnService.EXTRA_PROFILE_JSON, profileJson)
+        try {
+            ContextCompat.startForegroundService(this, intent)
+        } catch (error: Exception) {
+            result.error(
+                "ENGINE_START_FAILED",
+                "Android could not start the network service.",
+                error.javaClass.simpleName,
+            )
+            return
+        }
+        result.success(
+            mapOf(
+                "phase" to "preparing",
+                "warning" to
+                    if (mode == "vpn") {
+                        "Waiting for the native VPN engine."
+                    } else {
+                        "Starting the local proxy service."
+                    },
+            ),
+        )
+    }
+}

@@ -1,0 +1,218 @@
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:lucide_icons_flutter/lucide_icons.dart';
+
+import '../core/app_strings.dart';
+import '../core/diagnostics_strings.dart';
+import '../core/usque_theme.dart';
+import '../models/diagnostics_models.dart';
+
+class DiagnosticFindingCard extends StatelessWidget {
+  const DiagnosticFindingCard({
+    required this.finding,
+    required this.strings,
+    super.key,
+  });
+
+  final DiagnosticFinding finding;
+  final AppStrings strings;
+
+  @override
+  Widget build(BuildContext context) {
+    final failure = finding.failure;
+    final observation = finding.observation;
+    final evidence = finding.publicEvidence;
+    final theme = Theme.of(context);
+    final tokens = UsqueTokens.of(context);
+    final color = _statusColor(tokens, finding.status);
+    final remediation =
+        finding.remediationKey.isNotEmpty && finding.remediationKey != 'none'
+        ? finding.remediationKey
+        : failure?.remediationKey ?? finding.remediationKey;
+    final emphasized =
+        finding.status == DiagnosticCheckStatus.warning ||
+        finding.status == DiagnosticCheckStatus.failed;
+    return Container(
+      margin: const EdgeInsetsDirectional.fromSTEB(46, 0, 12, 12),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: emphasized ? color.withValues(alpha: tokens.tint * 0.55) : null,
+        border: emphasized
+            ? Border.all(color: color.withValues(alpha: 0.32))
+            : null,
+        borderRadius: BorderRadius.circular(UsqueRadii.control),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          if (observation != null) ...<Widget>[
+            Text(
+              '${diagnosticObservationSourceLabel(strings, observation.source)} · ${diagnosticObservationAvailabilityLabel(strings, observation.availability)}',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 10),
+          ],
+          if (failure != null) ...<Widget>[
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Expanded(
+                  child: Text(
+                    diagnosticFailureTitle(strings, failure.code),
+                    style: theme.textTheme.titleSmall,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Flexible(
+                  child: Text(
+                    failure.code,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.end,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      fontFamily: UsqueFonts.mono,
+                      fontFamilyFallback: UsqueFonts.monoFallback,
+                      color: color,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 10),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: <Widget>[
+                _Fact(label: strings.get('diag_stage'), value: failure.stage),
+                if (failure.transport != null)
+                  _Fact(
+                    label: strings.get('transport'),
+                    value: failure.transport!,
+                  ),
+                if (failure.addressFamily != null)
+                  _Fact(
+                    label: strings.get('diag_family'),
+                    value: failure.addressFamily!,
+                  ),
+                _Fact(
+                  label: strings.get('diag_retryable'),
+                  value: _yesNo(strings, failure.retryable),
+                ),
+                _Fact(
+                  label: strings.get('diag_fallback_allowed'),
+                  value: _yesNo(strings, failure.fallbackAllowed),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Text(
+              diagnosticRemediation(strings, remediation),
+              style: theme.textTheme.bodyMedium,
+            ),
+            const SizedBox(height: 12),
+            Align(
+              alignment: AlignmentDirectional.centerEnd,
+              child: OutlinedButton.icon(
+                onPressed: () => _copySupportInfo(context, failure),
+                icon: const Icon(LucideIcons.copy, size: 17),
+                label: Text(strings.get('diag_copy_support')),
+              ),
+            ),
+          ] else ...<Widget>[
+            Text(
+              finding.status == DiagnosticCheckStatus.skipped &&
+                      finding.dependencyReason?.isNotEmpty == true
+                  ? diagnosticSkipReason(strings, finding)
+                  : _summaryText(strings, finding),
+              style: theme.textTheme.bodyMedium,
+            ),
+            if (remediation.isNotEmpty && remediation != 'none') ...<Widget>[
+              const SizedBox(height: 12),
+              Text(
+                diagnosticRemediation(strings, remediation),
+                style: theme.textTheme.bodyMedium,
+              ),
+            ],
+          ],
+          if (evidence.isNotEmpty) ...<Widget>[
+            const SizedBox(height: 10),
+            ExpansionTile(
+              key: PageStorageKey<String>('evidence-${finding.checkId}'),
+              title: Text(strings.get('technical_details')),
+              expandedCrossAxisAlignment: CrossAxisAlignment.stretch,
+              childrenPadding: const EdgeInsets.all(12),
+              children: evidence.indexed
+                  .map(
+                    (entry) => SelectableText(
+                      key: PageStorageKey<String>(
+                        'evidence-value-${finding.checkId}-${entry.$1}',
+                      ),
+                      entry.$2,
+                      style: UsqueTheme.mono(context, size: 12),
+                    ),
+                  )
+                  .toList(growable: false),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Future<void> _copySupportInfo(
+    BuildContext context,
+    TransportFailureInfo failure,
+  ) async {
+    final parts = <String>[
+      'code=${failure.code}',
+      'stage=${failure.stage}',
+      if (failure.transport != null) 'transport=${failure.transport}',
+      if (failure.addressFamily != null) 'family=${failure.addressFamily}',
+      'retryable=${failure.retryable}',
+      'fallback_allowed=${failure.fallbackAllowed}',
+    ];
+    await Clipboard.setData(ClipboardData(text: parts.join('\n')));
+    if (context.mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(strings.get('diag_support_copied'))),
+      );
+    }
+  }
+}
+
+class _Fact extends StatelessWidget {
+  const _Fact({required this.label, required this.value});
+
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Text(
+      '$label · $value',
+      style: Theme.of(context).textTheme.bodySmall,
+    );
+  }
+}
+
+String _yesNo(AppStrings strings, bool value) {
+  return strings.get(value ? 'diag_yes' : 'diag_no');
+}
+
+String _summaryText(AppStrings strings, DiagnosticFinding finding) {
+  return diagnosticFindingSummary(strings, finding);
+}
+
+Color _statusColor(UsqueTokens tokens, DiagnosticCheckStatus status) {
+  return switch (status) {
+    DiagnosticCheckStatus.passed => tokens.success,
+    DiagnosticCheckStatus.warning => tokens.caution,
+    DiagnosticCheckStatus.failed => tokens.danger,
+    DiagnosticCheckStatus.running => tokens.brand,
+    DiagnosticCheckStatus.pending ||
+    DiagnosticCheckStatus.skipped ||
+    DiagnosticCheckStatus.cancelled => tokens.hairlineStrong,
+  };
+}

@@ -1,0 +1,2215 @@
+//! Audited Windows IP Helper mutations used by the privileged Agent.
+//!
+//! Every public mutating function consumes a write-ahead receipt. Recovery
+//! therefore names exact routes, addresses, interface values, and DNS state
+//! instead of trying to infer what a crashed process may have changed.
+
+use std::{
+    cmp::Reverse,
+    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
+    mem,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    ptr::{self, NonNull},
+};
+
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
+use thiserror::Error;
+use uuid::Uuid;
+use windows_sys::{
+    Win32::{
+        Foundation::{
+            ERROR_ALREADY_EXISTS, ERROR_BUFFER_OVERFLOW, ERROR_FILE_NOT_FOUND,
+            ERROR_HOST_UNREACHABLE, ERROR_NETWORK_UNREACHABLE, ERROR_NO_NETWORK, ERROR_NOT_FOUND,
+            ERROR_NOT_SUPPORTED, ERROR_OBJECT_ALREADY_EXISTS, ERROR_PROTOCOL_UNREACHABLE, NO_ERROR,
+            WIN32_ERROR,
+        },
+        NetworkManagement::{
+            IpHelper::{
+                CreateIpForwardEntry2, CreateUnicastIpAddressEntry, DNS_INTERFACE_SETTINGS,
+                DNS_INTERFACE_SETTINGS_VERSION1, DNS_SETTING_IPV6, DNS_SETTING_NAMESERVER,
+                DeleteIpForwardEntry2, DeleteUnicastIpAddressEntry, FreeInterfaceDnsSettings,
+                FreeMibTable, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST,
+                GAA_FLAG_SKIP_UNICAST, GetAdaptersAddresses, GetBestInterfaceEx, GetBestRoute2,
+                GetIfTable2, GetInterfaceDnsSettings, GetIpForwardEntry2, GetIpForwardTable2,
+                GetIpInterfaceEntry, GetUnicastIpAddressEntry, IP_ADAPTER_ADDRESSES_LH,
+                IP_ADAPTER_DNS_SERVER_ADDRESS_XP, IP_ADDRESS_PREFIX, InitializeIpForwardEntry,
+                InitializeIpInterfaceEntry, InitializeUnicastIpAddressEntry, MIB_IF_ROW2,
+                MIB_IF_TABLE2, MIB_IPFORWARD_ROW2, MIB_IPFORWARD_TABLE2, MIB_IPINTERFACE_ROW,
+                MIB_UNICASTIPADDRESS_ROW, SetInterfaceDnsSettings, SetIpInterfaceEntry,
+            },
+            Ndis::NET_LUID_LH,
+        },
+        Networking::WinSock::{
+            ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC, IN_ADDR, IN_ADDR_0, IN_ADDR_0_0,
+            IN6_ADDR, IN6_ADDR_0, IpDadStatePreferred, IpPrefixOriginManual, IpSuffixOriginManual,
+            MIB_IPPROTO_NETMGMT, SOCKADDR, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_IN6_0,
+            SOCKADDR_INET, SOCKET_ADDRESS,
+        },
+    },
+    core::GUID,
+};
+
+use crate::{
+    journal::{AddressReceipt, MutationReceipt, MutationState, RecoveryJournal, RouteReceipt},
+    plan::ValidatedTunnelPlan,
+};
+
+const MAX_DNS_TEXT_UNITS: usize = 16 * 1024;
+const DEFAULT_ROUTE_METRIC: u32 = 0;
+const MAX_OBSERVED_ROUTES: usize = 4_096;
+const MAX_OBSERVED_INTERFACES: usize = 64;
+const MAX_RECOVERY_INTERFACES: usize = 4_096;
+const MAX_ADAPTER_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_ADAPTER_DNS_SERVERS: usize = 64;
+
+/// Uses IP Helper only: opening Wintun itself may enqueue orphan-device
+/// cleanup, so it is not an appropriate read-only startup probe.
+pub fn inspect_adapter_identity(receipt: &MutationReceipt) -> Result<bool, NetworkError> {
+    inspect_adapter_state(receipt).map(|state| state.is_some())
+}
+
+pub struct AdapterInterfaceState {
+    pub oper_status: u32,
+    pub admin_status: u32,
+    pub media_connect_state: u32,
+}
+
+pub fn inspect_adapter_state(
+    receipt: &MutationReceipt,
+) -> Result<Option<AdapterInterfaceState>, NetworkError> {
+    let mut table = ptr::null_mut();
+    // SAFETY: table is writable output storage; a successful allocation is
+    // owned by the guard and released exactly once with FreeMibTable.
+    check("GetIfTable2", unsafe { GetIfTable2(&mut table) })?;
+    let table = NonNull::new(table).ok_or(NetworkError::InterfaceSnapshot)?;
+    let guard = InterfaceTableGuard(table);
+    // SAFETY: GetIfTable2 initialized this header and its variable-length rows.
+    let count = unsafe { guard.0.as_ref().NumEntries } as usize;
+    if count > MAX_RECOVERY_INTERFACES {
+        return Err(NetworkError::InterfaceSnapshot);
+    }
+    // SAFETY: Windows allocated count MIB_IF_ROW2 rows following the header;
+    // the guard keeps that allocation alive for the complete inspection.
+    let rows = unsafe {
+        std::slice::from_raw_parts(
+            ptr::addr_of!((*guard.0.as_ptr()).Table).cast::<MIB_IF_ROW2>(),
+            count,
+        )
+    };
+    if !inspect_adapter_rows(receipt, rows)? {
+        return Ok(None);
+    }
+    let MutationReceipt::WintunAdapter { adapter_guid, .. } = receipt else {
+        return Err(NetworkError::ReceiptKind("Wintun adapter"));
+    };
+    // The same snapshot passed the full name/GUID/LUID/uniqueness check.
+    let row = rows
+        .iter()
+        .find(|row| uuid_from_guid(row.InterfaceGuid) == *adapter_guid)
+        .ok_or(NetworkError::AdapterIdentity)?;
+    Ok(Some(AdapterInterfaceState {
+        oper_status: row.OperStatus as u32,
+        admin_status: row.AdminStatus as u32,
+        media_connect_state: row.MediaConnectState as u32,
+    }))
+}
+
+fn inspect_adapter_rows(
+    receipt: &MutationReceipt,
+    rows: &[MIB_IF_ROW2],
+) -> Result<bool, NetworkError> {
+    let MutationReceipt::WintunAdapter {
+        adapter_name,
+        adapter_guid,
+        interface_luid,
+    } = receipt
+    else {
+        return Err(NetworkError::ReceiptKind("Wintun adapter"));
+    };
+    if adapter_guid.is_nil() {
+        return Err(NetworkError::AdapterIdentity);
+    }
+    let mut found = false;
+    for row in rows {
+        let end = row
+            .Alias
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(row.Alias.len());
+        let name_matches = row.Alias[..end]
+            .iter()
+            .copied()
+            .eq(adapter_name.encode_utf16());
+        let guid_matches = uuid_from_guid(row.InterfaceGuid) == *adapter_guid;
+        let actual_luid = luid_value(row.InterfaceLuid);
+        let luid_matches = *interface_luid != 0 && actual_luid == *interface_luid;
+        // LUID indices may be freed and assigned to a different adapter. A
+        // numeric-only match is not the journaled device. Callers must still
+        // confirm exact PnP absence and must not write through the retired LUID.
+        if guid_matches || name_matches {
+            if !guid_matches
+                || !name_matches
+                || actual_luid == 0
+                || (*interface_luid != 0 && !luid_matches)
+                || found
+            {
+                return Err(NetworkError::AdapterIdentity);
+            }
+            found = true;
+        }
+    }
+    Ok(found)
+}
+
+struct InterfaceTableGuard(NonNull<MIB_IF_TABLE2>);
+
+impl Drop for InterfaceTableGuard {
+    fn drop(&mut self) {
+        // SAFETY: this guard uniquely owns a successful GetIfTable2 allocation.
+        unsafe { FreeMibTable(self.0.as_ptr().cast()) };
+    }
+}
+
+/// Checks expected interface values and exact route keys, without repairing
+/// anything. Missing resources require a new transaction, not blind resume.
+pub fn tunnel_configuration_present(journal: &RecoveryJournal) -> Result<bool, NetworkError> {
+    let plan = journal
+        .plan
+        .as_ref()
+        .ok_or(NetworkError::ReceiptKind("tunnel plan"))?;
+    for step in &journal.steps {
+        if step.state != MutationState::Applied {
+            return Ok(false);
+        }
+        let present = match &step.receipt {
+            MutationReceipt::InterfaceConfiguration {
+                interface_luid,
+                created_addresses,
+                ..
+            } => {
+                for family in [AF_INET, AF_INET6] {
+                    if (family == AF_INET && plan.assigned_ipv4.is_some())
+                        || (family == AF_INET6 && plan.assigned_ipv6.is_some())
+                    {
+                        match interface_mtu(*interface_luid, family) {
+                            Ok(mtu) if mtu == u32::from(plan.mtu) => {}
+                            Ok(_) => return Ok(false),
+                            Err(error) if error.is_interface_churn() => return Ok(false),
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+                for address in created_addresses {
+                    if !address_exists(*interface_luid, parse_network(&address.address)?.addr())? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            MutationReceipt::Dns { interface_guid, .. } => {
+                let mut expected = plan.dns_servers.clone();
+                expected.sort();
+                expected.dedup();
+                get_configured_dns_servers(*interface_guid)? == expected
+            }
+            MutationReceipt::EndpointBypass { created }
+            | MutationReceipt::DefaultRoutes { created, .. } => {
+                for receipt in created {
+                    if !route_exists(receipt)? {
+                        return Ok(false);
+                    }
+                }
+                true
+            }
+            _ => true,
+        };
+        if !present {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PhysicalInterfaceInfo {
+    pub interface_luid: u64,
+    pub interface_index: u32,
+    pub dns_servers: Vec<IpAddr>,
+    pub address_family_mask: u8,
+    pub route_fingerprint: u64,
+}
+
+/// Reads only numeric link metadata for a physical interface already selected
+/// by the endpoint-bypass planner. It never inspects DNS queries or names.
+pub fn physical_interface_info(interface_luid: u64) -> Result<PhysicalInterfaceInfo, NetworkError> {
+    require_luid(interface_luid)?;
+    let mut interface_index = 0_u32;
+    // SAFETY: both pointers reference initialized stack values that remain
+    // valid and exclusively borrowed for the synchronous Windows call.
+    check("ConvertInterfaceLuidToIndex", unsafe {
+        windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToIndex(
+            &luid(interface_luid),
+            &mut interface_index,
+        )
+    })?;
+    let mut dns_servers = effective_dns_servers(interface_luid)?;
+    dns_servers.sort();
+    dns_servers.dedup();
+    dns_servers.truncate(8);
+    Ok(PhysicalInterfaceInfo {
+        interface_luid,
+        interface_index,
+        dns_servers,
+        address_family_mask: 0,
+        route_fingerprint: 0,
+    })
+}
+
+/// Observes the current route outside this tunnel without changing any route,
+/// interface, or DNS state. Owned endpoint host routes are excluded from the
+/// selection so their old interface cannot mask a newly preferred adapter.
+pub fn current_physical_interface(
+    target: SocketAddr,
+    tunnel_luid: u64,
+    owned_bypasses: &[RouteReceipt],
+) -> Result<PhysicalInterfaceInfo, NetworkError> {
+    require_luid(tunnel_luid)?;
+    let family = if target.is_ipv4() { AF_INET } else { AF_INET6 };
+    let mut table = ptr::null_mut();
+    // SAFETY: `table` is initialized writable pointer storage. The successful
+    // allocation is immediately placed in an RAII owner using FreeMibTable.
+    check("GetIpForwardTable2", unsafe {
+        GetIpForwardTable2(family, &mut table)
+    })?;
+    let table = ObservedRouteTable(NonNull::new(table).ok_or(NetworkError::RouteSnapshotMissing)?);
+    let (route, interface) = select_current_physical_route(
+        table.rows()?,
+        target.ip(),
+        tunnel_luid,
+        owned_bypasses,
+        get_interface,
+    )?
+    .ok_or(NetworkError::NoReachableEndpoint)?;
+    let interface_luid = luid_value(route.InterfaceLuid);
+    let destination = sockaddr_from_ip(target.ip());
+    let mut selected_route = MIB_IPFORWARD_ROW2::default();
+    let mut source = SOCKADDR_INET::default();
+    // SAFETY: the selected LUID is non-zero and all input/output structures
+    // remain initialized and live throughout this read-only synchronous call.
+    check("GetBestRoute2", unsafe {
+        GetBestRoute2(
+            &route.InterfaceLuid,
+            0,
+            ptr::null(),
+            &destination,
+            0,
+            &mut selected_route,
+            &mut source,
+        )
+    })?;
+    if luid_value(selected_route.InterfaceLuid) != interface_luid {
+        return Err(NetworkError::RouteSnapshotChanged);
+    }
+    let (source_ip, source_scope) = ip_from_sockaddr(&source)?;
+    if source_ip.is_unspecified()
+        || source_ip.is_multicast()
+        || source_ip.is_ipv4() != target.is_ipv4()
+    {
+        return Err(NetworkError::RouteSnapshotChanged);
+    }
+    let mut info = physical_interface_info(interface_luid)?;
+    if info.interface_index != interface.InterfaceIndex {
+        return Err(NetworkError::RouteSnapshotChanged);
+    }
+    let mut fingerprint = DefaultHasher::new();
+    interface_luid.hash(&mut fingerprint);
+    info.interface_index.hash(&mut fingerprint);
+    source_ip.hash(&mut fingerprint);
+    source_scope.hash(&mut fingerprint);
+    ip_from_sockaddr(&route.DestinationPrefix.Prefix)?.hash(&mut fingerprint);
+    route.DestinationPrefix.PrefixLength.hash(&mut fingerprint);
+    ip_from_sockaddr(&route.NextHop)?.hash(&mut fingerprint);
+    route.Metric.hash(&mut fingerprint);
+    interface.Metric.hash(&mut fingerprint);
+    interface.NlMtu.hash(&mut fingerprint);
+    info.address_family_mask = if target.is_ipv4() { 1 } else { 2 };
+    info.route_fingerprint = fingerprint.finish();
+    Ok(info)
+}
+
+struct ObservedRouteTable(NonNull<MIB_IPFORWARD_TABLE2>);
+
+impl ObservedRouteTable {
+    fn rows(&self) -> Result<&[MIB_IPFORWARD_ROW2], NetworkError> {
+        // SAFETY: the pointer comes from a successful GetIpForwardTable2 call
+        // and stays owned by this guard for the returned slice lifetime.
+        let count = unsafe { self.0.as_ref().NumEntries as usize };
+        if count > MAX_OBSERVED_ROUTES {
+            return Err(NetworkError::RouteSnapshotTooLarge);
+        }
+        // SAFETY: Windows reports the initialized flexible-array length. The
+        // count is bounded above, the first row has its native alignment, and
+        // the allocation cannot be freed while this immutable slice is used.
+        Ok(unsafe {
+            std::slice::from_raw_parts(ptr::addr_of!((*self.0.as_ptr()).Table).cast(), count)
+        })
+    }
+}
+
+impl Drop for ObservedRouteTable {
+    fn drop(&mut self) {
+        // SAFETY: this guard uniquely owns the allocation returned by IP Helper
+        // and calls the matching deallocator exactly once.
+        unsafe { FreeMibTable(self.0.as_ptr().cast()) };
+    }
+}
+
+fn select_current_physical_route(
+    routes: &[MIB_IPFORWARD_ROW2],
+    target: IpAddr,
+    tunnel_luid: u64,
+    owned_bypasses: &[RouteReceipt],
+    mut lookup_interface: impl FnMut(u64, ADDRESS_FAMILY) -> Result<MIB_IPINTERFACE_ROW, NetworkError>,
+) -> Result<Option<(MIB_IPFORWARD_ROW2, MIB_IPINTERFACE_ROW)>, NetworkError> {
+    if routes.len() > MAX_OBSERVED_ROUTES {
+        return Err(NetworkError::RouteSnapshotTooLarge);
+    }
+    let family = if target.is_ipv4() { AF_INET } else { AF_INET6 };
+    let mut interfaces = BTreeMap::new();
+    let mut selected = None;
+    let mut selected_rank = None;
+    for route in routes {
+        let interface_luid = luid_value(route.InterfaceLuid);
+        if interface_luid == 0
+            || interface_luid == tunnel_luid
+            || route.Loopback
+            || route.ValidLifetime == 0
+        {
+            continue;
+        }
+        let (prefix, _) = ip_from_sockaddr(&route.DestinationPrefix.Prefix)?;
+        let network = IpNet::new(prefix, route.DestinationPrefix.PrefixLength)
+            .map_err(|_| NetworkError::RouteSnapshotChanged)?;
+        if !network.contains(&target) || owned_bypass_matches(route, &network, owned_bypasses)? {
+            continue;
+        }
+        if !interfaces.contains_key(&interface_luid) {
+            if interfaces.len() == MAX_OBSERVED_INTERFACES {
+                return Err(NetworkError::RouteSnapshotTooLarge);
+            }
+            let interface = match lookup_interface(interface_luid, family) {
+                Ok(interface) => Some(interface),
+                Err(error) if error.is_candidate_unavailable() || error.is_interface_churn() => {
+                    None
+                }
+                Err(error) => return Err(error),
+            };
+            interfaces.insert(interface_luid, interface);
+        }
+        let Some(interface) = interfaces.get(&interface_luid).copied().flatten() else {
+            continue;
+        };
+        if !interface.Connected || interface.InterfaceIndex == 0 || interface.NlMtu == 0 {
+            continue;
+        }
+        let rank = (
+            Reverse(network.prefix_len()),
+            u64::from(route.Metric) + u64::from(interface.Metric),
+            interface_luid,
+        );
+        if selected_rank.is_none_or(|previous| rank < previous) {
+            selected_rank = Some(rank);
+            selected = Some((*route, interface));
+        }
+    }
+    Ok(selected)
+}
+
+fn owned_bypass_matches(
+    route: &MIB_IPFORWARD_ROW2,
+    network: &IpNet,
+    bypasses: &[RouteReceipt],
+) -> Result<bool, NetworkError> {
+    let (next_hop, scope) = ip_from_sockaddr(&route.NextHop)?;
+    Ok(bypasses.iter().any(|bypass| {
+        bypass.owned
+            && bypass.interface_luid == luid_value(route.InterfaceLuid)
+            && bypass
+                .destination
+                .parse::<IpNet>()
+                .is_ok_and(|value| value == *network)
+            && bypass.next_hop.unwrap_or_else(|| unspecified(*network)) == next_hop
+            && bypass.next_hop_scope_id == scope
+            && bypass.metric == route.Metric
+    }))
+}
+
+pub fn plan_endpoint_bypass(
+    endpoint_candidates: &[SocketAddr],
+    control_api_candidates: &[SocketAddr],
+) -> Result<MutationReceipt, NetworkError> {
+    plan_endpoint_bypass_with(
+        endpoint_candidates,
+        control_api_candidates,
+        plan_physical_route,
+    )
+}
+
+fn plan_endpoint_bypass_with(
+    endpoint_candidates: &[SocketAddr],
+    control_api_candidates: &[SocketAddr],
+    mut lookup: impl FnMut(IpNet) -> Result<RouteReceipt, NetworkError>,
+) -> Result<MutationReceipt, NetworkError> {
+    let endpoint_hosts = endpoint_candidates
+        .iter()
+        .map(SocketAddr::ip)
+        .collect::<BTreeSet<_>>();
+    let control_hosts = control_api_candidates
+        .iter()
+        .map(SocketAddr::ip)
+        .collect::<BTreeSet<_>>();
+    let all_hosts = endpoint_hosts
+        .union(&control_hosts)
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut reachable_hosts = BTreeSet::new();
+    let mut created = Vec::new();
+
+    for host in all_hosts {
+        let destination = host_network(host);
+        if let Some(receipt) = plan_candidate_route(destination, &mut lookup)? {
+            reachable_hosts.insert(host);
+            created.push(receipt);
+        }
+    }
+
+    if endpoint_hosts.is_disjoint(&reachable_hosts) {
+        return Err(NetworkError::NoReachableEndpoint);
+    }
+    if control_hosts.is_disjoint(&reachable_hosts) {
+        return Err(NetworkError::NoReachableControlApi);
+    }
+    Ok(MutationReceipt::EndpointBypass { created })
+}
+
+fn plan_candidate_route(
+    destination: IpNet,
+    lookup: &mut impl FnMut(IpNet) -> Result<RouteReceipt, NetworkError>,
+) -> Result<Option<RouteReceipt>, NetworkError> {
+    match lookup(destination) {
+        Ok(receipt) => Ok(Some(receipt)),
+        Err(error) if error.is_interface_churn() => match lookup(destination) {
+            Ok(receipt) => Ok(Some(receipt)),
+            Err(retry_error)
+                if retry_error.is_interface_churn() || retry_error.is_candidate_unavailable() =>
+            {
+                Ok(None)
+            }
+            Err(retry_error) => Err(retry_error),
+        },
+        Err(error) if error.is_candidate_unavailable() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn apply_endpoint_bypass(receipt: &mut MutationReceipt) -> Result<(), NetworkError> {
+    let MutationReceipt::EndpointBypass { created } = receipt else {
+        return Err(NetworkError::ReceiptKind("endpoint bypass"));
+    };
+    for route in created {
+        apply_route(route)?;
+    }
+    Ok(())
+}
+
+pub fn restore_endpoint_bypass(receipt: &MutationReceipt) -> Result<(), NetworkError> {
+    let MutationReceipt::EndpointBypass { created } = receipt else {
+        return Err(NetworkError::ReceiptKind("endpoint bypass"));
+    };
+    let mut first_error = None;
+    for route in created.iter().rev() {
+        retain_first_error(&mut first_error, restore_route(route));
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+pub fn plan_interface_configuration(
+    interface_luid: u64,
+    plan: &ValidatedTunnelPlan,
+) -> Result<MutationReceipt, NetworkError> {
+    require_luid(interface_luid)?;
+    let previous_ipv4_mtu = plan
+        .assigned_ipv4
+        .as_ref()
+        .map(|_| interface_mtu(interface_luid, AF_INET))
+        .transpose()?;
+    let previous_ipv6_mtu = plan
+        .assigned_ipv6
+        .as_ref()
+        .map(|_| interface_mtu(interface_luid, AF_INET6))
+        .transpose()?;
+    let created_addresses = plan
+        .assigned_ipv4
+        .iter()
+        .chain(plan.assigned_ipv6.iter())
+        .map(|network| {
+            let owned = !address_exists(interface_luid, network.addr())?;
+            Ok(AddressReceipt {
+                address: network.to_string(),
+                owned,
+            })
+        })
+        .collect::<Result<Vec<_>, NetworkError>>()?;
+    Ok(MutationReceipt::InterfaceConfiguration {
+        interface_luid,
+        previous_ipv4_mtu,
+        previous_ipv6_mtu,
+        created_addresses,
+    })
+}
+
+pub fn apply_interface_configuration(
+    receipt: &mut MutationReceipt,
+    plan: &ValidatedTunnelPlan,
+) -> Result<(), NetworkError> {
+    let MutationReceipt::InterfaceConfiguration {
+        interface_luid,
+        previous_ipv4_mtu: _,
+        previous_ipv6_mtu: _,
+        created_addresses,
+    } = receipt
+    else {
+        return Err(NetworkError::ReceiptKind("interface configuration"));
+    };
+    require_luid(*interface_luid)?;
+    // Create addresses before changing per-family MTU, matching the ordering
+    // used by the audited Wintun/WireGuard implementations. Ownership is
+    // updated in place so a later failure still journals which addresses this
+    // generation created.
+    for address in created_addresses {
+        if !address.owned {
+            continue;
+        }
+        let network = parse_network(&address.address)?;
+        record_create_ownership(&mut address.owned, create_address(*interface_luid, network))?;
+    }
+    if plan.assigned_ipv4.is_some() {
+        set_interface_mtu(*interface_luid, AF_INET, u32::from(plan.mtu))?;
+    }
+    if plan.assigned_ipv6.is_some() {
+        set_interface_mtu(*interface_luid, AF_INET6, u32::from(plan.mtu))?;
+    }
+    Ok(())
+}
+
+pub fn restore_interface_configuration(receipt: &MutationReceipt) -> Result<(), NetworkError> {
+    let MutationReceipt::InterfaceConfiguration {
+        interface_luid,
+        previous_ipv4_mtu,
+        previous_ipv6_mtu,
+        created_addresses,
+    } = receipt
+    else {
+        return Err(NetworkError::ReceiptKind("interface configuration"));
+    };
+    require_luid(*interface_luid)?;
+    let mut first_error = None;
+    for address in created_addresses.iter().rev().filter(|entry| entry.owned) {
+        let result = parse_network(&address.address)
+            .and_then(|network| delete_address(*interface_luid, network));
+        retain_first_error(&mut first_error, result);
+    }
+    if let Some(mtu) = previous_ipv6_mtu {
+        retain_first_error(
+            &mut first_error,
+            set_interface_mtu(*interface_luid, AF_INET6, *mtu),
+        );
+    }
+    if let Some(mtu) = previous_ipv4_mtu {
+        retain_first_error(
+            &mut first_error,
+            set_interface_mtu(*interface_luid, AF_INET, *mtu),
+        );
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+pub fn plan_dns(
+    interface_luid: u64,
+    _plan: &ValidatedTunnelPlan,
+) -> Result<MutationReceipt, NetworkError> {
+    let interface_guid = interface_guid(interface_luid)?;
+    let previous_servers = get_configured_dns_servers(interface_guid)?;
+    Ok(MutationReceipt::Dns {
+        interface_guid,
+        previous_automatic: previous_servers.is_empty(),
+        previous_servers,
+    })
+}
+
+pub fn apply_dns(
+    receipt: MutationReceipt,
+    plan: &ValidatedTunnelPlan,
+) -> Result<MutationReceipt, NetworkError> {
+    let MutationReceipt::Dns { interface_guid, .. } = &receipt else {
+        return Err(NetworkError::ReceiptKind("DNS"));
+    };
+    set_dns_servers(*interface_guid, &plan.dns_servers)?;
+    Ok(receipt)
+}
+
+pub fn restore_dns(receipt: &MutationReceipt) -> Result<(), NetworkError> {
+    let MutationReceipt::Dns {
+        interface_guid,
+        previous_automatic,
+        previous_servers,
+    } = receipt
+    else {
+        return Err(NetworkError::ReceiptKind("DNS"));
+    };
+    if *previous_automatic {
+        set_dns_servers(*interface_guid, &[])
+    } else {
+        set_dns_servers(*interface_guid, previous_servers)
+    }
+}
+
+pub fn plan_default_routes(
+    interface_luid: u64,
+    plan: &ValidatedTunnelPlan,
+) -> Result<MutationReceipt, NetworkError> {
+    require_luid(interface_luid)?;
+    let mut routes = Vec::new();
+    if plan.assigned_ipv4.is_some() {
+        routes.push(plan_route(
+            "0.0.0.0/0".parse().expect("static IPv4 default"),
+            None,
+            0,
+            interface_luid,
+            DEFAULT_ROUTE_METRIC,
+        )?);
+    }
+    if plan.assigned_ipv6.is_some() {
+        routes.push(plan_route(
+            "::/0".parse().expect("static IPv6 default"),
+            None,
+            0,
+            interface_luid,
+            DEFAULT_ROUTE_METRIC,
+        )?);
+    }
+    if plan.split_dns && plan.assigned_ipv4.is_some() {
+        routes.push(plan_route(
+            "198.18.0.1/32".parse().expect("static Split DNS IPv4 host"),
+            None,
+            0,
+            interface_luid,
+            0,
+        )?);
+    }
+    if plan.split_dns && plan.assigned_ipv6.is_some() {
+        routes.push(plan_route(
+            "fd00::1/128".parse().expect("static Split DNS IPv6 host"),
+            None,
+            0,
+            interface_luid,
+            0,
+        )?);
+    }
+
+    let mut exclusions = BTreeSet::new();
+    exclusions.extend(plan.split_exclusions.iter().copied());
+    for exclusion in exclusions {
+        if family_is_available(exclusion, plan) {
+            routes.push(plan_physical_route(exclusion)?);
+        }
+    }
+    Ok(MutationReceipt::DefaultRoutes {
+        created: routes,
+        replaced: Vec::new(),
+    })
+}
+
+pub fn apply_default_routes(receipt: &mut MutationReceipt) -> Result<(), NetworkError> {
+    let MutationReceipt::DefaultRoutes { created, .. } = receipt else {
+        return Err(NetworkError::ReceiptKind("default routes"));
+    };
+    for route in created {
+        apply_route(route)?;
+    }
+    Ok(())
+}
+
+pub fn restore_default_routes(
+    receipt: &MutationReceipt,
+    adapter: &MutationReceipt,
+) -> Result<(), NetworkError> {
+    let MutationReceipt::DefaultRoutes { created, replaced } = receipt else {
+        return Err(NetworkError::ReceiptKind("default routes"));
+    };
+    let MutationReceipt::WintunAdapter { interface_luid, .. } = adapter else {
+        return Err(NetworkError::AdapterIdentity);
+    };
+    require_luid(*interface_luid)?;
+    let retired_luid = (!inspect_adapter_identity(adapter)?).then_some(*interface_luid);
+    restore_routes_guarded(
+        created,
+        replaced,
+        retired_luid,
+        route_exists,
+        restore_route,
+        create_route,
+    )
+}
+
+fn restore_routes_guarded(
+    created: &[RouteReceipt],
+    replaced: &[RouteReceipt],
+    retired_luid: Option<u64>,
+    mut exists: impl FnMut(&RouteReceipt) -> Result<bool, NetworkError>,
+    mut remove: impl FnMut(&RouteReceipt) -> Result<(), NetworkError>,
+    mut create: impl FnMut(&RouteReceipt) -> Result<(), NetworkError>,
+) -> Result<(), NetworkError> {
+    let mut first_error = None;
+    for route in created.iter().rev() {
+        let result = if !route.owned {
+            Ok(())
+        } else if retired_luid == Some(route.interface_luid) {
+            // Absence of the adapter does NOT prove absence of a route. If a
+            // replacement interface now has the same route key, ownership is
+            // ambiguous: preserve it and the receipt, never delete by LUID.
+            exists(route).and_then(|present| {
+                if present {
+                    Err(NetworkError::AdapterIdentity)
+                } else {
+                    Ok(())
+                }
+            })
+        } else {
+            remove(route)
+        };
+        retain_first_error(&mut first_error, result);
+    }
+    for route in replaced {
+        let result = if retired_luid == Some(route.interface_luid) {
+            Err(NetworkError::AdapterIdentity)
+        } else {
+            create(route)
+        };
+        retain_first_error(&mut first_error, result);
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn family_is_available(network: IpNet, plan: &ValidatedTunnelPlan) -> bool {
+    match network {
+        IpNet::V4(_) => plan.assigned_ipv4.is_some(),
+        IpNet::V6(_) => plan.assigned_ipv6.is_some(),
+    }
+}
+
+fn plan_physical_route(destination: IpNet) -> Result<RouteReceipt, NetworkError> {
+    let lookup = representative_ip(destination);
+    let best = best_route(lookup)?;
+    let (next_hop_address, next_hop_scope_id) = ip_from_sockaddr(&best.NextHop)?;
+    let next_hop = if next_hop_address.is_unspecified() {
+        None
+    } else {
+        Some(next_hop_address)
+    };
+    plan_route(
+        destination,
+        next_hop,
+        next_hop_scope_id,
+        luid_value(best.InterfaceLuid),
+        best.Metric,
+    )
+}
+
+fn plan_route(
+    destination: IpNet,
+    next_hop: Option<IpAddr>,
+    next_hop_scope_id: u32,
+    interface_luid: u64,
+    metric: u32,
+) -> Result<RouteReceipt, NetworkError> {
+    require_luid(interface_luid)?;
+    if next_hop.is_some_and(|value| value.is_ipv4() != destination.addr().is_ipv4()) {
+        return Err(NetworkError::AddressFamily);
+    }
+    let mut receipt = RouteReceipt {
+        destination: destination.to_string(),
+        next_hop,
+        next_hop_scope_id,
+        interface_luid,
+        metric,
+        owned: true,
+    };
+    receipt.owned = !route_exists(&receipt)?;
+    Ok(receipt)
+}
+
+fn apply_route(receipt: &mut RouteReceipt) -> Result<(), NetworkError> {
+    if !receipt.owned {
+        return Ok(());
+    }
+    let result = create_route(receipt);
+    record_create_ownership(&mut receipt.owned, result)
+}
+
+/// ALREADY_EXISTS means this generation did not create the object. Recovery
+/// must not delete it, so `owned` is cleared before the caller continues.
+fn record_create_ownership(
+    owned: &mut bool,
+    result: Result<(), NetworkError>,
+) -> Result<(), NetworkError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(NetworkError::Windows { code, .. })
+            if code == ERROR_OBJECT_ALREADY_EXISTS || code == ERROR_ALREADY_EXISTS =>
+        {
+            *owned = false;
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn create_route(receipt: &RouteReceipt) -> Result<(), NetworkError> {
+    let row = route_row(receipt)?;
+    // SAFETY: `row` is fully initialized and remains valid for the call.
+    check("CreateIpForwardEntry2", unsafe {
+        CreateIpForwardEntry2(&row)
+    })
+}
+
+fn restore_route(receipt: &RouteReceipt) -> Result<(), NetworkError> {
+    if !receipt.owned {
+        return Ok(());
+    }
+    let row = route_row(receipt)?;
+    // SAFETY: `row` is fully initialized and remains valid for the call.
+    let status = unsafe { DeleteIpForwardEntry2(&row) };
+    if status == NO_ERROR || status == ERROR_NOT_FOUND || status == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        Err(NetworkError::windows("DeleteIpForwardEntry2", status))
+    }
+}
+
+fn route_exists(receipt: &RouteReceipt) -> Result<bool, NetworkError> {
+    let mut row = route_row(receipt)?;
+    // SAFETY: `row` contains the route key and is writable for API output.
+    let status = unsafe { GetIpForwardEntry2(&mut row) };
+    if status == NO_ERROR {
+        Ok(true)
+    } else if status == ERROR_NOT_FOUND || status == ERROR_FILE_NOT_FOUND {
+        Ok(false)
+    } else {
+        Err(NetworkError::windows("GetIpForwardEntry2", status))
+    }
+}
+
+fn route_row(receipt: &RouteReceipt) -> Result<MIB_IPFORWARD_ROW2, NetworkError> {
+    let destination = parse_network(&receipt.destination)?;
+    require_luid(receipt.interface_luid)?;
+    if receipt
+        .next_hop
+        .is_some_and(|value| value.is_ipv4() != destination.addr().is_ipv4())
+    {
+        return Err(NetworkError::AddressFamily);
+    }
+    let mut row = MIB_IPFORWARD_ROW2::default();
+    // SAFETY: the API only writes default scalar values into `row`.
+    unsafe { InitializeIpForwardEntry(&mut row) };
+    row.InterfaceLuid = luid(receipt.interface_luid);
+    row.DestinationPrefix = prefix_from_network(destination);
+    row.NextHop = sockaddr_from_ip_scoped(
+        receipt.next_hop.unwrap_or_else(|| unspecified(destination)),
+        receipt.next_hop_scope_id,
+    );
+    row.SitePrefixLength = destination.prefix_len();
+    row.Metric = receipt.metric;
+    row.Protocol = MIB_IPPROTO_NETMGMT;
+    Ok(row)
+}
+
+fn best_route(destination: IpAddr) -> Result<MIB_IPFORWARD_ROW2, NetworkError> {
+    let destination = sockaddr_from_ip(destination);
+    let mut interface_index = 0_u32;
+    // SAFETY: SOCKADDR_INET begins with the same family field as SOCKADDR and
+    // remains alive for the call.
+    check("GetBestInterfaceEx", unsafe {
+        GetBestInterfaceEx(
+            (&raw const destination).cast::<SOCKADDR>(),
+            &mut interface_index,
+        )
+    })?;
+    let mut interface_luid = NET_LUID_LH::default();
+    // `ConvertInterfaceIndexToLuid` is represented in windows-sys but keeping
+    // this import local makes the route discovery dependency explicit.
+    // SAFETY: output storage is valid.
+    check("ConvertInterfaceIndexToLuid", unsafe {
+        windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceIndexToLuid(
+            interface_index,
+            &mut interface_luid,
+        )
+    })?;
+    let mut route = MIB_IPFORWARD_ROW2::default();
+    let mut source = SOCKADDR_INET::default();
+    // SAFETY: all input/output pointers are valid for the duration of the call.
+    check("GetBestRoute2", unsafe {
+        GetBestRoute2(
+            &interface_luid,
+            0,
+            ptr::null(),
+            &destination,
+            0,
+            &mut route,
+            &mut source,
+        )
+    })?;
+    Ok(route)
+}
+
+fn interface_mtu(interface_luid: u64, family: ADDRESS_FAMILY) -> Result<u32, NetworkError> {
+    let row = get_interface(interface_luid, family)?;
+    Ok(row.NlMtu)
+}
+
+fn set_interface_mtu(
+    interface_luid: u64,
+    family: ADDRESS_FAMILY,
+    mtu: u32,
+) -> Result<(), NetworkError> {
+    match set_interface_mtu_once(interface_luid, family, mtu) {
+        Err(error) if error.is_interface_churn() => {
+            set_interface_mtu_once(interface_luid, family, mtu)
+        }
+        result => result,
+    }
+}
+
+fn set_interface_mtu_once(
+    interface_luid: u64,
+    family: ADDRESS_FAMILY,
+    mtu: u32,
+) -> Result<(), NetworkError> {
+    let mut row = get_interface(interface_luid, family)?;
+    prepare_mtu_update(&mut row, family, mtu);
+    // SAFETY: `row` was populated by GetIpInterfaceEntry for this interface.
+    check("SetIpInterfaceEntry", unsafe {
+        SetIpInterfaceEntry(&mut row)
+    })
+}
+
+fn prepare_mtu_update(row: &mut MIB_IPINTERFACE_ROW, family: ADDRESS_FAMILY, mtu: u32) {
+    row.NlMtu = mtu;
+    if family == AF_INET {
+        // SetIpInterfaceEntry rejects an IPv4 row whose SitePrefixLength is
+        // non-zero, even when that value came from GetIpInterfaceEntry.
+        // Microsoft documents this field as non-modifiable for IPv4.
+        row.SitePrefixLength = 0;
+    }
+}
+
+fn get_interface(
+    interface_luid: u64,
+    family: ADDRESS_FAMILY,
+) -> Result<MIB_IPINTERFACE_ROW, NetworkError> {
+    require_luid(interface_luid)?;
+    let mut row = MIB_IPINTERFACE_ROW::default();
+    // SAFETY: the API initializes defaults in writable storage.
+    unsafe { InitializeIpInterfaceEntry(&mut row) };
+    row.Family = family;
+    row.InterfaceLuid = luid(interface_luid);
+    // SAFETY: row contains a valid family and interface LUID.
+    check("GetIpInterfaceEntry", unsafe {
+        GetIpInterfaceEntry(&mut row)
+    })?;
+    Ok(row)
+}
+
+fn address_exists(interface_luid: u64, address: IpAddr) -> Result<bool, NetworkError> {
+    Ok(find_address(interface_luid, address)?.is_some())
+}
+
+fn find_address(
+    interface_luid: u64,
+    address: IpAddr,
+) -> Result<Option<MIB_UNICASTIPADDRESS_ROW>, NetworkError> {
+    let mut row = address_row(interface_luid, host_network(address))?;
+    // SAFETY: row contains the address and interface key and is writable.
+    let status = unsafe { GetUnicastIpAddressEntry(&mut row) };
+    if status == NO_ERROR {
+        Ok(Some(row))
+    } else if status == ERROR_NOT_FOUND || status == ERROR_FILE_NOT_FOUND {
+        Ok(None)
+    } else {
+        Err(NetworkError::windows("GetUnicastIpAddressEntry", status))
+    }
+}
+
+fn create_address(interface_luid: u64, network: IpNet) -> Result<(), NetworkError> {
+    let row = address_row(interface_luid, network)?;
+    // SAFETY: row is fully initialized and remains valid for the call.
+    check("CreateUnicastIpAddressEntry", unsafe {
+        CreateUnicastIpAddressEntry(&row)
+    })
+}
+
+fn delete_address(interface_luid: u64, network: IpNet) -> Result<(), NetworkError> {
+    let Some(row) = find_address(interface_luid, network.addr())? else {
+        return Ok(());
+    };
+    // Delete the exact row returned by Windows rather than reconstructing a
+    // partially populated row. This makes recovery safe for an Intended
+    // receipt whose CreateUnicastIpAddressEntry never ran.
+    // SAFETY: `row` is a complete MIB_UNICASTIPADDRESS_ROW from find_address.
+    let status = unsafe { DeleteUnicastIpAddressEntry(&row) };
+    if status == NO_ERROR || status == ERROR_NOT_FOUND || status == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        Err(NetworkError::windows("DeleteUnicastIpAddressEntry", status))
+    }
+}
+
+fn address_row(
+    interface_luid: u64,
+    network: IpNet,
+) -> Result<MIB_UNICASTIPADDRESS_ROW, NetworkError> {
+    require_luid(interface_luid)?;
+    let mut row = MIB_UNICASTIPADDRESS_ROW::default();
+    // SAFETY: the API initializes defaults in writable storage.
+    unsafe { InitializeUnicastIpAddressEntry(&mut row) };
+    row.InterfaceLuid = luid(interface_luid);
+    row.Address = sockaddr_from_ip(network.addr());
+    row.OnLinkPrefixLength = network.prefix_len();
+    row.PrefixOrigin = IpPrefixOriginManual;
+    row.SuffixOrigin = IpSuffixOriginManual;
+    row.DadState = IpDadStatePreferred;
+    Ok(row)
+}
+
+fn interface_guid(interface_luid: u64) -> Result<Uuid, NetworkError> {
+    require_luid(interface_luid)?;
+    let mut guid = GUID::default();
+    // SAFETY: input and output storage are valid.
+    check("ConvertInterfaceLuidToGuid", unsafe {
+        windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToGuid(
+            &luid(interface_luid),
+            &mut guid,
+        )
+    })?;
+    Ok(uuid_from_guid(guid))
+}
+
+/// Effective DNS includes DHCP-assigned servers. Do NOT use this for rollback:
+/// persisting effective DHCP values as static settings changes the user's mode.
+fn effective_dns_servers(interface_luid: u64) -> Result<Vec<IpAddr>, NetworkError> {
+    let mut bytes = 15_000_u32;
+    for _ in 0..3 {
+        let mut snapshot = AdapterAddressSnapshot::new(bytes as usize)?;
+        let head = snapshot
+            .words
+            .as_mut_ptr()
+            .cast::<IP_ADAPTER_ADDRESSES_LH>();
+        bytes = u32::try_from(snapshot.words.len() * mem::size_of::<u64>())
+            .map_err(|_| NetworkError::InterfaceSnapshot)?;
+        // SAFETY: the zeroed allocation is large enough for `bytes`, has the
+        // native structure's alignment, and cannot move during this call.
+        // No SKIP_DNS_SERVER flag: we need the effective per-interface list.
+        let status = unsafe {
+            GetAdaptersAddresses(
+                u32::from(AF_UNSPEC),
+                GAA_FLAG_SKIP_UNICAST | GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+                ptr::null(),
+                head,
+                &mut bytes,
+            )
+        };
+        if status == ERROR_BUFFER_OVERFLOW {
+            continue;
+        }
+        check("GetAdaptersAddresses", status)?;
+        return snapshot.dns_servers(head, interface_luid);
+    }
+    Err(NetworkError::RouteSnapshotChanged)
+}
+
+/// Owns the native linked lists. Every pointer/length is checked against this
+/// bounded, stable allocation before dereferencing; cycles are bounded too.
+struct AdapterAddressSnapshot {
+    words: Vec<u64>,
+}
+
+impl AdapterAddressSnapshot {
+    fn new(bytes: usize) -> Result<Self, NetworkError> {
+        const { assert!(mem::align_of::<IP_ADAPTER_ADDRESSES_LH>() <= mem::align_of::<u64>()) };
+        if bytes == 0 || bytes > MAX_ADAPTER_SNAPSHOT_BYTES {
+            return Err(NetworkError::InterfaceSnapshot);
+        }
+        Ok(Self {
+            words: vec![0; bytes.div_ceil(mem::size_of::<u64>())],
+        })
+    }
+
+    fn read<T: Copy>(&self, pointer: *const T) -> Result<T, NetworkError> {
+        let start = self.words.as_ptr() as usize;
+        let offset = (pointer as usize)
+            .checked_sub(start)
+            .ok_or(NetworkError::InterfaceSnapshot)?;
+        if offset
+            .checked_add(mem::size_of::<T>())
+            .is_none_or(|end| end > self.words.len() * mem::size_of::<u64>())
+        {
+            return Err(NetworkError::InterfaceSnapshot);
+        }
+        // SAFETY: the complete value lies within the live initialized native
+        // buffer. Only Copy Win32 integer/pointer structures are read here;
+        // read_unaligned also handles SOCKET_ADDRESS's variable-size targets.
+        Ok(unsafe { pointer.read_unaligned() })
+    }
+
+    fn dns_servers(
+        &self,
+        mut next: *const IP_ADAPTER_ADDRESSES_LH,
+        interface_luid: u64,
+    ) -> Result<Vec<IpAddr>, NetworkError> {
+        require_luid(interface_luid)?;
+        let mut selected = None;
+        for _ in 0..MAX_RECOVERY_INTERFACES {
+            if next.is_null() {
+                return selected.ok_or(NetworkError::RouteSnapshotChanged);
+            }
+            if self.read(next.cast::<u32>())? < mem::size_of::<IP_ADAPTER_ADDRESSES_LH>() as u32 {
+                return Err(NetworkError::InterfaceSnapshot);
+            }
+            let adapter = self.read(next)?;
+            if luid_value(adapter.Luid) == interface_luid {
+                if selected.is_some() {
+                    return Err(NetworkError::InterfaceSnapshot);
+                }
+                selected = Some(self.dns_list(adapter.FirstDnsServerAddress)?);
+            }
+            next = adapter.Next;
+        }
+        Err(NetworkError::InterfaceSnapshot)
+    }
+
+    fn dns_list(
+        &self,
+        mut next: *const IP_ADAPTER_DNS_SERVER_ADDRESS_XP,
+    ) -> Result<Vec<IpAddr>, NetworkError> {
+        let mut addresses = Vec::new();
+        for _ in 0..=MAX_ADAPTER_DNS_SERVERS {
+            if next.is_null() {
+                return Ok(addresses);
+            }
+            if addresses.len() == MAX_ADAPTER_DNS_SERVERS
+                || self.read(next.cast::<u32>())?
+                    < mem::size_of::<IP_ADAPTER_DNS_SERVER_ADDRESS_XP>() as u32
+            {
+                return Err(NetworkError::InterfaceSnapshot);
+            }
+            let server = self.read(next)?;
+            addresses.push(self.dns_address(server.Address)?);
+            next = server.Next;
+        }
+        Err(NetworkError::InterfaceSnapshot)
+    }
+
+    fn dns_address(&self, address: SOCKET_ADDRESS) -> Result<IpAddr, NetworkError> {
+        if address.iSockaddrLength < mem::size_of::<ADDRESS_FAMILY>() as i32 {
+            return Err(NetworkError::InterfaceSnapshot);
+        }
+        let family = self.read(address.lpSockaddr.cast::<ADDRESS_FAMILY>())?;
+        let socket = match family {
+            AF_INET if address.iSockaddrLength >= mem::size_of::<SOCKADDR_IN>() as i32 => {
+                SOCKADDR_INET {
+                    Ipv4: self.read(address.lpSockaddr.cast::<SOCKADDR_IN>())?,
+                }
+            }
+            AF_INET6 if address.iSockaddrLength >= mem::size_of::<SOCKADDR_IN6>() as i32 => {
+                SOCKADDR_INET {
+                    Ipv6: self.read(address.lpSockaddr.cast::<SOCKADDR_IN6>())?,
+                }
+            }
+            _ => return Err(NetworkError::InterfaceSnapshot),
+        };
+        ip_from_sockaddr(&socket).map(|(address, _)| address)
+    }
+}
+
+/// Static settings only: an empty list must remain automatic on rollback.
+fn get_configured_dns_servers(interface_guid: Uuid) -> Result<Vec<IpAddr>, NetworkError> {
+    let mut servers = get_dns_servers_for_family(interface_guid, false)?;
+    servers.extend(get_dns_servers_for_family(interface_guid, true)?);
+    servers.sort();
+    servers.dedup();
+    Ok(servers)
+}
+
+fn get_dns_servers_for_family(
+    interface_guid: Uuid,
+    ipv6: bool,
+) -> Result<Vec<IpAddr>, NetworkError> {
+    let mut settings = DNS_INTERFACE_SETTINGS {
+        Version: DNS_INTERFACE_SETTINGS_VERSION1,
+        Flags: if ipv6 { u64::from(DNS_SETTING_IPV6) } else { 0 },
+        ..Default::default()
+    };
+    // SAFETY: settings has the required version and writable output storage.
+    check("GetInterfaceDnsSettings", unsafe {
+        GetInterfaceDnsSettings(guid_from_uuid(interface_guid), &mut settings)
+    })?;
+    let guard = DnsSettingsGuard(settings);
+    let text = wide_string(guard.0.NameServer)?;
+    parse_dns_servers(&text)
+}
+
+fn set_dns_servers(interface_guid: Uuid, servers: &[IpAddr]) -> Result<(), NetworkError> {
+    set_dns_servers_for_family(interface_guid, servers, false)?;
+    set_dns_servers_for_family(interface_guid, servers, true)
+}
+
+fn set_dns_servers_for_family(
+    interface_guid: Uuid,
+    servers: &[IpAddr],
+    ipv6: bool,
+) -> Result<(), NetworkError> {
+    let mut wide = dns_server_text(servers, ipv6);
+    let settings = DNS_INTERFACE_SETTINGS {
+        Version: DNS_INTERFACE_SETTINGS_VERSION1,
+        Flags: dns_server_flags(ipv6),
+        NameServer: wide.as_mut_ptr(),
+        ..Default::default()
+    };
+    let operation = if ipv6 {
+        "SetInterfaceDnsSettings (IPv6)"
+    } else {
+        "SetInterfaceDnsSettings (IPv4)"
+    };
+    // SAFETY: all fields without matching flags are zero, NameServer points to
+    // a live null-terminated buffer, and settings remains valid for the call.
+    check(operation, unsafe {
+        SetInterfaceDnsSettings(guid_from_uuid(interface_guid), &settings)
+    })
+}
+
+fn dns_server_text(servers: &[IpAddr], ipv6: bool) -> Vec<u16> {
+    let text = servers
+        .iter()
+        .filter(|server| server.is_ipv6() == ipv6)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    text.encode_utf16().chain([0]).collect()
+}
+
+fn dns_server_flags(ipv6: bool) -> u64 {
+    u64::from(DNS_SETTING_NAMESERVER) | if ipv6 { u64::from(DNS_SETTING_IPV6) } else { 0 }
+}
+
+struct DnsSettingsGuard(DNS_INTERFACE_SETTINGS);
+
+impl Drop for DnsSettingsGuard {
+    fn drop(&mut self) {
+        // SAFETY: a successful GetInterfaceDnsSettings call initialized this
+        // object and requires exactly one matching free.
+        unsafe { FreeInterfaceDnsSettings(&mut self.0) };
+    }
+}
+
+fn parse_dns_servers(value: &str) -> Result<Vec<IpAddr>, NetworkError> {
+    value
+        .split([',', ';', ' '])
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<IpAddr>()
+                .map_err(|_| NetworkError::DnsSnapshot(value.to_owned()))
+        })
+        .collect()
+}
+
+fn wide_string(value: *const u16) -> Result<String, NetworkError> {
+    if value.is_null() {
+        return Ok(String::new());
+    }
+    let mut length = 0;
+    // SAFETY: GetInterfaceDnsSettings returns a null-terminated allocation.
+    // The explicit cap prevents an unbounded scan if the API contract is ever
+    // violated by corrupted system state.
+    unsafe {
+        while length < MAX_DNS_TEXT_UNITS && *value.add(length) != 0 {
+            length += 1;
+        }
+        if length == MAX_DNS_TEXT_UNITS {
+            return Err(NetworkError::DnsSnapshotTooLong);
+        }
+        String::from_utf16(std::slice::from_raw_parts(value, length))
+            .map_err(|_| NetworkError::DnsSnapshotUtf16)
+    }
+}
+
+fn host_network(address: IpAddr) -> IpNet {
+    match address {
+        IpAddr::V4(value) => Ipv4Net::new(value, 32).expect("valid host prefix").into(),
+        IpAddr::V6(value) => Ipv6Net::new(value, 128).expect("valid host prefix").into(),
+    }
+}
+
+fn representative_ip(network: IpNet) -> IpAddr {
+    match network {
+        IpNet::V4(value) => IpAddr::V4(value.addr()),
+        IpNet::V6(value) => IpAddr::V6(value.addr()),
+    }
+}
+
+fn unspecified(network: IpNet) -> IpAddr {
+    match network {
+        IpNet::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpNet::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    }
+}
+
+fn prefix_from_network(network: IpNet) -> IP_ADDRESS_PREFIX {
+    IP_ADDRESS_PREFIX {
+        Prefix: sockaddr_from_ip(network.addr()),
+        PrefixLength: network.prefix_len(),
+    }
+}
+
+fn sockaddr_from_ip(address: IpAddr) -> SOCKADDR_INET {
+    sockaddr_from_ip_scoped(address, 0)
+}
+
+fn sockaddr_from_ip_scoped(address: IpAddr, scope_id: u32) -> SOCKADDR_INET {
+    match address {
+        IpAddr::V4(address) => SOCKADDR_INET {
+            Ipv4: SOCKADDR_IN {
+                sin_family: AF_INET,
+                sin_port: 0,
+                sin_addr: IN_ADDR {
+                    S_un: IN_ADDR_0 {
+                        S_un_b: IN_ADDR_0_0 {
+                            s_b1: address.octets()[0],
+                            s_b2: address.octets()[1],
+                            s_b3: address.octets()[2],
+                            s_b4: address.octets()[3],
+                        },
+                    },
+                },
+                sin_zero: [0; 8],
+            },
+        },
+        IpAddr::V6(address) => SOCKADDR_INET {
+            Ipv6: SOCKADDR_IN6 {
+                sin6_family: AF_INET6,
+                sin6_port: 0,
+                sin6_flowinfo: 0,
+                sin6_addr: IN6_ADDR {
+                    u: IN6_ADDR_0 {
+                        Byte: address.octets(),
+                    },
+                },
+                Anonymous: SOCKADDR_IN6_0 {
+                    sin6_scope_id: scope_id,
+                },
+            },
+        },
+    }
+}
+
+fn ip_from_sockaddr(value: &SOCKADDR_INET) -> Result<(IpAddr, u32), NetworkError> {
+    // SAFETY: the active union member is selected by the common family field.
+    unsafe {
+        match value.si_family {
+            AF_INET => {
+                let bytes = value.Ipv4.sin_addr.S_un.S_un_b;
+                Ok((
+                    IpAddr::V4(Ipv4Addr::new(
+                        bytes.s_b1, bytes.s_b2, bytes.s_b3, bytes.s_b4,
+                    )),
+                    0,
+                ))
+            }
+            AF_INET6 => Ok((
+                IpAddr::V6(Ipv6Addr::from(value.Ipv6.sin6_addr.u.Byte)),
+                value.Ipv6.Anonymous.sin6_scope_id,
+            )),
+            _ => Err(NetworkError::AddressFamily),
+        }
+    }
+}
+
+fn parse_network(value: &str) -> Result<IpNet, NetworkError> {
+    value
+        .parse::<IpNet>()
+        .map_err(|_| NetworkError::Network(value.to_owned()))
+}
+
+fn luid(value: u64) -> NET_LUID_LH {
+    NET_LUID_LH { Value: value }
+}
+
+fn luid_value(value: NET_LUID_LH) -> u64 {
+    // SAFETY: Value is the complete representation of NET_LUID.
+    unsafe { value.Value }
+}
+
+fn require_luid(value: u64) -> Result<(), NetworkError> {
+    if value == 0 {
+        Err(NetworkError::EmptyLuid)
+    } else {
+        Ok(())
+    }
+}
+
+fn uuid_from_guid(value: GUID) -> Uuid {
+    Uuid::from_fields(value.data1, value.data2, value.data3, &value.data4)
+}
+
+fn guid_from_uuid(value: Uuid) -> GUID {
+    let (data1, data2, data3, data4) = value.as_fields();
+    GUID {
+        data1,
+        data2,
+        data3,
+        data4: *data4,
+    }
+}
+
+fn check(operation: &'static str, code: WIN32_ERROR) -> Result<(), NetworkError> {
+    if code == NO_ERROR {
+        Ok(())
+    } else {
+        Err(NetworkError::windows(operation, code))
+    }
+}
+
+fn retain_first_error(destination: &mut Option<NetworkError>, result: Result<(), NetworkError>) {
+    if let Err(error) = result
+        && destination.is_none()
+    {
+        *destination = Some(error);
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum NetworkError {
+    #[error("the journaled adapter identity does not match the interface snapshot")]
+    AdapterIdentity,
+    #[error("a bounded interface identity snapshot is unavailable")]
+    InterfaceSnapshot,
+    #[error("Windows returned no route snapshot allocation")]
+    RouteSnapshotMissing,
+    #[error("the bounded physical route snapshot limit was exceeded")]
+    RouteSnapshotTooLarge,
+    #[error("the physical route snapshot changed during observation")]
+    RouteSnapshotChanged,
+    #[error("{operation} failed with Windows error {code}")]
+    Windows {
+        operation: &'static str,
+        code: WIN32_ERROR,
+    },
+    #[error("network receipt is not a {0} receipt")]
+    ReceiptKind(&'static str),
+    #[error("interface LUID must not be zero")]
+    EmptyLuid,
+    #[error("address families in the network receipt do not match")]
+    AddressFamily,
+    #[error("journal route or address is not a CIDR: {0}")]
+    Network(String),
+    #[error("Windows returned a non-IP DNS server value: {0}")]
+    DnsSnapshot(String),
+    #[error("Windows returned an unterminated DNS settings string")]
+    DnsSnapshotTooLong,
+    #[error("Windows returned invalid UTF-16 in DNS settings")]
+    DnsSnapshotUtf16,
+    #[error("no physical route to a configured WARP endpoint is available")]
+    NoReachableEndpoint,
+    #[error("no physical route to an authenticated WARP control endpoint is available")]
+    NoReachableControlApi,
+}
+
+impl NetworkError {
+    const fn windows(operation: &'static str, code: WIN32_ERROR) -> Self {
+        Self::Windows { operation, code }
+    }
+
+    const fn is_candidate_unavailable(&self) -> bool {
+        matches!(
+            self,
+            Self::Windows {
+                code: ERROR_NO_NETWORK
+                    | ERROR_NOT_SUPPORTED
+                    | ERROR_NETWORK_UNREACHABLE
+                    | ERROR_HOST_UNREACHABLE
+                    | ERROR_PROTOCOL_UNREACHABLE,
+                ..
+            }
+        )
+    }
+
+    const fn is_interface_churn(&self) -> bool {
+        matches!(
+            self,
+            Self::Windows {
+                code: ERROR_FILE_NOT_FOUND | ERROR_NOT_FOUND,
+                ..
+            }
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retired_tun_routes_are_verified_individually_and_never_deleted_on_a_replacement() {
+        let tunnel = RouteReceipt {
+            interface_luid: 7,
+            ..fake_route("0.0.0.0/0".parse().unwrap())
+        };
+        let physical = RouteReceipt {
+            interface_luid: 9,
+            ..fake_route("192.0.2.0/24".parse().unwrap())
+        };
+        for route_survives in [false, true] {
+            let mut removed = Vec::new();
+            let mut inspected = Vec::new();
+            let result = restore_routes_guarded(
+                &[physical.clone(), tunnel.clone()],
+                &[],
+                Some(7),
+                |route| {
+                    inspected.push(route.interface_luid);
+                    Ok(route_survives)
+                },
+                |route| {
+                    removed.push(route.interface_luid);
+                    Ok(())
+                },
+                |_| panic!("no replaced routes"),
+            );
+            assert_eq!(inspected, [7]);
+            assert_eq!(
+                removed,
+                [9],
+                "physical exclusions still require explicit cleanup"
+            );
+            assert_eq!(result.is_err(), route_survives);
+        }
+        assert!(
+            restore_routes_guarded(
+                std::slice::from_ref(&tunnel),
+                &[],
+                Some(7),
+                |_| Err(NetworkError::windows("GetIpForwardEntry2", 5)),
+                |_| panic!("unknown route ownership"),
+                |_| panic!("no replaced routes"),
+            )
+            .is_err()
+        );
+        assert!(
+            restore_routes_guarded(
+                &[],
+                &[tunnel],
+                Some(7),
+                |_| panic!("no created routes"),
+                |_| panic!("no created routes"),
+                |_| panic!("must not recreate on a reused LUID"),
+            )
+            .is_err()
+        );
+    }
+
+    fn fixture_write<T: Copy>(
+        snapshot: &mut AdapterAddressSnapshot,
+        offset: usize,
+        value: T,
+    ) -> *mut T {
+        assert!(offset + mem::size_of::<T>() <= snapshot.words.len() * mem::size_of::<u64>());
+        let pointer = snapshot
+            .words
+            .as_mut_ptr()
+            .cast::<u8>()
+            .wrapping_add(offset)
+            .cast::<T>();
+        // SAFETY: the test-owned buffer was bounds-checked above and remains
+        // allocated at the same address throughout every fixture observation.
+        unsafe { pointer.write_unaligned(value) };
+        pointer
+    }
+
+    fn effective_dns_fixture() -> (AdapterAddressSnapshot, *mut IP_ADAPTER_ADDRESSES_LH) {
+        let mut snapshot = AdapterAddressSnapshot::new(4096).unwrap();
+        let ipv4 = sockaddr_from_ip("192.0.2.53".parse().unwrap());
+        let ipv6 = sockaddr_from_ip("fe80::53".parse().unwrap());
+        let ipv4 = fixture_write(&mut snapshot, 2176, ipv4);
+        let ipv6 = fixture_write(&mut snapshot, 2240, ipv6);
+        let mut second = IP_ADAPTER_DNS_SERVER_ADDRESS_XP {
+            Address: SOCKET_ADDRESS {
+                lpSockaddr: ipv6.cast(),
+                iSockaddrLength: mem::size_of::<SOCKADDR_IN6>() as i32,
+            },
+            ..Default::default()
+        };
+        second.Anonymous.Alignment = mem::size_of_val(&second) as u64;
+        let second = fixture_write(&mut snapshot, 2112, second);
+        let mut first = IP_ADAPTER_DNS_SERVER_ADDRESS_XP {
+            Next: second,
+            Address: SOCKET_ADDRESS {
+                lpSockaddr: ipv4.cast(),
+                iSockaddrLength: mem::size_of::<SOCKADDR_IN>() as i32,
+            },
+            ..Default::default()
+        };
+        first.Anonymous.Alignment = mem::size_of_val(&first) as u64;
+        let first = fixture_write(&mut snapshot, 2048, first);
+        let mut other = IP_ADAPTER_ADDRESSES_LH {
+            Luid: luid(9),
+            ..Default::default()
+        };
+        other.Anonymous1.Alignment = mem::size_of_val(&other) as u64;
+        let other = fixture_write(&mut snapshot, 1024, other);
+        let mut adapter = IP_ADAPTER_ADDRESSES_LH {
+            Luid: luid(7),
+            Next: other,
+            FirstDnsServerAddress: first,
+            ..Default::default()
+        };
+        adapter.Anonymous1.Alignment = mem::size_of_val(&adapter) as u64;
+        adapter.Anonymous2.Flags = 4; // IP_ADAPTER_DHCP_ENABLED; no static DNS configuration.
+        let head = fixture_write(&mut snapshot, 0, adapter);
+        (snapshot, head)
+    }
+
+    #[test]
+    fn effective_dns_snapshot_includes_dhcp_ipv4_and_ipv6_on_only_the_selected_adapter() {
+        let (snapshot, head) = effective_dns_fixture();
+        assert_eq!(
+            snapshot.dns_servers(head, 7).unwrap(),
+            vec![
+                "192.0.2.53".parse::<IpAddr>().unwrap(),
+                "fe80::53".parse().unwrap(),
+            ]
+        );
+        assert!(snapshot.dns_servers(head, 9).unwrap().is_empty());
+        assert!(
+            snapshot.dns_servers(head, 10).is_err(),
+            "missing interface is not empty DNS"
+        );
+        assert!(
+            parse_dns_servers("").unwrap().is_empty(),
+            "automatic rollback stays automatic"
+        );
+    }
+
+    #[test]
+    fn effective_dns_snapshot_rejects_cycles_truncation_and_duplicate_luids() {
+        for case in 0..6 {
+            let (mut snapshot, head) = effective_dns_fixture();
+            let mut adapter = snapshot.read(head).unwrap();
+            match case {
+                0 => {
+                    adapter.Next = head;
+                    fixture_write(&mut snapshot, 0, adapter);
+                }
+                1 => {
+                    adapter.Anonymous1.Alignment = 4;
+                    fixture_write(&mut snapshot, 0, adapter);
+                }
+                2 => {
+                    let mut other = snapshot.read(adapter.Next).unwrap();
+                    other.Luid = luid(7);
+                    fixture_write(&mut snapshot, 1024, other);
+                }
+                3..=5 => {
+                    let mut server = snapshot.read(adapter.FirstDnsServerAddress).unwrap();
+                    if case == 3 {
+                        server.Next = adapter.FirstDnsServerAddress;
+                    }
+                    if case == 4 {
+                        server.Address.iSockaddrLength = 1;
+                    }
+                    if case == 5 {
+                        server.Address.lpSockaddr = ptr::null_mut();
+                    }
+                    fixture_write(&mut snapshot, 2048, server);
+                }
+                _ => unreachable!(),
+            }
+            assert!(snapshot.dns_servers(head, 7).is_err(), "case {case}");
+        }
+        assert!(AdapterAddressSnapshot::new(MAX_ADAPTER_SNAPSHOT_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn adapter_probe_distinguishes_absence_from_reused_identity_without_os_calls() {
+        let guid = Uuid::new_v4();
+        let name = "Usque-0123456789ab";
+        let receipt = MutationReceipt::WintunAdapter {
+            adapter_name: name.to_owned(),
+            adapter_guid: guid,
+            interface_luid: 7,
+        };
+        let mut row = MIB_IF_ROW2 {
+            InterfaceGuid: guid_from_uuid(guid),
+            InterfaceLuid: luid(7),
+            ..Default::default()
+        };
+        for (target, unit) in row.Alias.iter_mut().zip(name.encode_utf16()) {
+            *target = unit;
+        }
+        assert!(inspect_adapter_rows(&receipt, &[row]).unwrap());
+        assert!(!inspect_adapter_rows(&receipt, &[]).unwrap());
+        row.InterfaceGuid = guid_from_uuid(Uuid::new_v4());
+        assert!(matches!(
+            inspect_adapter_rows(&receipt, &[row]),
+            Err(NetworkError::AdapterIdentity)
+        ));
+        row.InterfaceGuid = guid_from_uuid(guid);
+        row.InterfaceLuid = luid(8);
+        assert!(matches!(
+            inspect_adapter_rows(&receipt, &[row]),
+            Err(NetworkError::AdapterIdentity)
+        ));
+        row.InterfaceLuid = luid(7);
+        row.Alias[0] = b'X' as u16;
+        assert!(matches!(
+            inspect_adapter_rows(&receipt, &[row]),
+            Err(NetworkError::AdapterIdentity)
+        ));
+        // Freed LUIDs may be reused by another VPN. Different GUID AND name
+        // must not be mistaken for a conflicting instance of our old adapter.
+        row.InterfaceGuid = guid_from_uuid(Uuid::new_v4());
+        assert!(!inspect_adapter_rows(&receipt, &[row]).unwrap());
+    }
+
+    fn observed_route(network: &str, interface_luid: u64, metric: u32) -> MIB_IPFORWARD_ROW2 {
+        let network = network.parse::<IpNet>().unwrap();
+        MIB_IPFORWARD_ROW2 {
+            InterfaceLuid: luid(interface_luid),
+            InterfaceIndex: interface_luid as u32,
+            DestinationPrefix: prefix_from_network(network),
+            NextHop: sockaddr_from_ip(unspecified(network)),
+            ValidLifetime: u32::MAX,
+            Metric: metric,
+            ..MIB_IPFORWARD_ROW2::default()
+        }
+    }
+
+    fn observed_interface(interface_luid: u64, family: ADDRESS_FAMILY) -> MIB_IPINTERFACE_ROW {
+        MIB_IPINTERFACE_ROW {
+            Family: family,
+            InterfaceLuid: luid(interface_luid),
+            InterfaceIndex: interface_luid as u32,
+            Connected: true,
+            NlMtu: 1_500,
+            Metric: 10,
+            ..MIB_IPINTERFACE_ROW::default()
+        }
+    }
+
+    #[test]
+    fn physical_route_observation_excludes_tun_owned_bypass_and_disconnected_interfaces() {
+        let mut loopback = observed_route("203.0.113.9/32", 12, 0);
+        loopback.Loopback = true;
+        let routes = [
+            observed_route("128.0.0.0/1", 7, 0),
+            observed_route("203.0.113.9/32", 9, 0),
+            observed_route("0.0.0.0/0", 9, 50),
+            observed_route("0.0.0.0/0", 10, 1),
+            observed_route("203.0.113.9/32", 11, 0),
+            loopback,
+        ];
+        let owned = [RouteReceipt {
+            destination: "203.0.113.9/32".to_owned(),
+            next_hop: None,
+            next_hop_scope_id: 0,
+            interface_luid: 9,
+            metric: 0,
+            owned: true,
+        }];
+        let (selected, _) = select_current_physical_route(
+            &routes,
+            "203.0.113.9".parse().unwrap(),
+            7,
+            &owned,
+            |interface_luid, family| {
+                let mut interface = observed_interface(interface_luid, family);
+                interface.Connected = interface_luid != 11;
+                Ok(interface)
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(luid_value(selected.InterfaceLuid), 10);
+    }
+
+    #[test]
+    fn physical_route_observation_preserves_preexisting_routes_and_longest_prefix() {
+        let routes = [
+            observed_route("0.0.0.0/0", 10, 0),
+            observed_route("203.0.113.9/32", 9, 100),
+        ];
+        let preexisting = [RouteReceipt {
+            destination: "203.0.113.9/32".to_owned(),
+            next_hop: None,
+            next_hop_scope_id: 0,
+            interface_luid: 9,
+            metric: 100,
+            owned: false,
+        }];
+        let (selected, _) = select_current_physical_route(
+            &routes,
+            "203.0.113.9".parse().unwrap(),
+            7,
+            &preexisting,
+            |interface_luid, family| Ok(observed_interface(interface_luid, family)),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(luid_value(selected.InterfaceLuid), 9);
+    }
+
+    #[test]
+    fn physical_route_observation_has_hard_route_and_interface_limits() {
+        let routes = vec![observed_route("0.0.0.0/0", 9, 0); MAX_OBSERVED_ROUTES + 1];
+        assert!(matches!(
+            select_current_physical_route(
+                &routes,
+                "203.0.113.9".parse().unwrap(),
+                7,
+                &[],
+                |_, _| panic!("oversized snapshot must fail before interface lookup")
+            ),
+            Err(NetworkError::RouteSnapshotTooLarge)
+        ));
+        let routes = (100..100 + MAX_OBSERVED_INTERFACES as u64 + 1)
+            .map(|interface| observed_route("0.0.0.0/0", interface, 1))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            select_current_physical_route(
+                &routes,
+                "203.0.113.9".parse().unwrap(),
+                7,
+                &[],
+                |interface_luid, family| Ok(observed_interface(interface_luid, family))
+            ),
+            Err(NetworkError::RouteSnapshotTooLarge)
+        ));
+    }
+
+    #[test]
+    fn sockaddr_round_trips_ipv4_and_ipv6_scope() {
+        for (address, scope) in [
+            ("162.159.198.2".parse().expect("IPv4"), 0),
+            ("2606:4700:103::2".parse().expect("IPv6"), 19),
+        ] {
+            let encoded = sockaddr_from_ip_scoped(address, scope);
+            assert_eq!(
+                ip_from_sockaddr(&encoded).expect("decode"),
+                (address, scope)
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_encoding_preserves_network_and_length() {
+        for network in ["192.168.0.0/16", "2606:4700:103::/48"] {
+            let network = network.parse::<IpNet>().expect("network");
+            let encoded = prefix_from_network(network);
+            assert_eq!(encoded.PrefixLength, network.prefix_len());
+            assert_eq!(
+                ip_from_sockaddr(&encoded.Prefix).expect("decode").0,
+                network.addr()
+            );
+        }
+    }
+
+    #[test]
+    fn dns_snapshot_parser_accepts_windows_separators() {
+        assert_eq!(
+            parse_dns_servers("1.1.1.1, 8.8.8.8;2606:4700:4700::1111").expect("servers"),
+            vec![
+                "1.1.1.1".parse::<IpAddr>().expect("IPv4"),
+                "8.8.8.8".parse::<IpAddr>().expect("IPv4"),
+                "2606:4700:4700::1111".parse::<IpAddr>().expect("IPv6"),
+            ]
+        );
+        assert!(parse_dns_servers("resolver.example").is_err());
+    }
+
+    #[test]
+    fn dns_settings_separate_ipv4_and_ipv6_servers() {
+        let servers = [
+            "1.1.1.1".parse::<IpAddr>().expect("IPv4"),
+            "2606:4700:4700::1111".parse::<IpAddr>().expect("IPv6"),
+            "8.8.8.8".parse::<IpAddr>().expect("IPv4"),
+            "2001:4860:4860::8888".parse::<IpAddr>().expect("IPv6"),
+        ];
+
+        assert_eq!(
+            dns_server_text(&servers, false),
+            "1.1.1.1,8.8.8.8"
+                .encode_utf16()
+                .chain([0])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            dns_server_text(&servers, true),
+            "2606:4700:4700::1111,2001:4860:4860::8888"
+                .encode_utf16()
+                .chain([0])
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(dns_server_flags(false), u64::from(DNS_SETTING_NAMESERVER));
+        assert_eq!(
+            dns_server_flags(true),
+            u64::from(DNS_SETTING_NAMESERVER | DNS_SETTING_IPV6)
+        );
+    }
+
+    #[test]
+    fn empty_dns_family_uses_a_non_null_empty_string() {
+        assert_eq!(dns_server_text(&[], false), vec![0]);
+        assert_eq!(
+            dns_server_text(&["1.1.1.1".parse().expect("IPv4")], true),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn guid_uuid_conversion_is_lossless() {
+        let value = Uuid::parse_str("12345678-9abc-def0-1122-334455667788").expect("UUID");
+        assert_eq!(uuid_from_guid(guid_from_uuid(value)), value);
+    }
+
+    #[test]
+    fn ipv4_mtu_update_clears_the_non_modifiable_site_prefix() {
+        let mut ipv4 = MIB_IPINTERFACE_ROW {
+            SitePrefixLength: 24,
+            ..Default::default()
+        };
+        prepare_mtu_update(&mut ipv4, AF_INET, 1280);
+        assert_eq!(ipv4.NlMtu, 1280);
+        assert_eq!(ipv4.SitePrefixLength, 0);
+
+        let mut ipv6 = MIB_IPINTERFACE_ROW {
+            SitePrefixLength: 64,
+            ..Default::default()
+        };
+        prepare_mtu_update(&mut ipv6, AF_INET6, 1280);
+        assert_eq!(ipv6.NlMtu, 1280);
+        assert_eq!(ipv6.SitePrefixLength, 64);
+    }
+
+    #[test]
+    fn already_exists_clears_ownership_without_failing_apply() {
+        let mut owned = true;
+        record_create_ownership(
+            &mut owned,
+            Err(NetworkError::windows(
+                "CreateIpForwardEntry2",
+                ERROR_OBJECT_ALREADY_EXISTS,
+            )),
+        )
+        .expect("already exists is a no-op");
+        assert!(!owned);
+
+        let mut owned = true;
+        record_create_ownership(
+            &mut owned,
+            Err(NetworkError::windows(
+                "CreateUnicastIpAddressEntry",
+                ERROR_ALREADY_EXISTS,
+            )),
+        )
+        .expect("already exists is a no-op");
+        assert!(!owned);
+
+        let mut owned = true;
+        let error = record_create_ownership(
+            &mut owned,
+            Err(NetworkError::windows(
+                "CreateIpForwardEntry2",
+                ERROR_NOT_FOUND,
+            )),
+        )
+        .expect_err("other Windows errors stay fatal");
+        assert!(owned);
+        assert!(matches!(
+            error,
+            NetworkError::Windows {
+                code: ERROR_NOT_FOUND,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn route_row_rejects_mixed_families_without_touching_windows() {
+        let receipt = RouteReceipt {
+            destination: "0.0.0.0/0".to_owned(),
+            next_hop: Some("2001:db8::1".parse().expect("IPv6")),
+            next_hop_scope_id: 0,
+            interface_luid: 1,
+            metric: 0,
+            owned: true,
+        };
+        assert!(matches!(
+            route_row(&receipt),
+            Err(NetworkError::AddressFamily)
+        ));
+    }
+
+    fn fake_route(destination: IpNet) -> RouteReceipt {
+        RouteReceipt {
+            destination: destination.to_string(),
+            next_hop: Some(match destination {
+                IpNet::V4(_) => "192.0.2.1".parse().expect("IPv4 gateway"),
+                IpNet::V6(_) => "2001:db8::1".parse().expect("IPv6 gateway"),
+            }),
+            next_hop_scope_id: 0,
+            interface_luid: 7,
+            metric: 5,
+            owned: true,
+        }
+    }
+
+    fn candidates() -> (Vec<SocketAddr>, Vec<SocketAddr>) {
+        (
+            vec![
+                "162.159.198.2:443".parse().expect("IPv4 endpoint"),
+                "[2606:4700:103::2]:443".parse().expect("IPv6 endpoint"),
+            ],
+            vec![
+                "198.51.100.10:443".parse().expect("IPv4 control"),
+                "[2001:db8::10]:443".parse().expect("IPv6 control"),
+            ],
+        )
+    }
+
+    #[test]
+    fn endpoint_bypass_skips_an_unreachable_ipv6_family() {
+        let (endpoints, control) = candidates();
+        let receipt = plan_endpoint_bypass_with(&endpoints, &control, |destination| {
+            if destination.addr().is_ipv6() {
+                Err(NetworkError::windows(
+                    "GetBestInterfaceEx",
+                    ERROR_NETWORK_UNREACHABLE,
+                ))
+            } else {
+                Ok(fake_route(destination))
+            }
+        })
+        .expect("IPv4 routes keep the plan usable");
+        let MutationReceipt::EndpointBypass { created } = receipt else {
+            panic!("endpoint receipt");
+        };
+        assert_eq!(created.len(), 2);
+        assert!(
+            created
+                .iter()
+                .all(|route| route.destination.ends_with("/32"))
+        );
+    }
+
+    #[test]
+    fn endpoint_bypass_skips_an_unreachable_ipv4_family() {
+        let (endpoints, control) = candidates();
+        let receipt = plan_endpoint_bypass_with(&endpoints, &control, |destination| {
+            if destination.addr().is_ipv4() {
+                Err(NetworkError::windows(
+                    "GetBestInterfaceEx",
+                    ERROR_NETWORK_UNREACHABLE,
+                ))
+            } else {
+                Ok(fake_route(destination))
+            }
+        })
+        .expect("IPv6 routes keep the plan usable");
+        let MutationReceipt::EndpointBypass { created } = receipt else {
+            panic!("endpoint receipt");
+        };
+        assert_eq!(created.len(), 2);
+        assert!(
+            created
+                .iter()
+                .all(|route| route.destination.ends_with("/128"))
+        );
+    }
+
+    #[test]
+    fn endpoint_bypass_retries_interface_churn_once() {
+        let (endpoints, control) = candidates();
+        let mut first_ipv4_endpoint_lookup = true;
+        let receipt = plan_endpoint_bypass_with(&endpoints, &control, |destination| {
+            if destination.addr() == endpoints[0].ip() && first_ipv4_endpoint_lookup {
+                first_ipv4_endpoint_lookup = false;
+                return Err(NetworkError::windows("GetBestRoute2", ERROR_FILE_NOT_FOUND));
+            }
+            Ok(fake_route(destination))
+        })
+        .expect("a replacement interface is discovered");
+        let MutationReceipt::EndpointBypass { created } = receipt else {
+            panic!("endpoint receipt");
+        };
+        assert_eq!(created.len(), 4);
+        assert!(!first_ipv4_endpoint_lookup);
+    }
+
+    #[test]
+    fn endpoint_bypass_requires_a_data_route() {
+        let (endpoints, control) = candidates();
+        let result = plan_endpoint_bypass_with(&endpoints, &control, |destination| {
+            if endpoints
+                .iter()
+                .any(|candidate| candidate.ip() == destination.addr())
+            {
+                Err(NetworkError::windows(
+                    "GetBestInterfaceEx",
+                    ERROR_NETWORK_UNREACHABLE,
+                ))
+            } else {
+                Ok(fake_route(destination))
+            }
+        });
+        assert!(matches!(result, Err(NetworkError::NoReachableEndpoint)));
+    }
+
+    #[test]
+    fn endpoint_bypass_requires_a_control_route() {
+        let (endpoints, control) = candidates();
+        let result = plan_endpoint_bypass_with(&endpoints, &control, |destination| {
+            if control
+                .iter()
+                .any(|candidate| candidate.ip() == destination.addr())
+            {
+                Err(NetworkError::windows(
+                    "GetBestInterfaceEx",
+                    ERROR_PROTOCOL_UNREACHABLE,
+                ))
+            } else {
+                Ok(fake_route(destination))
+            }
+        });
+        assert!(matches!(result, Err(NetworkError::NoReachableControlApi)));
+    }
+
+    #[test]
+    fn endpoint_bypass_does_not_hide_fatal_route_errors() {
+        let (endpoints, control) = candidates();
+        let result = plan_endpoint_bypass_with(&endpoints, &control, |_| {
+            Err(NetworkError::windows("GetBestInterfaceEx", 5))
+        });
+        assert!(matches!(result, Err(NetworkError::Windows { code: 5, .. })));
+    }
+}

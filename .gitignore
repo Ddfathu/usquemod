@@ -1,0 +1,106 @@
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+.env.*
+!.env.example
+
+# Usque specific
+/AGENTS.md
+/.claude/
+config*.json*
+/usque
+usque.exe
+dist/.vscode/
+.vscode/
+
+# Rust
+/target/
+/third_party/ts_netstack_smoltcp_core/target/
+/third_party/quiche-0.29.3/target/
+/.toolchains
+/.wix/
+/dist/
+**/*.rs.bk
+
+# Flutter and Dart
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/build/
+!third_party/boring-sys-4.22.0/build/
+!third_party/boring-sys-4.22.0/build/main.rs
+!third_party/boring-sys-4.22.0/build/config.rs
+**/.packages
+
+# Python tooling
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# IDE, OS and native-tool caches
+/.idea/
+/.vs/
+/.nvimlog
+*.swp
+*.swo
+**/.gradle/
+**/.kotlin/
+**/.cxx/
+**/.externalNativeBuild/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Platform-local build configuration and signing material
+**/android/local.properties
+**/android/key.properties
+**/android/app/src/main/jniLibs/
+**/*.jks
+**/*.keystore
+**/*.p12
+**/*.pfx
+**/*.mobileprovision
+**/macos/Flutter/ephemeral/
+**/linux/flutter/ephemeral/
+**/windows/flutter/ephemeral/
+
+# Local diagnostics and coverage
+/diagnostics/
+/coverage/
+/tmp/
+*.lcov
+*.log
+*.dmp
+
+# Official signed Wintun redistribution payloads. Only the two Windows Beta
+# architectures are vendored; their source archive hash is documented beside
+# the files.
+!third_party/wintun-0.14.1/wintun/bin/amd64/wintun.dll
+!third_party/wintun-0.14.1/wintun/bin/arm64/wintun.dll
+
+*.apk
+*.zip

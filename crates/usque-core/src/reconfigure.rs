@@ -1,0 +1,490 @@
+//! Classify an in-place profile mutation so the engine can keep MASQUE when
+//! only local frontends change.
+
+use crate::config::Profile;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconfigureClass {
+    /// Only persisted, next-session settings changed (or no runtime change).
+    PersistOnly,
+    /// Update the shared application traffic policy without replacing any flow.
+    HotTrafficPolicy,
+    /// Profile id or identity-bound endpoint changed; refuse.
+    Reject,
+    /// Tear down MASQUE and reconnect with rollback.
+    ColdReconnect,
+    /// Only Windows system-proxy lease changes.
+    HotSystemProxy,
+    /// SOCKS/HTTP listeners or those frontend toggles (and proxy DNS/auth).
+    HotFrontends,
+    /// Only the VPN/TUN frontend flag flipped and no mode-dependent GEO or DNS
+    /// policy needs to be rebuilt.
+    HotTunnelAttach,
+    /// Replace the final OpenVPN session while retaining the WARP underlay.
+    HotVpnGate,
+}
+
+/// Decide how to apply `next` over the currently connected `previous` profile.
+pub fn classify_reconfigure(previous: &Profile, next: &Profile) -> ReconfigureClass {
+    if previous.id != next.id {
+        return ReconfigureClass::Reject;
+    }
+
+    let mut runtime_next = next.clone();
+    runtime_next.congestion_control = previous.congestion_control;
+    runtime_next.disable_quic = previous.disable_quic;
+    if previous == &runtime_next {
+        return if previous.disable_quic != next.disable_quic {
+            ReconfigureClass::HotTrafficPolicy
+        } else {
+            ReconfigureClass::PersistOnly
+        };
+    }
+    if previous.vpn_gate != next.vpn_gate || previous.chain_exit != next.chain_exit {
+        if !previous.chain_enabled() && next.chain_enabled() && previous.mtu != 1280 {
+            return ReconfigureClass::ColdReconnect;
+        }
+        let mut without_gate = runtime_next.clone();
+        without_gate.vpn_gate = previous.vpn_gate.clone();
+        without_gate.chain_exit = previous.chain_exit.clone();
+        if previous == &without_gate {
+            return ReconfigureClass::HotVpnGate;
+        }
+        return ReconfigureClass::ColdReconnect;
+    }
+
+    let cold = previous.data_plane != next.data_plane
+        || previous.data_plane == crate::DataPlaneMode::L4Proxy
+            && previous.frontends.tunnel != next.frontends.tunnel
+        || previous.transport != next.transport
+        || previous.endpoint != next.endpoint
+        || previous.ip_policy != next.ip_policy
+        || previous.mtu != next.mtu
+        || previous.dns_mode != next.dns_mode
+        || previous.dns_servers != next.dns_servers
+        || previous.allow_lan != next.allow_lan
+        || previous.split_exclusions != next.split_exclusions
+        || previous.kill_switch != next.kill_switch
+        || previous.bypass_domains != next.bypass_domains
+        || previous.geo_direct_countries != next.geo_direct_countries
+        || previous.direct_dns != next.direct_dns
+        // Final proxy DNS is shared by TUN and local frontends for the session.
+        || previous.chain_enabled() && previous.chain_exit.as_ref().is_some_and(|chain| chain.source.is_proxy())
+            && (previous.proxy.dns_mode != next.proxy.dns_mode
+                || previous.proxy.dns_servers != next.proxy.dns_servers)
+        // Automatic MASQUE sockets need leases owned by the new VPN operation.
+        // A proxy runtime's no-op protector cannot supply those on hot attach.
+        || !previous.frontends.tunnel
+            && next.frontends.tunnel
+            && next.endpoint.selection == crate::EndpointSelection::Automatic
+        || previous.frontends.tunnel != next.frontends.tunnel
+            && (previous.has_domain_direct_rules()
+                || next.has_domain_direct_rules()
+                // The final Gate gateway creates its synthetic DNS service at
+                // startup only when TUN is enabled. A hot attach cannot supply
+                // the resolver that both platforms advertise to the OS.
+                || previous.chain_enabled() && (previous.dns_mode == crate::DnsMode::Tunnel || previous.custom_chain().is_some()));
+    if cold {
+        return ReconfigureClass::ColdReconnect;
+    }
+
+    let proxy_except_system = proxy_equal_except_system(&previous.proxy, &next.proxy);
+
+    let socks_http_frontends = previous.frontends.socks5 == next.frontends.socks5
+        && previous.frontends.http == next.frontends.http;
+    let tunnel_same = previous.frontends.tunnel == next.frontends.tunnel;
+    let system_proxy_same = previous.proxy.system_proxy == next.proxy.system_proxy;
+
+    if tunnel_same && socks_http_frontends && proxy_except_system && !system_proxy_same {
+        return ReconfigureClass::HotSystemProxy;
+    }
+
+    // Frontend application also replaces the Windows system-proxy lease. In
+    // particular, disabling HTTP normalizes system_proxy to false and must not
+    // tear down the other outputs or their shared underlay.
+    if tunnel_same && (!socks_http_frontends || !proxy_except_system) {
+        return ReconfigureClass::HotFrontends;
+    }
+
+    if !tunnel_same && socks_http_frontends && proxy_except_system && system_proxy_same {
+        return ReconfigureClass::HotTunnelAttach;
+    }
+
+    if previous.frontends == next.frontends && previous.proxy == next.proxy {
+        return ReconfigureClass::ColdReconnect;
+    }
+
+    ReconfigureClass::ColdReconnect
+}
+
+fn proxy_equal_except_system(
+    previous: &crate::config::ProxySettings,
+    next: &crate::config::ProxySettings,
+) -> bool {
+    previous.socks5_listeners == next.socks5_listeners
+        && previous.http_listeners == next.http_listeners
+        && previous.udp_idle_timeout_seconds == next.udp_idle_timeout_seconds
+        && previous.dns_mode == next.dns_mode
+        && previous.dns_servers == next.dns_servers
+        && previous.auth_username == next.auth_username
+        && previous.auth_password == next.auth_password
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{FrontendSettings, Profile};
+
+    fn base() -> Profile {
+        Profile::default()
+    }
+
+    #[test]
+    fn final_proxy_dns_changes_reconnect_both_system_and_local_frontends() {
+        for source in [
+            crate::chain_exit::ChainSource::HttpProxy,
+            crate::chain_exit::ChainSource::Socks5Proxy,
+        ] {
+            let mut previous = base();
+            previous.chain_exit = Some(crate::chain_exit::ChainExitSettings {
+                enabled: true,
+                source,
+                profile_id: Some(uuid::Uuid::new_v4()),
+                revision: Some(uuid::Uuid::new_v4()),
+                ..Default::default()
+            });
+            let mut next = previous.clone();
+            next.proxy.dns_mode = crate::ProxyDnsMode::LocalConfigured;
+            assert_eq!(
+                classify_reconfigure(&previous, &next),
+                ReconfigureClass::ColdReconnect
+            );
+            next = previous.clone();
+            next.proxy.dns_servers = vec!["9.9.9.9".parse().unwrap()];
+            assert_eq!(
+                classify_reconfigure(&previous, &next),
+                ReconfigureClass::ColdReconnect
+            );
+        }
+        let previous = base();
+        let mut next = previous.clone();
+        next.proxy.dns_mode = crate::ProxyDnsMode::LocalConfigured;
+        assert_eq!(
+            classify_reconfigure(&previous, &next),
+            ReconfigureClass::HotFrontends
+        );
+    }
+
+    #[test]
+    fn quic_policy_is_hot_and_does_not_escalate_mixed_changes() {
+        for enabled in [false, true] {
+            let previous = Profile {
+                disable_quic: !enabled,
+                ..base()
+            };
+            let mut next = previous.clone();
+            next.disable_quic = enabled;
+            assert_eq!(
+                classify_reconfigure(&previous, &next),
+                ReconfigureClass::HotTrafficPolicy
+            );
+            next.congestion_control = crate::CongestionControlAlgorithm::Reno;
+            assert_eq!(
+                classify_reconfigure(&previous, &next),
+                ReconfigureClass::HotTrafficPolicy
+            );
+            let mut mixed = next.clone();
+            mixed.proxy.socks5_listeners[0].set_port(1081);
+            assert_eq!(
+                classify_reconfigure(&previous, &mixed),
+                ReconfigureClass::HotFrontends
+            );
+            mixed = next.clone();
+            mixed.proxy.system_proxy = !previous.proxy.system_proxy;
+            assert_eq!(
+                classify_reconfigure(&previous, &mixed),
+                ReconfigureClass::HotSystemProxy
+            );
+            mixed = next.clone();
+            mixed.vpn_gate.enabled = !previous.vpn_gate.enabled;
+            assert_eq!(
+                classify_reconfigure(&previous, &mixed),
+                ReconfigureClass::HotVpnGate
+            );
+            next.mtu += 1;
+            assert_eq!(
+                classify_reconfigure(&previous, &next),
+                ReconfigureClass::ColdReconnect
+            );
+        }
+    }
+
+    #[test]
+    fn congestion_selection_is_deferred_even_with_other_runtime_changes() {
+        let previous = base();
+        for algorithm in crate::CongestionControlAlgorithm::ALL {
+            let mut next = previous.clone();
+            next.congestion_control = algorithm;
+            assert_eq!(
+                classify_reconfigure(&previous, &next),
+                ReconfigureClass::PersistOnly
+            );
+            next.proxy.socks5_listeners[0].set_port(1081);
+            assert_eq!(
+                classify_reconfigure(&previous, &next),
+                ReconfigureClass::HotFrontends
+            );
+            next.mtu += 1;
+            assert_eq!(
+                classify_reconfigure(&previous, &next),
+                ReconfigureClass::ColdReconnect
+            );
+        }
+    }
+
+    #[test]
+    fn socks_port_change_is_hot_frontends() {
+        let previous = base();
+        let mut next = previous.clone();
+        next.proxy.socks5_listeners[0].set_port(1081);
+        assert_eq!(
+            classify_reconfigure(&previous, &next),
+            ReconfigureClass::HotFrontends
+        );
+    }
+
+    #[test]
+    fn system_proxy_only_is_hot_system_proxy() {
+        let previous = base();
+        let mut next = previous.clone();
+        next.proxy.system_proxy = !previous.proxy.system_proxy;
+        assert_eq!(
+            classify_reconfigure(&previous, &next),
+            ReconfigureClass::HotSystemProxy
+        );
+    }
+
+    #[test]
+    fn disabling_http_and_its_system_proxy_keeps_other_outputs_hot() {
+        let mut previous = base();
+        previous.proxy.system_proxy = true;
+        let mut next = previous.clone();
+        next.frontends.http = false;
+        next.proxy.system_proxy = false;
+        next.canonicalize_mode();
+        assert_eq!(
+            classify_reconfigure(&previous, &next),
+            ReconfigureClass::HotFrontends
+        );
+        next.mtu = 1400;
+        assert_eq!(
+            classify_reconfigure(&previous, &next),
+            ReconfigureClass::ColdReconnect
+        );
+    }
+
+    #[test]
+    fn tunnel_only_flip_is_attach_detach() {
+        let previous = base();
+        let mut next = previous.clone();
+        next.frontends = FrontendSettings {
+            tunnel: !previous.frontends.tunnel,
+            socks5: previous.frontends.socks5,
+            http: previous.frontends.http,
+        };
+        assert_eq!(
+            classify_reconfigure(&previous, &next),
+            ReconfigureClass::HotTunnelAttach
+        );
+    }
+
+    #[test]
+    fn automatic_tunnel_attach_recreates_endpoint_protection() {
+        for transport in [
+            crate::TransportPolicy::Auto,
+            crate::TransportPolicy::Http3,
+            crate::TransportPolicy::Http2,
+        ] {
+            for kill_switch in [false, true] {
+                let mut proxy = base();
+                proxy.transport = transport;
+                proxy.kill_switch = kill_switch;
+                proxy.frontends.tunnel = false;
+                let mut vpn = proxy.clone();
+                vpn.frontends.tunnel = true;
+                assert_eq!(
+                    classify_reconfigure(&proxy, &vpn),
+                    ReconfigureClass::ColdReconnect
+                );
+                assert_eq!(
+                    classify_reconfigure(&vpn, &proxy),
+                    ReconfigureClass::HotTunnelAttach
+                );
+                proxy.endpoint.selection = crate::EndpointSelection::Custom;
+                vpn.endpoint.selection = crate::EndpointSelection::Custom;
+                assert_eq!(
+                    classify_reconfigure(&proxy, &vpn),
+                    ReconfigureClass::HotTunnelAttach
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gate_tunnel_dns_toggle_rebuilds_gateway_but_custom_connect_ip_toggles_stay_hot() {
+        for transport in [
+            crate::TransportPolicy::Auto,
+            crate::TransportPolicy::Http3,
+            crate::TransportPolicy::Http2,
+        ] {
+            for enabled in [false, true] {
+                for dns_mode in [
+                    crate::DnsMode::Tunnel,
+                    crate::DnsMode::LocalConfigured,
+                    crate::DnsMode::System,
+                ] {
+                    let mut proxy = base();
+                    proxy.endpoint.selection = crate::EndpointSelection::Custom;
+                    proxy.transport = transport;
+                    proxy.vpn_gate.enabled = enabled;
+                    proxy.dns_mode = dns_mode;
+                    proxy.frontends.tunnel = false;
+                    let mut vpn = proxy.clone();
+                    vpn.frontends.tunnel = true;
+                    let expected = if enabled && dns_mode == crate::DnsMode::Tunnel {
+                        ReconfigureClass::ColdReconnect
+                    } else {
+                        ReconfigureClass::HotTunnelAttach
+                    };
+                    assert_eq!(classify_reconfigure(&proxy, &vpn), expected);
+                    assert_eq!(classify_reconfigure(&vpn, &proxy), expected);
+
+                    let mut listeners = proxy.clone();
+                    listeners.proxy.socks5_listeners[0].set_port(1081);
+                    assert_eq!(
+                        classify_reconfigure(&proxy, &listeners),
+                        ReconfigureClass::HotFrontends
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_or_mtu_still_reconnects() {
+        let previous = base();
+        let mut next = previous.clone();
+        next.mtu = 1400;
+        assert_eq!(
+            classify_reconfigure(&previous, &next),
+            ReconfigureClass::ColdReconnect
+        );
+        next = previous.clone();
+        next.endpoint.port = 8443;
+        assert_eq!(
+            classify_reconfigure(&previous, &next),
+            ReconfigureClass::ColdReconnect
+        );
+    }
+
+    #[test]
+    fn different_profile_id_is_rejected() {
+        let previous = base();
+        let mut next = previous.clone();
+        next.id = uuid::Uuid::from_u128(2);
+        assert_eq!(
+            classify_reconfigure(&previous, &next),
+            ReconfigureClass::Reject
+        );
+    }
+
+    #[test]
+    fn l4_is_independent_and_tun_toggle_is_cold_but_frontends_remain_hot() {
+        let previous = base();
+        let mut l4 = previous.clone();
+        l4.data_plane = crate::DataPlaneMode::L4Proxy;
+        assert_eq!(
+            classify_reconfigure(&previous, &l4),
+            ReconfigureClass::ColdReconnect
+        );
+        assert_eq!(
+            classify_reconfigure(&l4, &previous),
+            ReconfigureClass::ColdReconnect
+        );
+        let mut next = l4.clone();
+        next.frontends.tunnel = !l4.frontends.tunnel;
+        assert_eq!(
+            classify_reconfigure(&l4, &next),
+            ReconfigureClass::ColdReconnect
+        );
+        next = l4.clone();
+        next.proxy.socks5_listeners[0].set_port(1081);
+        assert_eq!(
+            classify_reconfigure(&l4, &next),
+            ReconfigureClass::HotFrontends
+        );
+    }
+
+    #[test]
+    fn geo_direct_country_list_change_is_cold_reconnect() {
+        let previous = base();
+        let mut next = previous.clone();
+        next.geo_direct_countries = vec!["CN".to_owned()];
+        assert_eq!(
+            classify_reconfigure(&previous, &next),
+            ReconfigureClass::ColdReconnect
+        );
+        next.proxy.socks5_listeners[0].set_port(1081);
+        assert_eq!(
+            classify_reconfigure(&previous, &next),
+            ReconfigureClass::ColdReconnect
+        );
+        let unchanged = previous.clone();
+        assert_ne!(
+            classify_reconfigure(&previous, &unchanged),
+            ReconfigureClass::Reject
+        );
+        let socks_only = {
+            let mut profile = previous.clone();
+            profile.proxy.socks5_listeners[0].set_port(1081);
+            profile
+        };
+        assert_eq!(
+            classify_reconfigure(&previous, &socks_only),
+            ReconfigureClass::HotFrontends
+        );
+    }
+
+    #[test]
+    fn geo_direct_tunnel_toggle_is_cold_reconnect() {
+        let mut proxy_only = base();
+        proxy_only.frontends.tunnel = false;
+        proxy_only.geo_direct_countries = vec!["CN".to_owned()];
+        let mut vpn = proxy_only.clone();
+        vpn.frontends.tunnel = true;
+
+        assert_eq!(
+            classify_reconfigure(&proxy_only, &vpn),
+            ReconfigureClass::ColdReconnect
+        );
+        assert_eq!(
+            classify_reconfigure(&vpn, &proxy_only),
+            ReconfigureClass::ColdReconnect
+        );
+    }
+
+    #[test]
+    fn direct_dns_change_is_a_cold_reconnect() {
+        let previous = base();
+        let mut next = previous.clone();
+        next.direct_dns.mode = crate::config::DirectDnsMode::Doh;
+        next.direct_dns.server_name = "dns.example.com".to_owned();
+        next.direct_dns.doh_path = "/dns-query".to_owned();
+        next.direct_dns.bootstrap_ips = vec!["192.0.2.53".parse().unwrap()];
+        next.direct_dns.port = 443;
+        assert_eq!(
+            classify_reconfigure(&previous, &next),
+            ReconfigureClass::ColdReconnect
+        );
+    }
+}

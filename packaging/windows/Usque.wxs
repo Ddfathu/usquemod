@@ -1,0 +1,435 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix
+  xmlns="http://wixtoolset.org/schemas/v4/wxs"
+  xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui"
+  RequiredVersion="5.0.2">
+  <Package
+    Name="Usque $(DisplayVersion)"
+    Manufacturer="Usque contributors"
+    ProductCode="$(ProductCode)"
+    Version="$(MsiVersion)"
+    UpgradeCode="076CF387-E447-4666-9153-2DA16049A390"
+    Language="$(MsiLanguage)"
+    Codepage="$(MsiCodepage)"
+    Scope="perMachine"
+    InstallerVersion="500">
+
+    <!--
+      Windows Installer compares only numeric versions. The build script maps
+      SemVer prereleases monotonically and keeps the user-facing SemVer in the
+      package name. Equal-version upgrades are intentional: they let users
+      replace a validation build of the same architecture without two products
+      owning the same installation directory.
+
+      Install the new product transaction before removing the related product.
+      The fixed, versioned Agent must be present when an older cached MSI runs
+      its fail-closed recovery action. Stable component identities keep shared
+      files and the service registered while the older product is removed. Keep
+      this inside the transaction so either both sides commit or both roll back.
+    -->
+    <MajorUpgrade
+      AllowSameVersionUpgrades="yes"
+      DowngradeErrorMessage="A newer version of [ProductName] is already installed."
+      IgnoreLanguage="yes"
+      Schedule="afterInstallExecute" />
+
+    <!--
+      AllowSameVersionUpgrades affects product detection, not file replacement.
+      Every File in this package is private application payload, never user
+      data or a shared system DLL. Replace that payload as a unit, including
+      equal-version binaries and unversioned files, so a new signer/Engine
+      cannot be combined with an old Agent or GUI. Product downgrades remain
+      blocked. Do not set REINSTALL: repair/modify/patch stays unsupported.
+    -->
+    <CustomAction
+      Id="SetPayloadReinstallMode"
+      Property="REINSTALLMODE"
+      Value="amus" />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+    <ui:WixUI
+      Id="UsqueWixUI_InstallDir"
+      InstallDirectory="INSTALLFOLDER" />
+    <WixVariable Id="WixUILicenseRtf" Value="$(LicensePath)" />
+
+    <Property Id="ARPCOMMENTS" Value="Unofficial Consumer WARP client. Installed variant: $(Variant)." />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+    <Property Id="ARPSYSTEMCOMPONENT" Value="1" />
+    <Property Id="ARPPRODUCTICON" Value="UsqueProductIcon.ico" />
+    <!--
+      Restart Manager first gives the GUI and Engine a bounded graceful exit.
+      Force only an unresponsive process so an already-installed version that
+      predates the maintenance-shutdown protocol cannot block its own upgrade.
+      Never restart a process after uninstall or while a major upgrade is
+      replacing its executable and recovering privileged network state.
+    -->
+    <Property Id="MSIRMSHUTDOWN" Value="1" />
+    <Property Id="MSIDISABLERMRESTART" Value="1" />
+    <!--
+      Leave this public property unset so the MSI checkbox stays off by default.
+      Settings uninstall uses usque-uninstall.exe, which sets the value only
+      after the user confirms.
+    -->
+    <Property Id="USQUE_REMOVE_USER_DATA" Secure="yes" />
+    <!-- Read by the signed in-app update helper before Windows Installer runs. -->
+    <Property Id="USQUE_UPDATE_VARIANT" Value="$(Variant)" />
+    <Icon Id="UsqueProductIcon.ico" SourceFile="$(IconPath)" />
+
+    <!-- Preserve a user-selected target directory across major upgrades. -->
+    <Property Id="INSTALLFOLDER" Secure="yes">
+      <RegistrySearch
+        Id="UsqueInstallLocationSearch"
+        Root="HKLM"
+        Key="Software\Usque"
+        Name="InstallLocation"
+        Type="directory"
+        Bitness="always64" />
+    </Property>
+
+    <Property Id="WINDOWSBUILDNUMBER" Secure="yes">
+      <RegistrySearch
+        Id="WindowsBuildNumberSearch"
+        Root="HKLM"
+        Key="SOFTWARE\Microsoft\Windows NT\CurrentVersion"
+        Name="CurrentBuildNumber"
+        Type="raw" />
+    </Property>
+    <Launch
+      Condition="Installed OR (VersionNT64 AND WINDOWSBUILDNUMBER &gt;= 19045)"
+      Message="Usque requires 64-bit Windows 10 22H2 (build 19045) or newer." />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Usque" />
+    </StandardDirectory>
+    <!-- ProgramMenuFolder resolves to the all-users menu for this package. -->
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="UsqueProgramMenuFolder" Name="Usque" />
+    </StandardDirectory>
+
+    <Component
+      Id="UsqueGuiComponent"
+      Directory="INSTALLFOLDER"
+      Guid="422D5D63-97E8-4B9A-89CF-C5C4C44BE55A">
+      <File
+        Id="UsqueGuiExecutable"
+        Source="!(bindpath.app)\usque.exe"
+        KeyPath="yes" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Usque"
+        Name="InstalledVariant"
+        Type="string"
+        Value="$(Variant)" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Usque"
+        Name="DisplayVersion"
+        Type="string"
+        Value="$(DisplayVersion)" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Usque"
+        Name="InstallLocation"
+        Type="string"
+        Value="[INSTALLFOLDER]" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Usque"
+        Name="ProductCode"
+        Type="string"
+        Value="[ProductCode]" />
+    </Component>
+
+    <Component
+      Id="UsqueUpdateComponent"
+      Directory="INSTALLFOLDER"
+      Guid="C3D450E1-4C8F-4E47-A4FC-9AA38A838B5B">
+      <File
+        Id="UsqueUpdateExecutable"
+        Source="!(bindpath.app)\usque-update.exe"
+        KeyPath="yes" />
+    </Component>
+
+    <!--
+      Non-advertised shortcuts require their own current-user registry KeyPath
+      under Windows Installer component rules. Keeping this separate prevents
+      shortcut activation from invoking MSI self-repair.
+    -->
+    <Component
+      Id="UsqueShortcutComponent"
+      Directory="UsqueProgramMenuFolder"
+      Guid="6A2E04E2-7E76-48B4-A7E3-3B219F986872">
+      <Shortcut
+        Id="UsqueStartMenuShortcut"
+        Name="Usque"
+        Description="Usque"
+        Target="[INSTALLFOLDER]usque.exe"
+        WorkingDirectory="INSTALLFOLDER"
+        Icon="UsqueProductIcon.ico"
+        IconIndex="0"
+        Advertise="no" />
+      <RemoveFolder
+        Id="RemoveUsqueProgramMenuFolder"
+        Directory="UsqueProgramMenuFolder"
+        On="uninstall" />
+      <RegistryValue
+        Id="UsqueShortcutKeyPath"
+        Root="HKCU"
+        Key="Software\Usque"
+        Name="StartMenuShortcut"
+        Type="integer"
+        Value="1"
+        KeyPath="yes" />
+    </Component>
+
+    <Component
+      Id="UsqueEngineComponent"
+      Directory="INSTALLFOLDER"
+      Guid="28D99AC5-277C-4654-BFD9-C2288FC02E1C">
+      <File
+        Id="UsqueEngineExecutable"
+        Source="!(bindpath.app)\usque-engine.exe"
+        KeyPath="yes" />
+    </Component>
+
+    <Component
+      Id="UsqueAgentComponent"
+      Directory="INSTALLFOLDER"
+      Guid="E8A3C869-B571-4BD6-9CB6-98179A7CA9AF">
+      <File
+        Id="UsqueAgentExecutable"
+        Source="!(bindpath.app)\usque-agent.exe"
+        KeyPath="yes" />
+      <ServiceInstall
+        Id="UsqueAgentServiceInstall"
+        Name="UsqueAgent"
+        DisplayName="Usque Agent"
+        Description="Least-privilege service for Usque network state."
+        Arguments="--service --signer-sha256 $(SignerSha256)"
+        Type="ownProcess"
+        Start="demand"
+        ErrorControl="normal"
+        Vital="yes">
+        <!--
+          SYSTEM and Administrators retain full service control. Only a local
+          interactive logon may query status and start the demand-start Agent;
+          stop, delete, and configuration rights remain privileged.
+        -->
+        <PermissionEx
+          Id="UsqueAgentServicePermission"
+          Sddl="D:P(A;;0xF01FF;;;SY)(A;;0xF01FF;;;BA)(A;;0x14;;;IU)" />
+      </ServiceInstall>
+      <ServiceControl
+        Id="UsqueAgentServiceControl"
+        Name="UsqueAgent"
+        Stop="both"
+        Remove="uninstall"
+        Wait="yes" />
+    </Component>
+
+    <Component
+      Id="OfficialWintunComponent"
+      Directory="INSTALLFOLDER"
+      Guid="4612F8C8-5197-48C4-AA2A-18C7BF098516">
+      <!-- Keep the official pre-signed Wintun binary byte-for-byte intact. -->
+      <File
+        Id="OfficialWintunLibrary"
+        Source="!(bindpath.app)\wintun.dll"
+        KeyPath="yes" />
+    </Component>
+
+    <Component
+      Id="UsqueUninstallComponent"
+      Directory="INSTALLFOLDER"
+      Guid="B8E91F02-3C4A-45D7-9F6E-21A84C7B5D03">
+      <File
+        Id="UsqueUninstallExecutable"
+        Source="!(bindpath.app)\usque-uninstall.exe"
+        KeyPath="yes" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Usque"
+        Name="DisplayName"
+        Type="string"
+        Value="[ProductName]" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Usque"
+        Name="DisplayVersion"
+        Type="string"
+        Value="$(DisplayVersion)" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Usque"
+        Name="Publisher"
+        Type="string"
+        Value="Usque contributors" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Usque"
+        Name="DisplayIcon"
+        Type="string"
+        Value="[INSTALLFOLDER]usque.exe" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Usque"
+        Name="InstallLocation"
+        Type="string"
+        Value="[INSTALLFOLDER]" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Usque"
+        Name="UninstallString"
+        Type="string"
+        Value="&quot;[INSTALLFOLDER]usque-uninstall.exe&quot;" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Usque"
+        Name="QuietUninstallString"
+        Type="string"
+        Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand $(UsqueQuietUninstallScript)" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Usque"
+        Name="NoModify"
+        Type="integer"
+        Value="1" />
+      <RegistryValue
+        Root="HKLM"
+        Key="Software\Microsoft\Windows\CurrentVersion\Uninstall\Usque"
+        Name="NoRepair"
+        Type="integer"
+        Value="1" />
+    </Component>
+
+    <!--
+      Deferred actions run as LocalSystem. The install preflight executes the
+      exact installed Agent before SCM is asked to start it, so missing Wintun,
+      an invalid signer argument, or an unusable secure pipe fails immediately
+      instead of making StartServices retry for several minutes.
+
+      Emergency WFP cleanup uses
+      stable Usque GUIDs and does not depend on a readable journal, so a later
+      detailed recovery failure can never leave the machine blocked offline.
+      Detailed recovery remains fatal: uninstall/major-upgrade must not remove
+      the Agent while leaving routes, DNS, proxy state, or an adapter behind.
+      A final true-uninstall-only action removes the proven-clean ProgramData
+      journal. It is deliberately skipped during a major upgrade.
+    -->
+    <CustomAction
+      Id="ValidateAgentStartup"
+      FileRef="UsqueAgentExecutable"
+      ExeCommand="--validate-only --signer-sha256 $(SignerSha256)"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+    <CustomAction
+      Id="EmergencyRemoveKillSwitch"
+      FileRef="UsqueAgentExecutable"
+      ExeCommand="--emergency-remove-kill-switch"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+    <CustomAction
+      Id="RecoverAgentState"
+      FileRef="UsqueAgentExecutable"
+      ExeCommand="--recover-state"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+    <!--
+      This action deliberately impersonates the uninstalling user: Usque's
+      Credential Manager entries and application-data directories are
+      current-user resources. It runs only after explicit opt-in and never
+      during a major upgrade.
+    -->
+    <CustomAction
+      Id="PurgeUserData"
+      FileRef="UsqueEngineExecutable"
+      ExeCommand='--config &quot;[LocalAppDataFolder]Usque\config.json&quot; --purge-user-data --preferences-directory &quot;[AppDataFolder]io.github.georgexie2333\Usque&quot;'
+      Execute="deferred"
+      Impersonate="yes"
+      Return="check" />
+    <CustomAction
+      Id="RemoveUserStartupRegistration"
+      FileRef="UsqueGuiExecutable"
+      ExeCommand="--remove-startup"
+      Execute="deferred"
+      Impersonate="yes"
+      Return="check" />
+    <CustomAction
+      Id="FinalizeAgentUninstall"
+      FileRef="UsqueAgentExecutable"
+      ExeCommand="--finalize-uninstall"
+      Execute="deferred"
+      Impersonate="no"
+      Return="check" />
+    <CustomAction
+      Id="RejectUnsupportedMaintenance"
+      Error="Repair, modify, and patch operations are not supported because Usque may own crash-recovery network state. Uninstall and reinstall Usque, or install a newer release instead." />
+    <InstallUISequence>
+      <Custom
+        Action="SetPayloadReinstallMode"
+        Before="CostInitialize"
+        Condition='NOT Installed AND NOT REMOVE~="ALL"' />
+    </InstallUISequence>
+    <InstallExecuteSequence>
+      <!-- Enforce the same overwrite policy for quiet and interactive installs
+           before file costing, even if the caller supplied another mode. -->
+      <Custom
+        Action="SetPayloadReinstallMode"
+        Before="CostInitialize"
+        Condition='NOT Installed AND NOT REMOVE~="ALL"' />
+      <Custom
+        Action="RejectUnsupportedMaintenance"
+        Before="StopServices"
+        Condition='Installed AND NOT REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' />
+      <Custom
+        Action="ValidateAgentStartup"
+        After="InstallServices"
+        Condition='NOT Installed AND NOT REMOVE~="ALL"' />
+      <Custom
+        Action="EmergencyRemoveKillSwitch"
+        After="StopServices"
+        Condition='REMOVE~="ALL"' />
+      <Custom
+        Action="RecoverAgentState"
+        After="EmergencyRemoveKillSwitch"
+        Condition='REMOVE~="ALL"' />
+      <Custom
+        Action="PurgeUserData"
+        After="RecoverAgentState"
+        Condition='REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE AND USQUE_REMOVE_USER_DATA="1"' />
+      <Custom
+        Action="RemoveUserStartupRegistration"
+        After="PurgeUserData"
+        Condition='REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' />
+      <Custom
+        Action="FinalizeAgentUninstall"
+        After="RemoveUserStartupRegistration"
+        Condition='REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE' />
+    </InstallExecuteSequence>
+
+    <Feature Id="Complete" Title="Usque" Level="1">
+      <ComponentRef Id="UsqueGuiComponent" />
+      <ComponentRef Id="UsqueShortcutComponent" />
+      <ComponentRef Id="UsqueEngineComponent" />
+      <ComponentRef Id="UsqueAgentComponent" />
+      <ComponentRef Id="OfficialWintunComponent" />
+      <ComponentRef Id="UsqueUninstallComponent" />
+      <ComponentRef Id="UsqueUpdateComponent" />
+
+      <!-- Flutter runtime, plug-ins, data, and assets not owned above. -->
+      <Files Include="!(bindpath.app)\**" Directory="INSTALLFOLDER">
+        <Exclude Files="!(bindpath.app)\usque.exe" />
+        <Exclude Files="!(bindpath.app)\usque-engine.exe" />
+        <Exclude Files="!(bindpath.app)\usque-agent.exe" />
+        <Exclude Files="!(bindpath.app)\usque-uninstall.exe" />
+        <Exclude Files="!(bindpath.app)\usque-update.exe" />
+        <Exclude Files="!(bindpath.app)\wintun.dll" />
+        <Exclude Files="!(bindpath.app)\**\*.pdb" />
+      </Files>
+    </Feature>
+  </Package>
+</Wix>

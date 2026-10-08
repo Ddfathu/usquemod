@@ -1,0 +1,259 @@
+# Direct DNS: System, DoH and DoT
+
+Direct DNS controls name lookups for destinations selected by country-based or custom domain
+direct rules. It is shared across accounts. It does not change other tunnel DNS,
+intercept an application's own encrypted DNS, or decrypt unrelated traffic.
+
+## Choose a mode
+
+| Mode in the app | Where matching queries go | What you need to configure |
+| --- | --- | --- |
+| Current network DNS (System, the default) | The DNS servers on your current network, outside the VPN. Those servers can see the queried names. | No custom resolver fields. |
+| DNS over HTTPS (DoH) | The encrypted resolver you choose, over HTTPS. | TLS server name, HTTPS path, port and bootstrap IP addresses. |
+| DNS over TLS (DoT) | The encrypted resolver you choose, over TLS. | TLS server name, port and bootstrap IP addresses. |
+
+The chosen DoH/DoT provider can see the names it resolves. Encryption protects
+the connection to that provider; it does not make queries anonymous to it.
+Usque has no provider presets or embedded resolver addresses.
+
+## Configure direct DNS
+
+1. In **Settings → TUN bypass settings** on Windows or **Settings → VPN bypass settings** on Android, select the countries and download
+   their GeoIP rules and the global GeoSite catalog, then save the selection.
+   Alternatively, enter custom domains under **Custom bypass targets**; these
+   do not need geographic downloads. If no country or custom domain rule matches,
+   these DNS settings are not used.
+2. Open **Settings → Advanced network settings → Direct DNS**.
+3. Choose System, DoH or DoT. For an encrypted resolver, enter the values from
+   your DNS provider using the field guide below.
+4. Select **Apply changes**. Editing or resetting fields alone does not apply
+   them. Read the save result and pending-state message; reconnect manually if
+   the change is saved for the next connection.
+5. Check **Network quality → Direct DNS** while connected. To test reachability,
+   run a confirmed [Deep diagnostic](network-doctor.md).
+
+In Simplified Chinese, the bypass page is **设置 → 绕过虚拟网卡分流设置** on Windows
+or **设置 → 绕过VPN分流设置** on Android. Direct DNS is under
+**设置 → 高级网络设置 → 直连 DNS**. The System option is currently labelled
+**当前网络的 DNS**.
+
+### Field guide
+
+| Field | What to enter | Format example |
+| --- | --- | --- |
+| DNS server name | The provider's certificate name, without `https://`, a port or a path. Do not enter an IP here. | `resolver.example` |
+| HTTPS path (DoH only) | The provider's path beginning with one slash, without a query string or fragment. | `/dns-query` |
+| Port (0 uses the default) | `443` for default DoH or `853` for default DoT. Use a different port only when specified by the provider. | `443` |
+| DNS server IP addresses | One to eight distinct IP addresses for that resolver, preferably one per line. Usque connects to these addresses without first using system DNS to find the server. | `192.0.2.53` and `2001:db8::53` |
+
+These are documentation-only examples, not a working resolver. Replace the
+example name and IPs with your provider's real values. DoT has no HTTPS path.
+The TLS certificate must match the name even though the connection uses a
+numeric IP address.
+
+## If it does not work
+
+- A validation error usually identifies a malformed name, path, port or IP.
+  Correct the field; failed validation does not save a different DNS mode.
+- If the encrypted resolver cannot be reached or authenticated, matching
+  queries fail. Usque does not switch them to System or plaintext DNS.
+  Check the provider's name, IP addresses, path, port and network reachability.
+- If the Engine does not support encrypted direct DNS, saved custom values stay
+  visible but unavailable for use. Use a compatible Engine, or explicitly choose
+  System if that is your intended privacy policy.
+- Apps using their own encrypted DNS hide names from Usque, so country routing
+  uses IP rules. The direct-DNS selector does not control those apps' resolvers.
+
+Other remote VPN queries use the final exit's DNS: WARP without a chain, or the
+active chain exit (custom OpenVPN or WireGuard, WARP via WireGuard, or VPN
+Gate). Explicit local DNS and proxy DNS settings keep their own scope.
+See the [direct DNS threat model](direct-dns-threat-model.md) for platform
+protection and diagnostic limits.
+
+## Implementation reference
+
+A runtime `Profile` receives a copy of the shared network settings. It is not a
+separate per-account direct-DNS preference. The following sections specify input
+validation, protocol handling and resource ownership.
+
+### Configuration and trust
+
+`DirectDnsSettings` is validated in core before opening a connection. TLS
+server names are IDNA-normalized DNS names, at most 253 characters/ASCII bytes
+after normalization, and validated with rustls `ServerName`. URL syntax,
+wildcards, empty labels, control characters and whitespace are rejected rather
+than silently trimmed. Numeric IPs belong only in the bootstrap list.
+
+The list contains 1–8 distinct numerical unicast IPs. Private unicast is
+allowed for enterprise resolvers. Unspecified, multicast, IPv4 broadcast and
+unscoped IPv6 link-local addresses are rejected. The current `IpAddr` settings
+do not carry a link-local scope, so link-local IPv6 cannot be used.
+
+Port zero canonicalizes to 443 (DoH) or 853 (DoT). DoH paths are ASCII paths
+starting with one `/`, at most 256 bytes, with no query, fragment, URL/host
+syntax, backslash, whitespace or control characters. An empty DoH path becomes
+`/dns-query`. DoT requires an empty path. Canonical physical-system JSON retains
+only `mode`; stale custom fields are cleared before saving.
+
+Production TLS uses the existing explicit ring provider and webpki roots,
+normal name/validity/chain verification and no early data. There is no custom
+CA, certificate-ignore switch or pin override. Test roots exist only in unit
+fixtures. DoH requires negotiated `h2`; DoT does not require HTTP ALPN.
+
+After TLS chooses a bootstrap address, HTTP/2 preface failures retain that
+address for the existing one-retry exclusion policy. The failed stream and
+lease are dropped before retry. The two-address budget, total query deadline,
+and no-retry-on-timeout policy are unchanged. Both an outer deadline expiry
+and a transport-reported preface I/O timeout preserve the Timeout classification.
+
+### Protocol and semantic validation
+
+DoH uses HTTP/2 POST, HTTPS authority derived from the configured name/port,
+the configured path and `application/dns-message` for Content-Type and Accept.
+Only status 200 is accepted; redirects are never followed. Media types are
+parsed completely, including legal token/quoted parameters, not matched with
+substring searches. Bodies are capped at 65,535 bytes; rejected/abandoned
+streams are reset. Its receive windows are 65,535 bytes per stream and
+256 KiB per connection, independent of MASQUE tuning. These exchanges follow
+the wire format in [RFC 8484](https://www.rfc-editor.org/rfc/rfc8484.html).
+
+DoT uses the two-byte big-endian message length from
+[RFC 7858](https://www.rfc-editor.org/rfc/rfc7858.html), with one outstanding
+query per connection. A zero length, EOF, canceled partial exchange, or invalid
+response discards that connection. Neither encrypted protocol applies the
+physical UDP-to-TCP truncation fallback.
+
+Both protocols reuse the existing Split DNS parser for transaction ID,
+question, opcode, record, CNAME, TTL and route-hint validation. No second DNS
+semantic parser is introduced. DNS name decoding is bounded before allocation
+can grow beyond the supported name length. The application's UDP response-size
+limit still applies, independently of encrypted upstream transport.
+
+### Bounds, cancellation and generations
+
+- At most four encrypted DNS sockets/connections, including connecting,
+  retiring and Happy Eyeballs losers. Permits live with actual I/O until its
+  socket and platform lease have been dropped.
+- DoH: four connections, sixteen concurrent requests per connection, sixty-four
+  total. DoT: four connections, one request per connection and at most sixty
+  more admitted queries waiting for a slot.
+- The sixty-four-query encrypted budget is separate from Split DNS's 512-task
+  budget. The latter includes queued UDP replies and TCP sessions. Full
+  admission returns a safe failure; no unbounded worker queue is spawned.
+- Idle connections close after sixty seconds; a connection is replaced after
+  at most one thousand queries. In-flight DoH streams finish before normal
+  retirement; network/profile cancellation closes them immediately.
+- A query has a four-second total deadline, with 2.5 seconds for socket
+  preparation/connect/TLS and at most three seconds for request/response,
+  always capped by the total deadline. At most one request retry uses a
+  different bootstrap IP, and one query visits at most two bootstrap IPs.
+- Bootstrap candidates are filtered by authoritative family availability.
+  IPv6/IPv4 Happy Eyeballs starts the alternative after 250 ms (or immediately
+  after a failed first candidate). Losers release their socket and lease.
+- Exact-generation protection is checked before setup, after bind/protect,
+  before/after TLS, before the request and before returning its result. Android
+  uses the exact `Network`; Windows VPN uses the Agent's generation-tagged
+  target lease. Windows proxy and disconnected desktop probes use ordinary
+  host networking with a logical generation-zero lease, not Agent/WFP
+  protection. Bootstrap never performs a hostname lookup.
+- A bounded 100 ms generation observer cancels the old pool; every query also
+  checks generation synchronously at its boundaries. New-generation requests
+  cannot reuse old connections. Profile shutdown rejects new work and cancels
+  old work. Queued application replies recheck generation before injection.
+
+### No plaintext downgrade
+
+Only the physical-system variant can discover physical DNS servers or use
+plain UDP/TCP DNS. An encrypted resolver error returns a fixed error and Split
+DNS replies SERVFAIL. The encrypted branch cannot change protocols, resolve a
+bootstrap name with system DNS, or fall back to port 53.
+
+The same runtime-owned pool serves Geo-selected HTTP/SOCKS proxy hostnames.
+An encrypted resolution error is terminal. If resolution succeeded but a
+direct data socket failed, the existing tunnel fallback reuses those resolved
+IP addresses; it does not re-query the hostname through a system/configured
+plaintext resolver. Physical-system routing keeps its existing fallback.
+
+Disabling the internal encrypted-DNS capability rejects an encrypted Profile
+before connection. It never rewrites the saved mode or silently substitutes
+physical-system DNS. Users may explicitly change the Profile themselves.
+
+### Privacy and validation limits
+
+#### Profile/config schema 13 (introduction)
+
+Direct DNS was introduced in configuration schema 13; the current schema is 21,
+and later migrations keep these fields.
+`AppConfig.shared_network.direct_dns` is hydrated into each account's runtime
+Profile. Old schema-12 configurations and missing protobuf Profile field 17
+canonicalize to System. Shared settings, not per-account endpoint overlays,
+select DNS. `DirectDnsSettings` wire fields 1–5 are mode, server name, DoH path,
+bootstrap IPs, and port; unknown protobuf fields retain compatibility. Android
+uses the equivalent `direct_dns` JSON object. Core validation remains
+authoritative after the editor's validation. Explicit configuration export
+preserves these user values; diagnostic export excludes them.
+
+Android waits for a usable non-VPN network in every mode, but only System
+Split DNS requires its physical DNS metadata. DoH/DoT bootstrap is independent
+of that list. See the deployment-specific [threat model](direct-dns-threat-model.md)
+and [capability rollback](network-quality-rollback.md).
+
+Metrics contain only protocol/mode, fixed phase/reason codes, RTT, counters and
+queue pressure. Direct-DNS code adds no QNAME, wire message, configured name,
+bootstrap/answer IP, certificate or physical DNS server to logs, metrics or
+diagnostics. Split DNS and proxy Geo fallback log events carry fixed reason
+codes, not raw target or error text. Metrics stay local.
+
+The TUN direct gateway is narrower. Its debug-level events `could not create
+GEO direct flow; using tunnel` and `GEO direct flow ended` carry the error text
+and the flow's `remote` address, which can be a direct answer IP. At the
+default Info level they are not written. If a user selects Debug, the desktop
+Engine writes them to its local `engine.jsonl` only after its log sanitizer
+replaces `remote` and other sensitive keys with `[REDACTED]` and replaces
+IP-, socket-address-, URL- and host-name-like tokens in strings. Other error
+text remains. Diagnostic export applies the same sanitizer again. This
+redaction is pattern-based, so do not treat Debug logs as free of private
+network details. The Android library installs no Rust log subscriber, so these
+events are not recorded there.
+
+Workstation tests use in-memory test CA material and loopback fake DoH/DoT
+servers. They cover protocol/PKI rejection, concurrency, reuse/recycle/idle
+cleanup, generation races, cancellation, exact leases, bootstrap retry,
+application SERVFAIL, proxy fallback and parser/media-type property fuzzing.
+The fake protector panics if encrypted code calls physical DNS discovery or
+hostname resolution. Existing system-mode truncation/oracle fixtures remain.
+
+These tests are not external leak proof. Actual device/adapter binding,
+observer packet counts and controlled performance evidence require the
+protected environments in [Contributing](../CONTRIBUTING.md#development-machines). Unavailable runs must be recorded as `not_run`; they do not establish leak or
+performance results.
+
+## Custom bypass targets / 自定义绕过目标
+
+In **Settings → TUN bypass settings** on Windows or **Settings → VPN bypass settings** on Android, enter one CIDR, IPv4/IPv6 address or
+bare domain per line, then select **Apply changes**. Existing bypass CIDRs from
+Advanced settings appear here automatically. Address rules and domains each
+allow up to 256 entries. An IP becomes a /32 or /128 host rule; network addresses
+are normalized and duplicates removed. Domains include themselves and every
+subdomain, using label boundaries: `example.com` matches `a.example.com`, not
+`notexample.com`. Case, a final dot, and IDNA names are normalized. URLs, ports,
+paths, wildcards and regular expressions are rejected. Invalid lines prevent
+saving the entire draft; a failed apply retains the draft for correction.
+
+Windows and Android share these settings across accounts and use them for VPN,
+HTTP and SOCKS5 frontends, including traffic otherwise sent through a chain.
+Custom rules work without selecting a country. Address literals use address
+rules; hostnames use domain rules. VPN DNS observations associate matching names
+with addresses only within the existing bounded TTL/generation cache. Conflicting
+names sharing an address fall back to explicit IP/CIDR or GeoIP matching.
+Applications using their own encrypted DNS cannot be matched by hidden names;
+IP/CIDR matching remains available. Changing rules follows the existing reconnect
+and pending-settings workflow. An older Engine shows targets read-only.
+
+在 Windows 的 **设置 → 绕过虚拟网卡分流设置** 或 Android 的 **设置 → 绕过VPN分流设置**
+的 **自定义绕过目标** 中，每行填写一个 CIDR、IPv4/IPv6 地址或域名，点击
+**应用修改**。原高级设置里的 CIDR 会自动显示在这里。
+域名匹配自身及全部子域名；不接受 URL、端口、路径、通配符或正则表达式。
+错误行会阻止整份草稿保存。自定义规则无需下载国家规则即可工作，设置跨账号共享，
+适用于 Windows、Android 的 VPN 和 HTTP/SOCKS5 入口。直连域名使用当前的直连 DNS
+设置；应用自行使用加密 DNS 时只能按地址分流。请查看应用结果，必要时重新连接。

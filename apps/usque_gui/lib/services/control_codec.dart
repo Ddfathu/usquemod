@@ -1,0 +1,3288 @@
+import 'dart:convert';
+import 'dart:typed_data';
+
+import 'package:flutter/foundation.dart';
+
+import '../core/diagnostics_contract_generated.dart';
+import '../models/app_models.dart';
+import '../models/diagnostics_models.dart';
+import 'engine_client.dart';
+
+/// Maximum framed IPC message size (4 MiB), shared with the Rust engine.
+const int kMaximumFrameBytes = 4 * 1024 * 1024;
+
+/// Protobuf encode/decode and domain mapping for desktop engine control IPC.
+///
+/// Wire formats (field numbers, framing, enums) must stay byte-compatible with
+/// the Rust `usque.v1` control service.
+class ControlCodec {
+  const ControlCodec();
+
+  /// Builds a length-prefixed control request frame.
+  Uint8List buildRequestFrame({
+    required String requestId,
+    required int payloadField,
+    required Uint8List payload,
+  }) {
+    final envelope = ControlPayloadWriter()
+      ..string(1, requestId)
+      ..message(payloadField, payload);
+    return frame(envelope.takeBytes());
+  }
+
+  /// Length-prefixes a protobuf payload for named-pipe / unix-socket exchange.
+  Uint8List frame(Uint8List payload) {
+    if (payload.length > kMaximumFrameBytes) {
+      throw const EngineException(
+        'ENGINE_IPC_FRAME_TOO_LARGE',
+        'The local Engine request exceeded 4 MiB.',
+      );
+    }
+    final output = Uint8List(payload.length + 4);
+    ByteData.sublistView(output).setUint32(0, payload.length, Endian.big);
+    output.setRange(4, output.length, payload);
+    return output;
+  }
+
+  Uint8List encodeProfile(UsqueProfile profile) {
+    final endpoint = ControlPayloadWriter()
+      ..string(1, profile.endpointIpv4)
+      ..string(2, profile.endpointIpv6)
+      ..unsigned(3, profile.endpointPort)
+      ..string(4, profile.sni)
+      ..enumeration(5, profile.endpointSelection.index + 1);
+    final proxy = ControlPayloadWriter();
+    for (final listener in profile.proxy.socksListeners) {
+      proxy.string(1, listener);
+    }
+    for (final listener in profile.proxy.httpListeners) {
+      proxy.string(2, listener);
+    }
+    proxy
+      ..boolean(3, profile.proxy.systemProxy)
+      ..unsigned(4, 60)
+      ..enumeration(5, profile.proxy.dnsMode.index + 1)
+      ..string(6, profile.proxy.dnsIpv4)
+      ..string(6, profile.proxy.dnsIpv6)
+      ..string(7, profile.proxy.authUsername);
+    final frontends = ControlPayloadWriter()
+      ..boolean(1, profile.frontends.tunnel)
+      ..boolean(2, profile.frontends.socks5)
+      ..boolean(3, profile.frontends.http);
+    final directDns = ControlPayloadWriter()
+      ..enumeration(1, _directDnsModeWireValue(profile.directDns.mode))
+      ..string(2, profile.directDns.serverName)
+      ..string(3, profile.directDns.dohPath);
+    for (final bootstrapIp in profile.directDns.bootstrapIps) {
+      directDns.string(4, bootstrapIp);
+    }
+    directDns.unsigned(5, profile.directDns.port);
+    final writer = ControlPayloadWriter()
+      ..string(1, profile.id)
+      ..string(2, profile.name)
+      ..enumeration(3, profile.mode.index + 1)
+      ..enumeration(4, profile.transport.index + 1)
+      ..message(5, endpoint.takeBytes())
+      ..enumeration(6, profile.ipPolicy.index + 1)
+      ..unsigned(7, profile.mtu)
+      ..string(8, profile.dnsIpv4)
+      ..string(8, profile.dnsIpv6)
+      ..boolean(9, profile.allowLan);
+    for (final cidr in profile.bypassCidrs) {
+      writer.string(10, cidr);
+    }
+    writer
+      ..boolean(11, profile.killSwitch)
+      ..boolean(12, profile.autoConnect)
+      ..message(13, proxy.takeBytes())
+      ..enumeration(14, profile.dnsMode.index + 1)
+      ..message(15, frontends.takeBytes());
+    for (final country in profile.geoDirectCountries) {
+      writer.string(16, country);
+    }
+    for (final domain in profile.bypassDomains) {
+      writer.string(23, domain);
+    }
+    writer.message(17, directDns.takeBytes());
+    writer.enumeration(
+      18,
+      _congestionControlWireValue(profile.congestionControl),
+    );
+    writer.enumeration(19, profile.dataPlane.index + 1);
+    writer.boolean(21, profile.disableQuic);
+    if (profile.chainExit case final chain?) {
+      final payload = ControlPayloadWriter()
+        ..boolean(1, chain.enabled)
+        ..string(2, chain.source.wire)
+        ..string(3, chain.profileId ?? '')
+        ..string(4, chain.revision ?? '');
+      if (chain.endpointOverride case final endpoint?) {
+        payload
+          ..string(5, endpoint.host)
+          ..unsigned(6, endpoint.port);
+      }
+      writer.message(22, payload.takeBytes());
+    }
+
+    if (profile.vpnGate != const VpnGateSettings()) {
+      writer.message(
+        20,
+        (ControlPayloadWriter()
+              ..boolean(1, profile.vpnGate.enabled)
+              ..string(2, profile.vpnGate.serverId)
+              ..string(3, profile.vpnGate.configSha256))
+            .takeBytes(),
+      );
+    }
+    return writer.takeBytes();
+  }
+
+  ControlResponse decodeResponse(Uint8List frame, String expectedRequestId) {
+    try {
+      if (frame.length < 4) {
+        throw const EngineException(
+          'ENGINE_IPC_TRUNCATED',
+          'The local Engine response header was truncated.',
+        );
+      }
+      final length = ByteData.sublistView(frame).getUint32(0, Endian.big);
+      if (length > kMaximumFrameBytes || length != frame.length - 4) {
+        throw const EngineException(
+          'ENGINE_IPC_INVALID_RESPONSE',
+          'The local Engine response length was invalid.',
+        );
+      }
+      final reader = _ProtoReader(Uint8List.sublistView(frame, 4));
+      String? requestId;
+      _StructuredEngineError? error;
+      EngineSnapshot? snapshot;
+      UpdateCheckResult? update;
+      ProfileCatalog? profileCatalog;
+      GeoRulesList? geoRulesList;
+      List<GeoRulesUpdateResult>? geoRulesUpdate;
+      DiagnosticSession? diagnosticSession;
+      ConnectionTimeline? connectionTimeline;
+      NetworkQualitySnapshot? networkQuality;
+      EngineCapabilities? capabilities;
+      NetworkSettingsState? networkSettings;
+      VpnGateDirectory? vpnGateDirectory;
+      ChainProfileResult? chainProfiles;
+      Map<String, Object?>? warpWireguard;
+      InitialIdentityState? initialIdentityState;
+      while (!reader.isDone) {
+        final field = reader.field();
+        switch (field.number) {
+          case 1:
+            requestId = reader.string(field);
+          case 2:
+            error = _decodeError(reader.message(field));
+          case 11:
+            snapshot = _decodeSnapshot(reader.message(field));
+          case 14:
+            update = _decodeUpdate(reader.message(field));
+          case 12:
+            profileCatalog = _decodeProfileCatalog(reader.message(field));
+          case 17:
+            geoRulesList = _decodeGeoRulesList(reader.message(field));
+          case 18:
+            geoRulesUpdate = _decodeGeoRulesUpdate(reader.message(field));
+          case 19:
+            diagnosticSession = _decodeDiagnosticSession(reader.message(field));
+          case 20:
+            connectionTimeline = _decodeConnectionTimeline(
+              reader.message(field),
+            );
+          case 21:
+            networkQuality = _decodeNetworkQuality(reader.message(field));
+          case 22:
+            networkSettings = _decodeNetworkSettings(reader.message(field));
+          case 25:
+            warpWireguard = _decodeChainJson(reader.message(field));
+          case 26:
+            initialIdentityState = _decodeInitialIdentityState(
+              reader.message(field),
+            );
+          case 24:
+            chainProfiles = ChainProfileResult.fromMap(
+              _decodeChainJson(reader.message(field)),
+            );
+          case 23:
+            vpnGateDirectory = VpnGateDirectory.fromMap(
+              _decodeVpnGate(reader.message(field), 'directory'),
+            );
+          case 15:
+            capabilities = _decodeCapabilities(reader.message(field));
+          default:
+            reader.skip(field);
+        }
+      }
+      if (requestId != expectedRequestId) {
+        throw const EngineException(
+          'ENGINE_IPC_REQUEST_MISMATCH',
+          'The local Engine response did not match its request.',
+        );
+      }
+      if (error != null) {
+        throw EngineException(
+          error.code,
+          error.message,
+          retryable: error.retryable,
+        );
+      }
+      return ControlResponse(
+        snapshot,
+        update,
+        profileCatalog,
+        geoRulesList: geoRulesList,
+        geoRulesUpdate: geoRulesUpdate,
+        diagnosticSession: diagnosticSession,
+        connectionTimeline: connectionTimeline,
+        networkQuality: networkQuality,
+        capabilities: capabilities,
+        networkSettings: networkSettings,
+        vpnGateDirectory: vpnGateDirectory,
+        chainProfiles: chainProfiles,
+        warpWireguard: warpWireguard,
+        initialIdentityState: initialIdentityState,
+      );
+    } on FormatException catch (error) {
+      throw _invalidIpcResponse(error);
+    }
+  }
+
+  EngineSnapshot? decodeEventSnapshot(Uint8List frame) {
+    return decodeEvent(frame).snapshot;
+  }
+
+  EngineSnapshotEvent decodeEvent(Uint8List frame) {
+    try {
+      if (frame.length < 4) {
+        throw const EngineException(
+          'ENGINE_EVENT_TRUNCATED',
+          'The local Engine event header was truncated.',
+        );
+      }
+      final length = ByteData.sublistView(frame).getUint32(0, Endian.big);
+      if (length > kMaximumFrameBytes || length != frame.length - 4) {
+        throw const EngineException(
+          'ENGINE_EVENT_INVALID',
+          'The local Engine event length was invalid.',
+        );
+      }
+
+      final envelope = _ProtoReader(Uint8List.sublistView(frame, 4));
+      EngineSnapshot? snapshot;
+      GeoRulesProgress? geoProgress;
+      DiagnosticSession? diagnosticSession;
+      NetworkQualitySnapshot? networkQuality;
+      EngineCapabilities? capabilities;
+      var diagnosticsChanged = false;
+      NetworkSettingsState? networkSettings;
+      while (!envelope.isDone) {
+        final field = envelope.field();
+        switch (field.number) {
+          case 1:
+            envelope.varint(field);
+          case 10:
+            final stateChanged = envelope.message(field);
+            while (!stateChanged.isDone) {
+              final stateField = stateChanged.field();
+              if (stateField.number == 1) {
+                snapshot = _decodeSnapshot(stateChanged.message(stateField));
+              } else {
+                stateChanged.skip(stateField);
+              }
+            }
+          case 17:
+            geoProgress = _decodeGeoProgress(envelope.message(field));
+          case 18:
+          case 21:
+          case 22:
+          case 25:
+            final event = envelope.message(field);
+            diagnosticsChanged = true;
+            while (!event.isDone) {
+              final eventField = event.field();
+              if (eventField.number == 1) {
+                diagnosticSession = _decodeDiagnosticSession(
+                  event.message(eventField),
+                );
+              } else {
+                event.skip(eventField);
+              }
+            }
+          case 19:
+          case 20:
+            diagnosticsChanged = true;
+            envelope.skip(field);
+          case 14:
+            final changed = envelope.message(field);
+            while (!changed.isDone) {
+              final changedField = changed.field();
+              if (changedField.number == 1) {
+                capabilities = _decodeCapabilities(
+                  changed.message(changedField),
+                );
+              } else {
+                changed.skip(changedField);
+              }
+            }
+          case 23:
+            final updated = envelope.message(field);
+            while (!updated.isDone) {
+              final updatedField = updated.field();
+              if (updatedField.number == 1) {
+                networkQuality = _decodeNetworkQuality(
+                  updated.message(updatedField),
+                );
+              } else {
+                updated.skip(updatedField);
+              }
+            }
+          case 24:
+            networkSettings = _decodeNetworkSettings(envelope.message(field));
+          default:
+            envelope.skip(field);
+        }
+      }
+      return EngineSnapshotEvent(
+        snapshot: snapshot,
+        geoProgress: geoProgress,
+        diagnosticSession: diagnosticSession,
+        diagnosticsChanged: diagnosticsChanged,
+        networkSettings: networkSettings,
+        networkQuality: networkQuality,
+        capabilities: capabilities,
+      );
+    } on FormatException catch (error) {
+      throw _invalidIpcResponse(error);
+    }
+  }
+
+  ProfileCatalog requireProfileCatalog(ControlResponse response) {
+    final catalog = response.profileCatalog;
+    if (catalog == null) {
+      throw const EngineException(
+        'ENGINE_IPC_INVALID_RESPONSE',
+        'The local Engine returned no profile catalog.',
+      );
+    }
+    return catalog;
+  }
+}
+
+/// Decoded control response payload (after structured error handling).
+class ControlResponse {
+  const ControlResponse(
+    this.snapshot,
+    this.update,
+    this.profileCatalog, {
+    this.geoRulesList,
+    this.geoRulesUpdate,
+    this.diagnosticSession,
+    this.connectionTimeline,
+    this.networkQuality,
+    this.capabilities,
+    this.networkSettings,
+    this.vpnGateDirectory,
+    this.chainProfiles,
+    this.warpWireguard,
+    this.initialIdentityState,
+  });
+
+  final EngineSnapshot? snapshot;
+  final UpdateCheckResult? update;
+  final ProfileCatalog? profileCatalog;
+  final GeoRulesList? geoRulesList;
+  final List<GeoRulesUpdateResult>? geoRulesUpdate;
+  final DiagnosticSession? diagnosticSession;
+  final ConnectionTimeline? connectionTimeline;
+  final NetworkQualitySnapshot? networkQuality;
+  final EngineCapabilities? capabilities;
+  final NetworkSettingsState? networkSettings;
+  final VpnGateDirectory? vpnGateDirectory;
+  final ChainProfileResult? chainProfiles;
+  final Map<String, Object?>? warpWireguard;
+  final InitialIdentityState? initialIdentityState;
+}
+
+InitialIdentityState _decodeInitialIdentityState(_ProtoReader reader) {
+  String operationId = '';
+  String profileId = '';
+  int phase = 0;
+  String errorCode = '';
+  bool reused = false;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        operationId = reader.string(field);
+      case 2:
+        profileId = reader.string(field);
+      case 3:
+        phase = reader.varint(field);
+      case 4:
+        errorCode = reader.string(field);
+      case 5:
+        reused = reader.varint(field) != 0;
+      default:
+        reader.skip(field);
+    }
+  }
+  if (profileId.isEmpty || phase < 1 || phase > 5) {
+    throw const FormatException('Invalid initial identity state');
+  }
+  return InitialIdentityState(
+    operationId: operationId,
+    profileId: profileId,
+    phase: InitialIdentityPhase.values[phase - 1],
+    errorCode: errorCode,
+    reused: reused,
+  );
+}
+
+/// Minimal protobuf field writer for control request payloads.
+class ControlPayloadWriter {
+  final BytesBuilder _bytes = BytesBuilder(copy: false);
+
+  void unsigned(int number, int value) {
+    if (value == 0) {
+      return;
+    }
+    _tag(number, 0);
+    _varint(value);
+  }
+
+  void enumeration(int number, int value) => unsigned(number, value);
+
+  void boolean(int number, bool value) {
+    if (value) {
+      unsigned(number, 1);
+    }
+  }
+
+  void string(int number, String value) {
+    if (value.isNotEmpty) {
+      bytes(number, Uint8List.fromList(utf8.encode(value)));
+    }
+  }
+
+  void message(int number, Uint8List value) {
+    _tag(number, 2);
+    _varint(value.length);
+    _bytes.add(value);
+  }
+
+  void bytes(int number, Uint8List value) {
+    if (value.isNotEmpty) {
+      message(number, value);
+    }
+  }
+
+  Uint8List takeBytes() => _bytes.takeBytes();
+
+  void _tag(int number, int wireType) => _varint((number << 3) | wireType);
+
+  void _varint(int value) {
+    if (value < 0) {
+      throw const FormatException('Negative protobuf varint');
+    }
+    do {
+      var byte = value & 0x7f;
+      value >>= 7;
+      if (value != 0) {
+        byte |= 0x80;
+      }
+      _bytes.addByte(byte);
+    } while (value != 0);
+  }
+}
+
+Map<String, Object?> _decodeVpnGate(_ProtoReader reader, String kind) {
+  const schemas = <String, Map<int, (String, String)>>{
+    'chain_settings': {
+      1: ('enabled', 'b'),
+      2: ('source', 's'),
+      3: ('profile_id', 's'),
+      4: ('revision', 's'),
+      5: ('endpoint_override_ip', 's'),
+      6: ('endpoint_override_port', 'u'),
+    },
+    'settings': {
+      1: ('enabled', 'b'),
+      2: ('server_id', 's'),
+      3: ('config_sha256', 's'),
+    },
+    'server': {
+      1: ('id', 's'),
+      2: ('hostname', 's'),
+      3: ('ip', 's'),
+      4: ('country_code', 's'),
+      5: ('country_name', 's'),
+      6: ('score', 'u'),
+      7: ('ping_ms', 'u'),
+      8: ('speed_bps', 'u'),
+      9: ('num_vpn_sessions', 'u'),
+      10: ('config_sha256', 's'),
+      11: ('unsupported_reason', 's'),
+      12: ('pool', 'pool'),
+      13: ('favorite', 'favorite'),
+    },
+    'pool': {
+      1: ('first_seen_at', 's'),
+      2: ('last_seen_at', 's'),
+      3: ('present_in_latest_source', 'b'),
+      4: ('tcp_status', 's'),
+      5: ('tcp_checked_at', 's'),
+      6: ('tcp_connect_ms', 'u'),
+      7: ('in_pool', 'b'),
+    },
+    'favorite': {
+      1: ('config_sha256', 's'),
+      2: ('saved_at_unix_ms', 'u'),
+      3: ('latest_config_sha256', 's'),
+    },
+    'node_progress': {
+      1: ('operation_id', 's'),
+      2: ('server_id', 's'),
+      3: ('config_sha256', 's'),
+      4: ('stage', 's'),
+      5: ('error', 's'),
+    },
+    'country': {
+      1: ('country_code', 's'),
+      2: ('country_name', 's'),
+      3: ('server_count', 'u'),
+    },
+    'network': {
+      1: ('ipv4', 's'),
+      2: ('ipv6', 's'),
+      3: ('dns_servers', 's'),
+      4: ('mtu', 'u'),
+    },
+    'status': {
+      1: ('stage', 's'),
+      2: ('generation', 'u'),
+      3: ('current_server', 'server'),
+      4: ('network', 'network'),
+      5: ('failure', 's'),
+      6: ('warp_stage', 's'),
+    },
+    'directory': {
+      1: ('servers', 'server'),
+      2: ('countries', 'country'),
+      3: ('total', 'u'),
+      4: ('source_server_count', 'u'),
+      5: ('fetched_at_unix_ms', 'u'),
+      6: ('source_url', 's'),
+      7: ('refresh_stage', 's'),
+      8: ('refresh_failures', 's'),
+      9: ('cached', 'b'),
+      10: ('status', 'status'),
+      11: ('saved_server', 'server'),
+      12: ('favorite_count', 'u'),
+      13: ('source_fetched_at', 's'),
+      14: ('node_progress', 'node_progress'),
+    },
+  };
+  final schema = schemas[kind]!;
+  final result = <String, Object?>{};
+  while (!reader.isDone) {
+    final field = reader.field();
+    final definition = schema[field.number];
+    if (definition == null) {
+      reader.skip(field);
+      continue;
+    }
+    final (key, type) = definition;
+    final Object value = switch (type) {
+      's' => reader.string(field),
+      'u' => reader.varint(field),
+      'b' => reader.varint(field) != 0,
+      _ => _decodeVpnGate(reader.message(field), type),
+    };
+    if (const [
+      'servers',
+      'countries',
+      'dns_servers',
+      'refresh_failures',
+    ].contains(key)) {
+      final list = result.putIfAbsent(key, () => <Object>[]) as List<Object>;
+      list.add(value);
+      final limit = switch (key) {
+        'servers' => 100,
+        'countries' => 676,
+        'dns_servers' => 8,
+        _ => 16,
+      };
+      if (list.length > limit) {
+        throw const FormatException('VPN Gate metadata exceeds its bound');
+      }
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+@visibleForTesting
+Uint8List debugEncodeGetStatusFrame(String requestId) {
+  return const ControlCodec().buildRequestFrame(
+    requestId: requestId,
+    payloadField: 10,
+    payload: Uint8List(0),
+  );
+}
+
+@visibleForTesting
+Uint8List debugEncodeProfilePayload(UsqueProfile profile) {
+  return const ControlCodec().encodeProfile(profile);
+}
+
+@visibleForTesting
+EngineSnapshot debugDecodeStatusFrame(Uint8List frame, String requestId) {
+  return const ControlCodec().decodeResponse(frame, requestId).snapshot ??
+      const EngineSnapshot();
+}
+
+@visibleForTesting
+NetworkQualitySnapshot? debugDecodeNetworkQualityFrame(
+  Uint8List frame,
+  String requestId,
+) {
+  return const ControlCodec().decodeResponse(frame, requestId).networkQuality;
+}
+
+@visibleForTesting
+ConnectionTimeline? debugDecodeConnectionTimelineFrame(
+  Uint8List frame,
+  String requestId,
+) {
+  return const ControlCodec()
+      .decodeResponse(frame, requestId)
+      .connectionTimeline;
+}
+
+@visibleForTesting
+EngineSnapshotEvent debugDecodeEventFrame(Uint8List frame) {
+  return const ControlCodec().decodeEvent(frame);
+}
+
+@visibleForTesting
+EngineCapabilities? debugDecodeCapabilitiesFrame(
+  Uint8List frame,
+  String requestId,
+) {
+  return const ControlCodec().decodeResponse(frame, requestId).capabilities;
+}
+
+@visibleForTesting
+EngineSnapshot? debugDecodeEventSnapshot(Uint8List frame) {
+  return const ControlCodec().decodeEventSnapshot(frame);
+}
+
+@visibleForTesting
+ProfileCatalog debugDecodeProfileCatalogFrame(
+  Uint8List frame,
+  String requestId,
+) {
+  return const ControlCodec().requireProfileCatalog(
+    const ControlCodec().decodeResponse(frame, requestId),
+  );
+}
+
+ProfileCatalog _decodeProfileCatalog(_ProtoReader reader) {
+  final profiles = <UsqueProfile>[];
+  final identityStates = <String, ProfileIdentityState>{};
+  final identityStatuses = <String, ProfileIdentityStatus>{};
+  String? activeProfileId;
+  UsqueProfile? sharedNetwork;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        profiles.add(_decodeProfile(reader.message(field)));
+      case 2:
+        activeProfileId = _emptyToNull(reader.string(field));
+      case 4:
+        sharedNetwork = _decodeProfile(reader.message(field));
+      case 3:
+        final status = reader.message(field);
+        String? profileId;
+        ProfileIdentityState? state;
+        var licenseState = LicenseState.unknown;
+        var accountType = '';
+        var cleanupPending = false;
+        var provider = IdentityProvider.consumer;
+        var organization = '';
+        while (!status.isDone) {
+          final statusField = status.field();
+          switch (statusField.number) {
+            case 1:
+              profileId = _emptyToNull(status.string(statusField));
+            case 2:
+              final value = status.varint(statusField);
+              if (value >= 1 && value <= ProfileIdentityState.values.length) {
+                state = ProfileIdentityState.values[value - 1];
+              }
+            case 3:
+              final value = status.varint(statusField);
+              if (value >= 1 && value <= LicenseState.values.length) {
+                licenseState = LicenseState.values[value - 1];
+              }
+            case 4:
+              accountType = status.string(statusField);
+            case 5:
+              cleanupPending = status.varint(statusField) != 0;
+            case 6:
+              final value = status.varint(statusField);
+              if (value >= 1 && value <= IdentityProvider.values.length) {
+                provider = IdentityProvider.values[value - 1];
+              }
+            case 7:
+              organization = status.string(statusField);
+            default:
+              status.skip(statusField);
+          }
+        }
+        if (profileId != null && state != null) {
+          identityStates[profileId] = state;
+          identityStatuses[profileId] = ProfileIdentityStatus(
+            state: state,
+            licenseState: licenseState,
+            accountType: accountType,
+            cleanupPending: cleanupPending,
+            provider: provider,
+            organization: organization,
+          );
+        }
+      default:
+        reader.skip(field);
+    }
+  }
+  if (profiles.isEmpty ||
+      activeProfileId == null ||
+      !profiles.any((profile) => profile.id == activeProfileId)) {
+    throw const EngineException(
+      'ENGINE_IPC_INVALID_RESPONSE',
+      'The local Engine returned an invalid profile catalog.',
+    );
+  }
+  return ProfileCatalog(
+    profiles: List<UsqueProfile>.unmodifiable(profiles),
+    sharedNetwork: sharedNetwork,
+    activeProfileId: activeProfileId,
+    identityStates: Map<String, ProfileIdentityState>.unmodifiable(
+      identityStates,
+    ),
+    identityStatuses: Map<String, ProfileIdentityStatus>.unmodifiable(
+      identityStatuses,
+    ),
+  );
+}
+
+UsqueProfile _decodeProfile(_ProtoReader reader) {
+  var vpnGate = const VpnGateSettings();
+  ChainExitSettings? chainExit;
+  final defaults = UsqueProfile.defaultProfile();
+  var id = defaults.id;
+  var name = defaults.name;
+  var mode = defaults.mode;
+  var transport = defaults.transport;
+  var dataPlane = defaults.dataPlane;
+  var disableQuic = false;
+  var congestionControl = defaults.congestionControl;
+  var ipPolicy = defaults.ipPolicy;
+  var endpointIpv4 = defaults.endpointIpv4;
+  var endpointIpv6 = defaults.endpointIpv6;
+  var endpointPort = defaults.endpointPort;
+  var endpointSelection = EndpointSelection.custom;
+  var sni = defaults.sni;
+  var mtu = defaults.mtu;
+  final dnsServers = <String>[];
+  var allowLan = false;
+  final bypassCidrs = <String>[];
+  var killSwitch = false;
+  var autoConnect = defaults.autoConnect;
+  var dnsMode = defaults.dnsMode;
+  var proxy = defaults.proxy;
+  var frontends = defaults.frontends;
+  var frontendsSeen = false;
+  final geoDirectCountries = <String>[];
+  final bypassDomains = <String>[];
+  var directDns = defaults.directDns;
+
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        id = reader.string(field);
+      case 2:
+        name = reader.string(field);
+      case 3:
+        mode = _decodeIndexedEnum(
+          OperatingMode.values,
+          reader.varint(field),
+          'operating mode',
+        );
+      case 4:
+        transport = _decodeIndexedEnum(
+          TransportPolicy.values,
+          reader.varint(field),
+          'transport policy',
+        );
+      case 5:
+        final endpoint = reader.message(field);
+        while (!endpoint.isDone) {
+          final endpointField = endpoint.field();
+          switch (endpointField.number) {
+            case 1:
+              endpointIpv4 = endpoint.string(endpointField);
+            case 2:
+              endpointIpv6 = endpoint.string(endpointField);
+            case 3:
+              endpointPort = endpoint.varint(endpointField);
+            case 4:
+              sni = endpoint.string(endpointField);
+            case 5:
+              endpointSelection = switch (endpoint.varint(endpointField)) {
+                0 || 2 => EndpointSelection.custom,
+                1 => EndpointSelection.automatic,
+                _ => throw const FormatException('Invalid endpoint selection'),
+              };
+            default:
+              endpoint.skip(endpointField);
+          }
+        }
+      case 6:
+        ipPolicy = _decodeIndexedEnum(
+          IpPolicy.values,
+          reader.varint(field),
+          'Endpoint family policy',
+        );
+      case 7:
+        mtu = reader.varint(field);
+      case 8:
+        dnsServers.add(reader.string(field));
+      case 9:
+        allowLan = reader.varint(field) != 0;
+      case 10:
+        bypassCidrs.add(reader.string(field));
+      case 11:
+        killSwitch = reader.varint(field) != 0;
+      case 12:
+        autoConnect = reader.varint(field) != 0;
+      case 13:
+        proxy = _decodeProxySettings(reader.message(field), proxy);
+      case 14:
+        dnsMode = _decodeIndexedEnum(
+          DnsMode.values,
+          reader.varint(field),
+          'DNS mode',
+        );
+      case 15:
+        final source = reader.message(field);
+        var tunnel = false;
+        var socks5 = false;
+        var http = false;
+        while (!source.isDone) {
+          final frontendField = source.field();
+          switch (frontendField.number) {
+            case 1:
+              tunnel = source.varint(frontendField) != 0;
+            case 2:
+              socks5 = source.varint(frontendField) != 0;
+            case 3:
+              http = source.varint(frontendField) != 0;
+            default:
+              source.skip(frontendField);
+          }
+        }
+        frontends = FrontendSettings(
+          tunnel: tunnel,
+          socks5: socks5,
+          http: http,
+        );
+        frontendsSeen = true;
+      case 16:
+        geoDirectCountries.add(reader.string(field));
+      case 23:
+        bypassDomains.add(reader.string(field));
+      case 17:
+        directDns = _decodeDirectDnsSettings(reader.message(field));
+      case 18:
+        final value = reader.varint(field);
+        congestionControl = value == 0
+            ? CongestionControlAlgorithm.cubic
+            : _decodeCongestionControl(value);
+      case 19:
+        final value = reader.varint(field);
+        dataPlane = value == 0
+            ? DataPlaneMode.connectIp
+            : _decodeIndexedEnum(DataPlaneMode.values, value, 'data plane');
+      case 22:
+        chainExit = ChainExitSettings.fromMap(
+          _decodeVpnGate(reader.message(field), 'chain_settings'),
+        );
+      case 20:
+        vpnGate = VpnGateSettings.fromMap(
+          _decodeVpnGate(reader.message(field), 'settings'),
+        );
+      case 21:
+        disableQuic = reader.varint(field) != 0;
+      default:
+        reader.skip(field);
+    }
+  }
+  if (!frontendsSeen) {
+    frontends = FrontendSettings(
+      tunnel: mode == OperatingMode.vpn,
+      socks5: mode == OperatingMode.socks5,
+      http: mode == OperatingMode.httpProxy,
+    );
+  }
+  return UsqueProfile(
+    id: id,
+    name: name,
+    mode: mode,
+    transport: transport,
+    dataPlane: dataPlane,
+    vpnGate: vpnGate,
+    chainExit: chainExit,
+    disableQuic: disableQuic,
+    congestionControl: congestionControl,
+    ipPolicy: ipPolicy,
+    endpointIpv4: endpointIpv4,
+    endpointIpv6: endpointIpv6,
+    endpointPort: endpointPort,
+    endpointSelection: endpointSelection,
+    sni: sni,
+    mtu: mtu,
+    dnsIpv4:
+        dnsServers.where((value) => value.contains('.')).firstOrNull ??
+        defaults.dnsIpv4,
+    dnsIpv6:
+        dnsServers.where((value) => value.contains(':')).firstOrNull ??
+        defaults.dnsIpv6,
+    dnsMode: dnsMode,
+    killSwitch: killSwitch,
+    allowLan: allowLan,
+    autoConnect: autoConnect,
+    bypassCidrs: List<String>.unmodifiable(bypassCidrs),
+    geoDirectCountries: List<String>.unmodifiable(geoDirectCountries),
+    bypassDomains: List<String>.unmodifiable(bypassDomains),
+    proxy: proxy,
+    frontends: frontends,
+    directDns: directDns,
+  );
+}
+
+DirectDnsSettings _decodeDirectDnsSettings(_ProtoReader reader) {
+  var mode = DirectDnsMode.physicalSystem;
+  var serverName = '';
+  var dohPath = '';
+  final bootstrapIps = <String>[];
+  var port = 0;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        mode = _decodeDirectDnsMode(reader.varint(field));
+      case 2:
+        serverName = reader.string(field);
+      case 3:
+        dohPath = reader.string(field);
+      case 4:
+        bootstrapIps.add(reader.string(field));
+      case 5:
+        port = reader.varint(field);
+      default:
+        reader.skip(field);
+    }
+  }
+  return DirectDnsSettings(
+    mode: mode,
+    serverName: serverName,
+    dohPath: dohPath,
+    bootstrapIps: List<String>.unmodifiable(bootstrapIps),
+    port: port,
+  );
+}
+
+int _directDnsModeWireValue(DirectDnsMode mode) => switch (mode) {
+  DirectDnsMode.unknown => 0,
+  DirectDnsMode.physicalSystem => 1,
+  DirectDnsMode.doh => 2,
+  DirectDnsMode.dot => 3,
+};
+
+DirectDnsMode _decodeDirectDnsMode(int value) => switch (value) {
+  1 => DirectDnsMode.physicalSystem,
+  2 => DirectDnsMode.doh,
+  3 => DirectDnsMode.dot,
+  _ => DirectDnsMode.unknown,
+};
+
+GeoRulesList _decodeGeoRulesList(_ProtoReader reader) {
+  final entries = <GeoRulesEntry>[];
+  var lastSuccessfulUpdateUnixMilliseconds = 0;
+  var hasGlobalGeosite = false;
+  var globalGeositeUpdatedUnixMilliseconds = 0;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        entries.add(_decodeGeoRulesEntry(reader.message(field)));
+      case 2:
+        lastSuccessfulUpdateUnixMilliseconds = reader.varint(field);
+      case 3:
+        hasGlobalGeosite = reader.varint(field) != 0;
+      case 4:
+        globalGeositeUpdatedUnixMilliseconds = reader.varint(field);
+      default:
+        reader.skip(field);
+    }
+  }
+  return GeoRulesList(
+    entries: List<GeoRulesEntry>.unmodifiable(entries),
+    lastSuccessfulUpdateUnixMilliseconds: lastSuccessfulUpdateUnixMilliseconds,
+    hasGlobalGeosite: hasGlobalGeosite,
+    globalGeositeUpdatedUnixMilliseconds: globalGeositeUpdatedUnixMilliseconds,
+  );
+}
+
+GeoRulesEntry _decodeGeoRulesEntry(_ProtoReader reader) {
+  var countryCode = '';
+  var hasGeoip = false;
+  var hasGeosite = false;
+  var lastUpdatedUnixMilliseconds = 0;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        countryCode = reader.string(field);
+      case 2:
+        hasGeoip = reader.varint(field) != 0;
+      case 3:
+        hasGeosite = reader.varint(field) != 0;
+      case 4:
+        lastUpdatedUnixMilliseconds = reader.varint(field);
+      default:
+        reader.skip(field);
+    }
+  }
+  return GeoRulesEntry(
+    countryCode: countryCode,
+    hasGeoip: hasGeoip,
+    hasGeosite: hasGeosite,
+    lastUpdatedUnixMilliseconds: lastUpdatedUnixMilliseconds,
+  );
+}
+
+List<GeoRulesUpdateResult> _decodeGeoRulesUpdate(_ProtoReader reader) {
+  final results = <GeoRulesUpdateResult>[];
+  while (!reader.isDone) {
+    final field = reader.field();
+    if (field.number != 1) {
+      reader.skip(field);
+      continue;
+    }
+    final item = reader.message(field);
+    var countryCode = '';
+    var status = GeoRulesUpdateStatus.updated;
+    var reason = '';
+    var artifactKind = '';
+    var artifactScope = '';
+    while (!item.isDone) {
+      final itemField = item.field();
+      switch (itemField.number) {
+        case 1:
+          countryCode = item.string(itemField);
+        case 2:
+          status = switch (item.varint(itemField)) {
+            1 => GeoRulesUpdateStatus.upToDate,
+            3 => GeoRulesUpdateStatus.failed,
+            _ => GeoRulesUpdateStatus.updated,
+          };
+        case 3:
+          reason = item.string(itemField);
+        case 4:
+          artifactKind = item.string(itemField);
+        case 5:
+          artifactScope = item.string(itemField);
+        default:
+          item.skip(itemField);
+      }
+    }
+    results.add(
+      GeoRulesUpdateResult(
+        countryCode: countryCode,
+        status: status,
+        reason: reason,
+        artifactKind: artifactKind,
+        artifactScope: artifactScope,
+      ),
+    );
+  }
+  return results;
+}
+
+GeoRulesProgress _decodeGeoProgress(_ProtoReader reader) {
+  var currentFile = '';
+  var completed = 0;
+  var total = 0;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        currentFile = reader.string(field);
+      case 2:
+        completed = reader.varint(field);
+      case 3:
+        total = reader.varint(field);
+      default:
+        reader.skip(field);
+    }
+  }
+  return GeoRulesProgress(
+    currentFile: currentFile,
+    completed: completed,
+    total: total,
+  );
+}
+
+DiagnosticSession _decodeDiagnosticSession(_ProtoReader reader) {
+  var sessionId = '';
+  var state = DiagnosticSessionState.failed;
+  var startedAt = DateTime.fromMillisecondsSinceEpoch(0, isUtc: true);
+  DateTime? completedAt;
+  var mode = DiagnosticMode.standard;
+  String? currentCheck;
+  var progressPercent = 0;
+  final findings = <DiagnosticFinding>[];
+  var summary = const DiagnosticSummary();
+  final activeChecks = <String>[];
+  int? revision;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        sessionId = reader.string(field);
+      case 2:
+        state = _decodeIndexedEnum(
+          DiagnosticSessionState.values,
+          reader.varint(field),
+          'diagnostic session state',
+        );
+      case 3:
+        final milliseconds = reader.varint(field);
+        if (milliseconds > 0) {
+          startedAt = DateTime.fromMillisecondsSinceEpoch(
+            milliseconds,
+            isUtc: true,
+          );
+        }
+      case 4:
+        final milliseconds = reader.varint(field);
+        if (milliseconds > 0) {
+          completedAt = DateTime.fromMillisecondsSinceEpoch(
+            milliseconds,
+            isUtc: true,
+          );
+        }
+      case 5:
+        mode = _decodeIndexedEnum(
+          DiagnosticMode.values,
+          reader.varint(field),
+          'diagnostic mode',
+        );
+      case 6:
+        currentCheck = _emptyToNull(reader.string(field));
+      case 7:
+        progressPercent = reader.varint(field).clamp(0, 100);
+      case 8:
+        findings.add(_decodeDiagnosticFinding(reader.message(field)));
+      case 9:
+        summary = _decodeDiagnosticSummary(reader.message(field));
+      case 10:
+        final check = reader.string(field);
+        if (activeChecks.length < 4 &&
+            DiagnosticsContract.checkIds.contains(check) &&
+            !activeChecks.contains(check)) {
+          activeChecks.add(check);
+        }
+      case 11:
+        final value = reader.varint(field);
+        revision = value >= 0 ? value : null;
+      default:
+        reader.skip(field);
+    }
+  }
+  return DiagnosticSession(
+    sessionId: sessionId,
+    state: state,
+    startedAt: startedAt,
+    completedAt: completedAt,
+    mode: mode,
+    currentCheck: currentCheck,
+    progressPercent: progressPercent,
+    findings: List<DiagnosticFinding>.unmodifiable(findings),
+    summary: summary,
+    activeChecks: List.unmodifiable(activeChecks),
+    revision: revision,
+  );
+}
+
+DiagnosticFinding _decodeDiagnosticFinding(_ProtoReader reader) {
+  var checkId = '';
+  var category = DiagnosticCategory.localComponent;
+  var status = DiagnosticCheckStatus.pending;
+  TransportFailureInfo? failure;
+  var severity = DiagnosticSeverity.info;
+  var summaryKey = '';
+  var remediationKey = '';
+  final evidence = <String>[];
+  DateTime? startedAt;
+  int? durationMilliseconds;
+  String? dependencyReason;
+  DiagnosticObservation? observation;
+  final typedEvidence = <DiagnosticEvidence>[];
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        checkId = reader.string(field);
+      case 2:
+        category = _decodeIndexedEnum(
+          DiagnosticCategory.values,
+          reader.varint(field),
+          'diagnostic category',
+        );
+      case 3:
+        status = _decodeIndexedEnum(
+          DiagnosticCheckStatus.values,
+          reader.varint(field),
+          'diagnostic check status',
+        );
+      case 4:
+        failure = _decodeTransportFailure(reader.message(field));
+      case 5:
+        severity = _decodeIndexedEnum(
+          DiagnosticSeverity.values,
+          reader.varint(field),
+          'diagnostic severity',
+        );
+      case 6:
+        summaryKey = reader.string(field);
+      case 7:
+        remediationKey = reader.string(field);
+      case 8:
+        evidence.add(reader.string(field));
+      case 9:
+        final milliseconds = reader.varint(field);
+        if (milliseconds > 0) {
+          startedAt = DateTime.fromMillisecondsSinceEpoch(
+            milliseconds,
+            isUtc: true,
+          );
+        }
+      case 10:
+        final value = reader.varint(field);
+        durationMilliseconds = value == 0 ? null : value;
+      case 11:
+        dependencyReason = _emptyToNull(reader.string(field));
+      case 12:
+        observation = _decodeDiagnosticObservation(reader.message(field));
+      case 13:
+        final value = _decodeDiagnosticEvidence(reader.message(field));
+        if (value != null && typedEvidence.length < 32) {
+          typedEvidence.add(value);
+        }
+      default:
+        reader.skip(field);
+    }
+  }
+  return DiagnosticFinding(
+    checkId: checkId,
+    category: category,
+    status: status,
+    failure: failure,
+    severity: severity,
+    summaryKey: summaryKey,
+    remediationKey: remediationKey,
+    sanitizedEvidence: List<String>.unmodifiable(evidence),
+    startedAt: startedAt,
+    durationMilliseconds: durationMilliseconds,
+    dependencyReason: dependencyReason,
+    observation: observation,
+    evidence: List.unmodifiable(typedEvidence),
+  );
+}
+
+DiagnosticObservation _decodeDiagnosticObservation(_ProtoReader reader) {
+  final values = <Object?, Object?>{'age_milliseconds': 0};
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        values['source'] = reader.string(field);
+      case 2:
+        values['availability'] = reader.string(field);
+      case 3:
+        values['age_milliseconds'] = reader.varint(field);
+      case 4:
+        values['connection_instance_id'] = reader.string(field);
+      case 5:
+        values['network_generation'] = reader.varint(field);
+      default:
+        reader.skip(field);
+    }
+  }
+  return DiagnosticObservation.fromMap(values);
+}
+
+DiagnosticEvidence? _decodeDiagnosticEvidence(_ProtoReader reader) {
+  final values = <Object?, Object?>{};
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        values['key'] = reader.string(field);
+      case 2:
+        values['number'] = reader.varint(field);
+      case 3:
+        values['token'] = reader.string(field);
+      default:
+        reader.skip(field);
+    }
+  }
+  return DiagnosticEvidence.fromMap(values);
+}
+
+DiagnosticSummary _decodeDiagnosticSummary(_ProtoReader reader) {
+  var passed = 0;
+  var warnings = 0;
+  var failed = 0;
+  var skipped = 0;
+  var cancelled = 0;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        passed = reader.varint(field);
+      case 2:
+        warnings = reader.varint(field);
+      case 3:
+        failed = reader.varint(field);
+      case 4:
+        skipped = reader.varint(field);
+      case 5:
+        cancelled = reader.varint(field);
+      default:
+        reader.skip(field);
+    }
+  }
+  return DiagnosticSummary(
+    passed: passed,
+    warnings: warnings,
+    failed: failed,
+    skipped: skipped,
+    cancelled: cancelled,
+  );
+}
+
+TransportFailureInfo _decodeTransportFailure(_ProtoReader reader) {
+  var code = 'INTERNAL';
+  var stage = 'diagnostics';
+  String? transport;
+  String? addressFamily;
+  var retryable = false;
+  var fallbackAllowed = false;
+  var severity = DiagnosticSeverity.error;
+  var remediationKey = '';
+  String? sanitizedDetail;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        code = reader.string(field);
+      case 2:
+        stage = reader.string(field);
+      case 3:
+        transport = _emptyToNull(reader.string(field));
+      case 4:
+        addressFamily = _emptyToNull(reader.string(field));
+      case 5:
+        retryable = reader.varint(field) != 0;
+      case 6:
+        fallbackAllowed = reader.varint(field) != 0;
+      case 7:
+        severity = _decodeIndexedEnum(
+          DiagnosticSeverity.values,
+          reader.varint(field),
+          'failure severity',
+        );
+      case 8:
+        remediationKey = reader.string(field);
+      case 9:
+        sanitizedDetail = _emptyToNull(reader.string(field));
+      default:
+        reader.skip(field);
+    }
+  }
+  return TransportFailureInfo(
+    code: code,
+    stage: stage,
+    transport: transport,
+    addressFamily: addressFamily,
+    retryable: retryable,
+    fallbackAllowed: fallbackAllowed,
+    severity: severity,
+    remediationKey: remediationKey,
+    sanitizedDetail: sanitizedDetail,
+  );
+}
+
+ConnectionTimeline _decodeConnectionTimeline(_ProtoReader reader) {
+  final events = <ConnectionTimelineEvent>[];
+  var metrics = const ConnectionMetrics();
+  var droppedEventCount = 0;
+  final metadata = <Object?, Object?>{};
+  DiagnosticObservation? observation;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        events.add(_decodeConnectionTimelineEvent(reader.message(field)));
+      case 2:
+        metrics = _decodeConnectionMetrics(reader.message(field));
+      case 3:
+        droppedEventCount = reader.varint(field);
+      case 4:
+        metadata['connection_instance_id'] = reader.string(field);
+      case 5:
+        metadata['retained'] = reader.varint(field) == 1;
+      case 6:
+        metadata['session_generation'] = reader.varint(field);
+      case 7:
+        observation = _decodeDiagnosticObservation(reader.message(field));
+      default:
+        reader.skip(field);
+    }
+  }
+  final validated = connectionTimelineFromMap(metadata);
+  return ConnectionTimeline(
+    events: List<ConnectionTimelineEvent>.unmodifiable(events),
+    metrics: metrics,
+    droppedEventCount: droppedEventCount,
+    connectionInstanceId: validated.connectionInstanceId,
+    retained: validated.retained,
+    sessionGeneration: validated.sessionGeneration,
+    observation: observation,
+  );
+}
+
+ConnectionTimelineEvent _decodeConnectionTimelineEvent(_ProtoReader reader) {
+  String? queueKind;
+  var sequence = 0;
+  DateTime? timestamp;
+  var elapsedMilliseconds = 0;
+  var eventType = ConnectionTimelineEventType.unknown;
+  String? stage;
+  String? transport;
+  String? addressFamily;
+  int? durationMilliseconds;
+  TransportFailureInfo? failure;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        sequence = reader.varint(field);
+      case 2:
+        final milliseconds = reader.varint(field);
+        if (milliseconds > 0) {
+          timestamp = DateTime.fromMillisecondsSinceEpoch(
+            milliseconds,
+            isUtc: true,
+          );
+        }
+      case 3:
+        elapsedMilliseconds = reader.varint(field);
+      case 4:
+        eventType = _decodeConnectionTimelineEventType(reader.varint(field));
+      case 5:
+        stage = _emptyToNull(reader.string(field));
+      case 6:
+        transport = _emptyToNull(reader.string(field));
+      case 7:
+        addressFamily = _emptyToNull(reader.string(field));
+      case 8:
+        final value = reader.varint(field);
+        durationMilliseconds = value == 0 ? null : value;
+      case 9:
+        failure = _decodeTransportFailure(reader.message(field));
+      case 10:
+        queueKind = switch (reader.varint(field)) {
+          1 => 'tun_to_transport',
+          2 => 'proxy_to_transport',
+          3 => 'transport_outgoing',
+          4 => 'h3_datagram_send',
+          5 => 'h3_wire_send',
+          6 => 'transport_to_tun',
+          7 => 'transport_to_proxy',
+          8 => 'direct_dns',
+          _ => null,
+        };
+      default:
+        reader.skip(field);
+    }
+  }
+  return ConnectionTimelineEvent(
+    queueKind: queueKind,
+    sequence: sequence,
+    timestamp: timestamp,
+    elapsedMilliseconds: elapsedMilliseconds,
+    eventType: eventType,
+    stage: stage,
+    transport: transport,
+    addressFamily: addressFamily,
+    durationMilliseconds:
+        eventType == ConnectionTimelineEventType.queueBackpressured
+        ? durationMilliseconds ?? 0
+        : durationMilliseconds,
+    failure: failure,
+  );
+}
+
+ConnectionTimelineEventType _decodeConnectionTimelineEventType(int wireValue) {
+  return switch (wireValue) {
+    1 => ConnectionTimelineEventType.attemptStarted,
+    2 => ConnectionTimelineEventType.endpointResolved,
+    3 => ConnectionTimelineEventType.socketConnected,
+    4 => ConnectionTimelineEventType.tlsReady,
+    5 => ConnectionTimelineEventType.quicReady,
+    6 => ConnectionTimelineEventType.masqueAccepted,
+    7 => ConnectionTimelineEventType.peerSettingsReceived,
+    8 => ConnectionTimelineEventType.addressAssigned,
+    9 => ConnectionTimelineEventType.tunnelReady,
+    10 => ConnectionTimelineEventType.firstPacketSent,
+    11 => ConnectionTimelineEventType.firstPacketReceived,
+    12 => ConnectionTimelineEventType.fallbackStarted,
+    13 => ConnectionTimelineEventType.reconnectScheduled,
+    14 => ConnectionTimelineEventType.networkChanged,
+    15 => ConnectionTimelineEventType.recoveryProbeStarted,
+    16 => ConnectionTimelineEventType.recoveryProbeSucceeded,
+    17 => ConnectionTimelineEventType.recoveryProbeFailed,
+    18 => ConnectionTimelineEventType.pathPromoted,
+    19 => ConnectionTimelineEventType.queueSaturated,
+    31 => ConnectionTimelineEventType.queueBackpressured,
+    20 => ConnectionTimelineEventType.disconnected,
+    21 => ConnectionTimelineEventType.failed,
+    22 => ConnectionTimelineEventType.migrationStarted,
+    23 => ConnectionTimelineEventType.migrationPathValidated,
+    24 => ConnectionTimelineEventType.migrationPromoted,
+    25 => ConnectionTimelineEventType.migrationFailed,
+    26 => ConnectionTimelineEventType.pmtuChanged,
+    27 => ConnectionTimelineEventType.pmtuRevalidationStarted,
+    28 => ConnectionTimelineEventType.pmtuRevalidationFailed,
+    29 => ConnectionTimelineEventType.directDnsDegraded,
+    30 => ConnectionTimelineEventType.directDnsRecovered,
+    _ => ConnectionTimelineEventType.unknown,
+  };
+}
+
+ConnectionMetrics _decodeConnectionMetrics(_ProtoReader reader) {
+  int? lastConnectDuration;
+  int? h3Duration;
+  int? h2Duration;
+  var rtt = 0;
+  var rttKnown = false;
+  var reconnectCount = 0;
+  var fallbackCount = 0;
+  var networkChangeCount = 0;
+  var highWatermark = 0;
+  var dropCount = 0;
+  String? lastFailureCode;
+  String? lastReconnectCode;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        final value = reader.varint(field);
+        lastConnectDuration = value == 0 ? null : value;
+      case 2:
+        final value = reader.varint(field);
+        h3Duration = value == 0 ? null : value;
+      case 3:
+        final value = reader.varint(field);
+        h2Duration = value == 0 ? null : value;
+      case 4:
+        rtt = reader.varint(field);
+      case 5:
+        rttKnown = reader.varint(field) != 0;
+      case 6:
+        reconnectCount = reader.varint(field);
+      case 7:
+        fallbackCount = reader.varint(field);
+      case 8:
+        networkChangeCount = reader.varint(field);
+      case 9:
+        highWatermark = reader.varint(field);
+      case 10:
+        dropCount = reader.varint(field);
+      case 11:
+        lastFailureCode = _emptyToNull(reader.string(field));
+      case 12:
+        lastReconnectCode = _emptyToNull(reader.string(field));
+      default:
+        reader.skip(field);
+    }
+  }
+  return ConnectionMetrics(
+    lastConnectDurationMilliseconds: lastConnectDuration,
+    lastH3HandshakeDurationMilliseconds: h3Duration,
+    lastH2HandshakeDurationMilliseconds: h2Duration,
+    currentSmoothedRttMilliseconds: rttKnown ? rtt : null,
+    reconnectCount: reconnectCount,
+    fallbackCount: fallbackCount,
+    networkChangeCount: networkChangeCount,
+    sendQueueHighWatermark: highWatermark,
+    sendQueueDropCount: dropCount,
+    lastFailureCode: lastFailureCode,
+    lastReconnectCode: lastReconnectCode,
+  );
+}
+
+EngineCapabilities _decodeCapabilities(_ProtoReader reader) {
+  var applicationQuicBlocking = false;
+  var accountMetadataMutations = false;
+  var sharedProxyAuthApplication = false;
+  var networkSettingsApplication = false;
+  var l4Tcp = false;
+  var l4TunTcp = false;
+  var l4DnsConversion = false;
+  var vpnGateTcp = false;
+  var chainProfileImport = false,
+      chainOpenvpnUdp = false,
+      chainWireguard = false,
+      chainWarpWireguard = false,
+      chainHttpProxy = false,
+      chainSocks5Proxy = false,
+      chainProxyEncryptedDns = false,
+      chainOpenvpnMultiEndpoint = false;
+  var customBypass = false;
+  var automaticEndpoints = false;
+  var vpnGatePoolFavorites = false;
+  final congestionAlgorithms = <CongestionControlAlgorithm>[];
+  var networkQuality = false;
+  var encryptedDirectDns = false;
+  var quicMigration = false;
+  var automaticPmtu = false;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 25:
+        networkSettingsApplication = reader.varint(field) != 0;
+      case 26:
+        l4Tcp = reader.varint(field) != 0;
+      case 27:
+        l4TunTcp = reader.varint(field) != 0;
+      case 28:
+        l4DnsConversion = reader.varint(field) != 0;
+      case 29:
+        vpnGateTcp = reader.varint(field) != 0;
+      case 30:
+        vpnGatePoolFavorites = reader.varint(field) != 0;
+      case 31:
+        applicationQuicBlocking = reader.varint(field) != 0;
+      case 32:
+        accountMetadataMutations = reader.varint(field) != 0;
+      case 34:
+        chainProfileImport = reader.varint(field) != 0;
+      case 35:
+        chainOpenvpnUdp = reader.varint(field) != 0;
+      case 39:
+        chainHttpProxy = reader.varint(field) != 0;
+      case 41:
+        customBypass = reader.varint(field) != 0;
+      case 42:
+        automaticEndpoints = reader.varint(field) != 0;
+      case 43:
+        chainProxyEncryptedDns = reader.varint(field) != 0;
+      case 40:
+        chainSocks5Proxy = reader.varint(field) != 0;
+      case 38:
+        chainWarpWireguard = reader.varint(field) != 0;
+      case 36:
+        chainWireguard = reader.varint(field) != 0;
+      case 37:
+        chainOpenvpnMultiEndpoint = reader.varint(field) != 0;
+      case 33:
+        sharedProxyAuthApplication = reader.varint(field) != 0;
+      case 20:
+        networkQuality = reader.varint(field) != 0;
+      case 21:
+        encryptedDirectDns = reader.varint(field) != 0;
+      case 22:
+        quicMigration = reader.varint(field) != 0;
+      case 23:
+        automaticPmtu = reader.varint(field) != 0;
+      case 24:
+        final values = field.wireType == 2 ? reader.message(field) : null;
+        if (values != null && values.isDone) break;
+        do {
+          final value = values == null
+              ? reader.varint(field)
+              : values._varint();
+          if (value >= 1 && value <= 4) {
+            final algorithm = _decodeCongestionControl(value);
+            if (!congestionAlgorithms.contains(algorithm)) {
+              congestionAlgorithms.add(algorithm);
+            }
+          }
+        } while (values != null && !values.isDone);
+      default:
+        reader.skip(field);
+    }
+  }
+  return EngineCapabilities(
+    networkSettingsApplication: networkSettingsApplication,
+    applicationQuicBlocking: applicationQuicBlocking,
+    accountMetadataMutations: accountMetadataMutations,
+    sharedProxyAuthApplication: sharedProxyAuthApplication,
+    l4Tcp: l4Tcp,
+    l4TunTcp: l4TunTcp,
+    l4DnsConversion: l4DnsConversion,
+    vpnGateTcp: vpnGateTcp,
+    chainProfileImport: chainProfileImport,
+    chainOpenvpnUdp: chainOpenvpnUdp,
+    chainWireguard: chainWireguard,
+    chainWarpWireguard: chainWarpWireguard,
+    chainHttpProxy: chainHttpProxy,
+    chainSocks5Proxy: chainSocks5Proxy,
+    chainProxyEncryptedDns: chainProxyEncryptedDns,
+    customBypass: customBypass,
+    automaticEndpoints: automaticEndpoints,
+    chainOpenvpnMultiEndpoint: chainOpenvpnMultiEndpoint,
+    vpnGatePoolFavorites: vpnGatePoolFavorites,
+    h3CongestionControlAlgorithms: List.unmodifiable(congestionAlgorithms),
+    networkQuality: networkQuality,
+    encryptedDirectDns: encryptedDirectDns,
+    quicMigration: quicMigration,
+    automaticPmtu: automaticPmtu,
+  );
+}
+
+NetworkSettingsState _decodeNetworkSettings(_ProtoReader reader) {
+  final values = <Object?, Object?>{};
+  final fields = <String>[];
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        values['source_epoch'] = reader.string(field);
+      case 2:
+        values['sequence'] = reader.varint(field);
+      case 3:
+        values['operation_id'] = reader.string(field);
+      case 4:
+        values['session_id'] = reader.string(field);
+      case 5:
+        values['stored_profile'] = _decodeProfile(
+          reader.message(field),
+        ).toMap();
+      case 6:
+        values['applied_profile'] = _decodeProfile(
+          reader.message(field),
+        ).toMap();
+      case 7:
+        values['apply_status'] = switch (reader.varint(field)) {
+          1 => 'not_required',
+          2 => 'applying',
+          3 => 'applied',
+          4 => 'deferred',
+          5 => 'failed',
+          _ => 'unknown',
+        };
+      case 8:
+        if (fields.length >= 32) {
+          throw const FormatException('Too many pending settings');
+        }
+        fields.add(reader.string(field));
+      case 9:
+        values['error_code'] = _emptyToNull(reader.string(field));
+      case 10:
+        values['persisted'] = reader.varint(field) != 0;
+      case 11:
+        values['shared_network_profile'] = _decodeProfile(
+          reader.message(field),
+        ).toMap();
+      default:
+        reader.skip(field);
+    }
+  }
+  values['sequence'] ??= 0;
+  values['deferred_fields'] = fields;
+  return NetworkSettingsState.fromMap(values);
+}
+
+NetworkQualitySnapshot _decodeNetworkQuality(_ProtoReader reader) {
+  TransportPerformanceSnapshot? transportPerformance;
+  UdpSocketReceiveSnapshot? udpSocketReceive;
+  DateTime? sampledAt;
+  String? connectionInstanceId;
+  var level = NetworkQualityLevel.unknown;
+  var metrics = const NetworkConnectionMetrics();
+  final queues = <NetworkQueueQuality>[];
+  final samples = <NetworkQualitySample>[];
+  var sampleCount = 0;
+  var pmtu = const PmtuQualityInfo();
+  var migration = const MigrationQualityInfo();
+  var directDns = const DirectDnsQualityInfo();
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        final milliseconds = reader.varint(field);
+        sampledAt = milliseconds <= 0 || milliseconds > 8640000000000000
+            ? null
+            : DateTime.fromMillisecondsSinceEpoch(milliseconds, isUtc: true);
+      case 2:
+        final id = reader.string(field);
+        connectionInstanceId = id.length <= 64 ? _emptyToNull(id) : null;
+      case 3:
+        level = _decodeNetworkQualityLevel(reader.varint(field));
+      case 4:
+        metrics = _decodeNetworkConnectionMetrics(reader.message(field));
+      case 5:
+        if (queues.length < 8) {
+          queues.add(_decodeNetworkQueueQuality(reader.message(field)));
+        } else {
+          reader.skip(field);
+        }
+      case 6:
+        pmtu = _decodePmtuQuality(reader.message(field));
+      case 7:
+        migration = _decodeMigrationQuality(reader.message(field));
+      case 8:
+        directDns = _decodeDirectDnsQuality(reader.message(field));
+      case 9:
+        if (sampleCount++ < 16) {
+          final sample = _decodeNetworkQualitySample(reader.message(field));
+          if (sample != null) samples.add(sample);
+        } else {
+          reader.skip(field);
+        }
+      case 10:
+        udpSocketReceive = _decodeUdpSocketReceive(reader.message(field));
+      case 11:
+        transportPerformance = _decodeTransportPerformance(
+          reader.message(field),
+        );
+      default:
+        reader.skip(field);
+    }
+  }
+  return NetworkQualitySnapshot(
+    transportPerformance: transportPerformance,
+    udpSocketReceive: udpSocketReceive,
+    sampledAt: sampledAt,
+    connectionInstanceId: connectionInstanceId,
+    level: level,
+    metrics: metrics,
+    queues: List<NetworkQueueQuality>.unmodifiable(queues),
+    pmtu: pmtu,
+    migration: migration,
+    directDns: directDns,
+    samples: List.unmodifiable(samples),
+  );
+}
+
+UdpSocketReceiveSnapshot _decodeUdpSocketReceive(_ProtoReader reader) {
+  int? receive, send;
+  L4ReceiveSnapshot? observation;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        receive = reader.varint(field);
+      case 2:
+        send = reader.varint(field);
+      case 3:
+        observation = L4ReceiveSnapshot.from(
+          _decodeL4Receive(reader.message(field)),
+        );
+      default:
+        reader.skip(field);
+    }
+  }
+  return UdpSocketReceiveSnapshot(
+    receiveBufferBytes: receive,
+    sendBufferBytes: send,
+    observation: observation,
+  );
+}
+
+NetworkQualitySample? _decodeNetworkQualitySample(_ProtoReader reader) {
+  const keys = <int, String>{
+    1: 'sequence',
+    2: 'sampled_at_unix_ms',
+    3: 'monotonic_millis',
+    4: 'downloaded_bytes',
+    5: 'uploaded_bytes',
+    6: 'rtt_ms',
+    7: 'loss_basis_points',
+  };
+  // Proto3 omits the zero monotonic origin; optional metrics retain presence.
+  final values = <Object?, Object?>{'monotonic_millis': 0};
+  while (!reader.isDone) {
+    final field = reader.field();
+    final key = keys[field.number];
+    if (key == null) {
+      reader.skip(field);
+    } else {
+      values[key] = reader.varint(field);
+    }
+  }
+  return NetworkQualitySample.fromMap(values);
+}
+
+NetworkConnectionMetrics _decodeNetworkConnectionMetrics(_ProtoReader reader) {
+  var latestRtt = 0;
+  var latestRttKnown = false;
+  var latestAvailability = MetricAvailability.unknown;
+  var smoothedRtt = 0;
+  var smoothedRttKnown = false;
+  var minimumRtt = 0;
+  var minimumRttKnown = false;
+  var rttVariance = 0;
+  var rttVarianceKnown = false;
+  var intervalLoss = 0;
+  var intervalLossKnown = false;
+  var congestionWindow = 0;
+  var congestionWindowKnown = false;
+  var bytesInFlight = 0;
+  var bytesInFlightKnown = false;
+  var sendRate = 0;
+  var sendRateKnown = false;
+  var packetsLost = 0;
+  var bytesLost = 0;
+  var tunSinkDrops = 0;
+  var quicDatagramDrops = 0;
+  var queueOldestAge = 0;
+  var queueOldestAgeKnown = false;
+  var currentPmtu = 0;
+  var currentPmtuKnown = false;
+  var migrationAttempts = 0;
+  var migrationSuccesses = 0;
+  var migrationFailures = 0;
+  var lastMigrationDuration = 0;
+  var lastMigrationDurationKnown = false;
+  var udpSendSyscalls = 0;
+  var udpRecvSyscalls = 0;
+  var udpDatagramsSent = 0;
+  var udpDatagramsReceived = 0;
+  var poolHits = 0;
+  var poolMisses = 0;
+  var h2StallCount = 0;
+  var h2StallTotal = 0;
+  var h2StallMax = 0;
+  var h2StreamWindow = 0;
+  var h2ConnectionWindow = 0;
+  var dnsSuccesses = 0;
+  var dnsFailures = 0;
+  var dnsTimeouts = 0;
+  var dnsLastRtt = 0;
+  var dnsLastRttKnown = false;
+  var pmtuChanges = 0;
+  var pmtuRevalidationFailures = 0;
+  var pmtuSendTooLarge = 0;
+  var smoothedAvailability = MetricAvailability.unknown;
+  var minimumAvailability = MetricAvailability.unknown;
+  var varianceAvailability = MetricAvailability.unknown;
+  var lossAvailability = MetricAvailability.unknown;
+  var congestionAvailability = MetricAvailability.unknown;
+  var bytesInFlightAvailability = MetricAvailability.unknown;
+  var sendRateAvailability = MetricAvailability.unknown;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 4:
+        smoothedRtt = reader.varint(field);
+      case 5:
+        smoothedRttKnown = reader.varint(field) != 0;
+      case 13:
+        minimumRtt = reader.varint(field);
+      case 14:
+        minimumRttKnown = reader.varint(field) != 0;
+      case 15:
+        rttVariance = reader.varint(field);
+      case 16:
+        rttVarianceKnown = reader.varint(field) != 0;
+      case 17:
+        intervalLoss = reader.varint(field);
+      case 18:
+        intervalLossKnown = reader.varint(field) != 0;
+      case 19:
+        congestionWindow = reader.varint(field);
+      case 20:
+        congestionWindowKnown = reader.varint(field) != 0;
+      case 21:
+        bytesInFlight = reader.varint(field);
+      case 22:
+        bytesInFlightKnown = reader.varint(field) != 0;
+      case 23:
+        sendRate = reader.varint(field);
+      case 24:
+        sendRateKnown = reader.varint(field) != 0;
+      case 25:
+        packetsLost = reader.varint(field);
+      case 26:
+        bytesLost = reader.varint(field);
+      case 27:
+        tunSinkDrops = reader.varint(field);
+      case 28:
+        quicDatagramDrops = reader.varint(field);
+      case 29:
+        queueOldestAge = reader.varint(field);
+      case 30:
+        queueOldestAgeKnown = reader.varint(field) != 0;
+      case 31:
+        currentPmtu = reader.varint(field);
+      case 32:
+        currentPmtuKnown = reader.varint(field) != 0;
+      case 33:
+        migrationAttempts = reader.varint(field);
+      case 34:
+        migrationSuccesses = reader.varint(field);
+      case 35:
+        migrationFailures = reader.varint(field);
+      case 36:
+        lastMigrationDuration = reader.varint(field);
+      case 37:
+        lastMigrationDurationKnown = reader.varint(field) != 0;
+      case 38:
+        udpSendSyscalls = reader.varint(field);
+      case 39:
+        udpRecvSyscalls = reader.varint(field);
+      case 40:
+        udpDatagramsSent = reader.varint(field);
+      case 41:
+        udpDatagramsReceived = reader.varint(field);
+      case 42:
+        poolHits = reader.varint(field);
+      case 43:
+        poolMisses = reader.varint(field);
+      case 44:
+        h2StallCount = reader.varint(field);
+      case 45:
+        h2StallTotal = reader.varint(field);
+      case 46:
+        h2StallMax = reader.varint(field);
+      case 47:
+        h2StreamWindow = reader.varint(field);
+      case 48:
+        h2ConnectionWindow = reader.varint(field);
+      case 49:
+        dnsSuccesses = reader.varint(field);
+      case 50:
+        dnsFailures = reader.varint(field);
+      case 51:
+        dnsTimeouts = reader.varint(field);
+      case 52:
+        dnsLastRtt = reader.varint(field);
+      case 53:
+        dnsLastRttKnown = reader.varint(field) != 0;
+      case 54:
+        pmtuChanges = reader.varint(field);
+      case 55:
+        pmtuRevalidationFailures = reader.varint(field);
+      case 56:
+        smoothedAvailability = _decodeMetricAvailability(reader.varint(field));
+      case 57:
+        minimumAvailability = _decodeMetricAvailability(reader.varint(field));
+      case 58:
+        varianceAvailability = _decodeMetricAvailability(reader.varint(field));
+      case 59:
+        lossAvailability = _decodeMetricAvailability(reader.varint(field));
+      case 60:
+        congestionAvailability = _decodeMetricAvailability(
+          reader.varint(field),
+        );
+      case 61:
+        bytesInFlightAvailability = _decodeMetricAvailability(
+          reader.varint(field),
+        );
+      case 62:
+        sendRateAvailability = _decodeMetricAvailability(reader.varint(field));
+      case 63:
+        pmtuSendTooLarge = reader.varint(field);
+      case 64:
+        latestRtt = reader.varint(field);
+      case 65:
+        latestRttKnown = reader.varint(field) != 0;
+      case 66:
+        latestAvailability = _decodeMetricAvailability(reader.varint(field));
+      default:
+        reader.skip(field);
+    }
+  }
+  return NetworkConnectionMetrics(
+    latestRttMilliseconds: latestRttKnown ? latestRtt : null,
+    latestRttAvailability: latestAvailability,
+    smoothedRttMilliseconds: smoothedRttKnown ? smoothedRtt : null,
+    minimumRttMilliseconds: minimumRttKnown ? minimumRtt : null,
+    rttVarianceMilliseconds: rttVarianceKnown ? rttVariance : null,
+    intervalLossBasisPoints: intervalLossKnown ? intervalLoss : null,
+    congestionWindowBytes: congestionWindowKnown ? congestionWindow : null,
+    bytesInFlight: bytesInFlightKnown ? bytesInFlight : null,
+    sendRateBitsPerSecond: sendRateKnown ? sendRate : null,
+    packetsLost: packetsLost,
+    bytesLost: bytesLost,
+    tunSinkDropCount: tunSinkDrops,
+    quicDatagramDropCount: quicDatagramDrops,
+    queueOldestAgeMilliseconds: queueOldestAgeKnown ? queueOldestAge : null,
+    currentPmtuBytes: currentPmtuKnown ? currentPmtu : null,
+    migrationAttemptCount: migrationAttempts,
+    migrationSuccessCount: migrationSuccesses,
+    migrationFailureCount: migrationFailures,
+    lastMigrationDurationMilliseconds: lastMigrationDurationKnown
+        ? lastMigrationDuration
+        : null,
+    udpSendSyscallCount: udpSendSyscalls,
+    udpRecvSyscallCount: udpRecvSyscalls,
+    udpDatagramSentCount: udpDatagramsSent,
+    udpDatagramReceivedCount: udpDatagramsReceived,
+    packetBufferPoolHitCount: poolHits,
+    packetBufferPoolMissCount: poolMisses,
+    h2FlowControlStallCount: h2StallCount,
+    h2FlowControlStallTotalMilliseconds: h2StallTotal,
+    h2FlowControlStallMaxMilliseconds: h2StallMax,
+    h2StreamReceiveWindowBytes: h2StreamWindow,
+    h2ConnectionReceiveWindowBytes: h2ConnectionWindow,
+    directDnsSuccessCount: dnsSuccesses,
+    directDnsFailureCount: dnsFailures,
+    directDnsTimeoutCount: dnsTimeouts,
+    directDnsLastRttMilliseconds: dnsLastRttKnown ? dnsLastRtt : null,
+    pmtuChangeCount: pmtuChanges,
+    pmtuRevalidationFailureCount: pmtuRevalidationFailures,
+    pmtuSendTooLargeCount: pmtuSendTooLarge,
+    smoothedRttAvailability: smoothedAvailability,
+    minimumRttAvailability: minimumAvailability,
+    rttVarianceAvailability: varianceAvailability,
+    intervalLossAvailability: lossAvailability,
+    congestionWindowAvailability: congestionAvailability,
+    bytesInFlightAvailability: bytesInFlightAvailability,
+    sendRateAvailability: sendRateAvailability,
+  );
+}
+
+NetworkQueueQuality _decodeNetworkQueueQuality(_ProtoReader reader) {
+  PerformanceCounters? backpressure;
+  var kind = NetworkQueueKind.unknown;
+  var availability = MetricAvailability.unknown;
+  var currentItems = 0;
+  var capacityItems = 0;
+  var currentBytes = 0;
+  var capacityBytes = 0;
+  var highWaterItems = 0;
+  var highWaterBytes = 0;
+  var dropItems = 0;
+  var dropBytes = 0;
+  var oldestAge = 0;
+  var oldestAgeKnown = false;
+  var enqueueCount = 0;
+  var dequeueCount = 0;
+  var closed = false;
+  var cancelled = false;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        kind = _decodeNetworkQueueKind(reader.varint(field));
+      case 2:
+        currentItems = reader.varint(field);
+      case 3:
+        capacityItems = reader.varint(field);
+      case 4:
+        currentBytes = reader.varint(field);
+      case 5:
+        capacityBytes = reader.varint(field);
+      case 6:
+        highWaterItems = reader.varint(field);
+      case 7:
+        highWaterBytes = reader.varint(field);
+      case 8:
+        dropItems = reader.varint(field);
+      case 9:
+        dropBytes = reader.varint(field);
+      case 10:
+        oldestAge = reader.varint(field);
+      case 11:
+        oldestAgeKnown = reader.varint(field) != 0;
+      case 12:
+        availability = _decodeMetricAvailability(reader.varint(field));
+      case 13:
+        enqueueCount = reader.varint(field);
+      case 14:
+        dequeueCount = reader.varint(field);
+      case 15:
+        closed = reader.varint(field) != 0;
+      case 16:
+        cancelled = reader.varint(field) != 0;
+      case 17:
+        backpressure = _decodePerformanceCounters(
+          reader.message(field),
+          queueBackpressureFields,
+          bucketLimit: 32,
+        );
+      default:
+        reader.skip(field);
+    }
+  }
+  return NetworkQueueQuality(
+    backpressure: backpressure,
+    kind: kind,
+    availability: availability,
+    currentItems: currentItems,
+    capacityItems: capacityItems,
+    currentBytes: currentBytes,
+    capacityBytes: capacityBytes,
+    highWaterItems: highWaterItems,
+    highWaterBytes: highWaterBytes,
+    dropItems: dropItems,
+    dropBytes: dropBytes,
+    oldestAgeMilliseconds: oldestAgeKnown ? oldestAge : null,
+    enqueueCount: enqueueCount,
+    dequeueCount: dequeueCount,
+    closed: closed,
+    cancelled: cancelled,
+  );
+}
+
+PmtuQualityInfo _decodePmtuQuality(_ProtoReader reader) {
+  var availability = MetricAvailability.unknown;
+  var outerPmtu = 0;
+  var effectivePayload = 0;
+  var effectiveAvailability = MetricAvailability.unknown;
+  var phaseCode = '';
+  var changeCount = 0;
+  var revalidationFailures = 0;
+  var sendTooLarge = 0;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        availability = _decodeMetricAvailability(reader.varint(field));
+      case 2:
+        outerPmtu = reader.varint(field);
+      case 3:
+        effectivePayload = reader.varint(field);
+      case 4:
+        phaseCode = reader.string(field);
+      case 5:
+        changeCount = reader.varint(field);
+      case 6:
+        revalidationFailures = reader.varint(field);
+      case 7:
+        effectiveAvailability = _decodeMetricAvailability(reader.varint(field));
+      case 8:
+        sendTooLarge = reader.varint(field);
+      default:
+        reader.skip(field);
+    }
+  }
+  return PmtuQualityInfo(
+    availability: availability,
+    outerPmtuBytes: _availabilityHasValue(availability) ? outerPmtu : null,
+    effectiveConnectIpPayloadBytes: _availabilityHasValue(effectiveAvailability)
+        ? effectivePayload
+        : null,
+    effectivePayloadAvailability: effectiveAvailability,
+    phaseCode: phaseCode,
+    changeCount: changeCount,
+    revalidationFailureCount: revalidationFailures,
+    sendTooLargeCount: sendTooLarge,
+  );
+}
+
+MigrationQualityInfo _decodeMigrationQuality(_ProtoReader reader) {
+  var phaseCode = '';
+  var attempts = 0;
+  var successes = 0;
+  var failures = 0;
+  var lastDuration = 0;
+  var lastDurationKnown = false;
+  var lastReasonCode = '';
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        phaseCode = reader.string(field);
+      case 2:
+        attempts = reader.varint(field);
+      case 3:
+        successes = reader.varint(field);
+      case 4:
+        failures = reader.varint(field);
+      case 5:
+        lastDuration = reader.varint(field);
+      case 6:
+        lastDurationKnown = reader.varint(field) != 0;
+      case 7:
+        lastReasonCode = reader.string(field);
+      default:
+        reader.skip(field);
+    }
+  }
+  return MigrationQualityInfo(
+    phaseCode: phaseCode,
+    attemptCount: attempts,
+    successCount: successes,
+    failureCount: failures,
+    lastDurationMilliseconds: lastDurationKnown ? lastDuration : null,
+    lastReasonCode: lastReasonCode,
+  );
+}
+
+DirectDnsQualityInfo _decodeDirectDnsQuality(_ProtoReader reader) {
+  var mode = DirectDnsMode.unknown;
+  var phaseCode = '';
+  var successes = 0;
+  var failures = 0;
+  var timeouts = 0;
+  var lastRtt = 0;
+  var lastRttKnown = false;
+  var lastReasonCode = '';
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        mode = _decodeDirectDnsMode(reader.varint(field));
+      case 2:
+        phaseCode = reader.string(field);
+      case 3:
+        successes = reader.varint(field);
+      case 4:
+        failures = reader.varint(field);
+      case 5:
+        timeouts = reader.varint(field);
+      case 6:
+        lastRtt = reader.varint(field);
+      case 7:
+        lastRttKnown = reader.varint(field) != 0;
+      case 8:
+        lastReasonCode = reader.string(field);
+      default:
+        reader.skip(field);
+    }
+  }
+  return DirectDnsQualityInfo(
+    mode: mode,
+    phaseCode: phaseCode,
+    successCount: successes,
+    failureCount: failures,
+    timeoutCount: timeouts,
+    lastRttMilliseconds: lastRttKnown ? lastRtt : null,
+    lastReasonCode: lastReasonCode,
+  );
+}
+
+MetricAvailability _decodeMetricAvailability(int value) => switch (value) {
+  1 => MetricAvailability.available,
+  2 => MetricAvailability.unsupported,
+  3 => MetricAvailability.notReady,
+  4 => MetricAvailability.stale,
+  _ => MetricAvailability.unknown,
+};
+
+bool _availabilityHasValue(MetricAvailability availability) =>
+    availability == MetricAvailability.available ||
+    availability == MetricAvailability.stale;
+
+NetworkQualityLevel _decodeNetworkQualityLevel(int value) => switch (value) {
+  1 => NetworkQualityLevel.good,
+  2 => NetworkQualityLevel.fair,
+  3 => NetworkQualityLevel.poor,
+  4 => NetworkQualityLevel.limitedData,
+  5 => NetworkQualityLevel.disconnected,
+  _ => NetworkQualityLevel.unknown,
+};
+
+NetworkQueueKind _decodeNetworkQueueKind(int value) => switch (value) {
+  1 => NetworkQueueKind.tunToTransport,
+  2 => NetworkQueueKind.proxyToTransport,
+  3 => NetworkQueueKind.transportOutgoing,
+  4 => NetworkQueueKind.h3DatagramSend,
+  5 => NetworkQueueKind.h3WireSend,
+  6 => NetworkQueueKind.transportToTun,
+  7 => NetworkQueueKind.transportToProxy,
+  8 => NetworkQueueKind.directDns,
+  9 => NetworkQueueKind.finalDns,
+  _ => NetworkQueueKind.unknown,
+};
+
+ProxySettings _decodeProxySettings(
+  _ProtoReader reader,
+  ProxySettings defaults,
+) {
+  final socksListeners = <String>[];
+  final httpListeners = <String>[];
+  final dnsServers = <String>[];
+  var systemProxy = defaults.systemProxy;
+  var dnsMode = defaults.dnsMode;
+  var authUsername = defaults.authUsername;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        socksListeners.add(reader.string(field));
+      case 2:
+        httpListeners.add(reader.string(field));
+      case 3:
+        systemProxy = reader.varint(field) != 0;
+      case 5:
+        dnsMode = _decodeIndexedEnum(
+          ProxyDnsMode.values,
+          reader.varint(field),
+          'proxy DNS mode',
+        );
+      case 6:
+        dnsServers.add(reader.string(field));
+      case 7:
+        authUsername = reader.string(field);
+      default:
+        reader.skip(field);
+    }
+  }
+  final socks = _decodeDualStackListeners(
+    socksListeners,
+    defaults.socksIpv4,
+    defaults.socksIpv6,
+    defaults.socksPort,
+  );
+  final http = _decodeDualStackListeners(
+    httpListeners,
+    defaults.httpIpv4,
+    defaults.httpIpv6,
+    defaults.httpPort,
+  );
+  return ProxySettings(
+    socksIpv4: socks.ipv4,
+    socksIpv6: socks.ipv6,
+    socksPort: socks.port,
+    httpIpv4: http.ipv4,
+    httpIpv6: http.ipv6,
+    httpPort: http.port,
+    socksListeners: List<String>.unmodifiable(socksListeners),
+    httpListeners: List<String>.unmodifiable(httpListeners),
+    dnsMode: dnsMode,
+    dnsIpv4:
+        dnsServers.where((value) => value.contains('.')).firstOrNull ??
+        defaults.dnsIpv4,
+    dnsIpv6:
+        dnsServers.where((value) => value.contains(':')).firstOrNull ??
+        defaults.dnsIpv6,
+    systemProxy: systemProxy,
+    authUsername: authUsername,
+  );
+}
+
+({String ipv4, String ipv6, int port}) _decodeDualStackListeners(
+  List<String> listeners,
+  String defaultIpv4,
+  String defaultIpv6,
+  int defaultPort,
+) {
+  var ipv4 = defaultIpv4;
+  var ipv6 = defaultIpv6;
+  var port = defaultPort;
+  for (final listener in listeners) {
+    final decoded = _splitSocketAddress(listener);
+    port = decoded.port;
+    if (decoded.host.contains(':')) {
+      ipv6 = decoded.host;
+    } else {
+      ipv4 = decoded.host;
+    }
+  }
+  return (ipv4: ipv4, ipv6: ipv6, port: port);
+}
+
+({String host, int port}) _splitSocketAddress(String value) {
+  if (value.startsWith('[')) {
+    final closing = value.indexOf(']');
+    if (closing <= 1 || closing + 2 >= value.length) {
+      throw const EngineException(
+        'ENGINE_IPC_INVALID_RESPONSE',
+        'The local Engine returned an invalid IPv6 listener.',
+      );
+    }
+    return (
+      host: value.substring(1, closing),
+      port: _parseListenerPort(value.substring(closing + 2)),
+    );
+  }
+  final separator = value.lastIndexOf(':');
+  if (separator <= 0) {
+    throw const EngineException(
+      'ENGINE_IPC_INVALID_RESPONSE',
+      'The local Engine returned an invalid listener.',
+    );
+  }
+  return (
+    host: value.substring(0, separator),
+    port: _parseListenerPort(value.substring(separator + 1)),
+  );
+}
+
+int _parseListenerPort(String value) {
+  final port = int.tryParse(value);
+  if (port == null) {
+    throw const EngineException(
+      'ENGINE_IPC_INVALID_RESPONSE',
+      'The local Engine returned an invalid listener port.',
+    );
+  }
+  return port;
+}
+
+EngineException _invalidIpcResponse(FormatException error) {
+  return EngineException(
+    'ENGINE_IPC_INVALID_RESPONSE',
+    'The local Engine response could not be decoded: ${error.message}',
+  );
+}
+
+T _decodeIndexedEnum<T>(List<T> values, int wireValue, String label) {
+  final index = wireValue - 1;
+  if (index < 0 || index >= values.length) {
+    throw EngineException(
+      'ENGINE_IPC_INVALID_RESPONSE',
+      'The local Engine returned an unknown $label.',
+    );
+  }
+  return values[index];
+}
+
+UpdateCheckResult _decodeUpdate(_ProtoReader reader) {
+  var available = false;
+  String? version;
+  String? releaseUrl;
+  UpdatePackage? package;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        available = reader.varint(field) != 0;
+      case 2:
+        version = _emptyToNull(reader.string(field));
+      case 3:
+        releaseUrl = _emptyToNull(reader.string(field));
+      case 4:
+        package = _decodeUpdatePackage(reader.message(field));
+      default:
+        reader.skip(field);
+    }
+  }
+  return UpdateCheckResult(
+    available: available,
+    version: version,
+    releaseUrl: releaseUrl,
+    package: package,
+  );
+}
+
+UpdatePackage _decodeUpdatePackage(_ProtoReader reader) {
+  var name = '';
+  var downloadUrl = '';
+  var size = 0;
+  var sha256 = '';
+  var platform = '';
+  var variant = '';
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        name = reader.string(field);
+      case 2:
+        downloadUrl = reader.string(field);
+      case 3:
+        size = reader.varint(field);
+      case 4:
+        sha256 = reader.string(field);
+      case 5:
+        platform = reader.string(field);
+      case 6:
+        variant = reader.string(field);
+      default:
+        reader.skip(field);
+    }
+  }
+  return UpdatePackage(
+    name: name,
+    downloadUrl: downloadUrl,
+    size: size,
+    sha256: sha256,
+    platform: platform,
+    variant: variant,
+  );
+}
+
+_StructuredEngineError _decodeError(_ProtoReader reader) {
+  var code = 'ENGINE_ERROR';
+  var message = 'The local Engine rejected this operation.';
+  var retryable = false;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        code = reader.string(field);
+      case 2:
+        message = reader.string(field);
+      case 3:
+        retryable = reader.varint(field) != 0;
+      default:
+        reader.skip(field);
+    }
+  }
+  return _StructuredEngineError(code, message, retryable);
+}
+
+EngineSnapshot _decodeSnapshot(_ProtoReader reader) {
+  var vpnGate = const VpnGateStatus();
+  var chainExit = const ChainExitStatus();
+  Map<String, Object?>? chainMetadata;
+  CongestionControlAlgorithm? sessionCongestionControl;
+  DataPlaneMode? dataPlane;
+  L4Snapshot? l4;
+  var phase = ConnectionPhase.error;
+  String? transport;
+  String? family;
+  var connectedSeconds = 0;
+  var uploaded = 0;
+  var downloaded = 0;
+  var uploadRate = 0;
+  var downloadRate = 0;
+  ExitInfo exit = const ExitInfo();
+  String? warning;
+  String? errorCode;
+  bool? errorRetryable;
+  var reconnectCount = 0;
+  String? killSwitchState;
+  var platformLockdown = false;
+  final activeListeners = <String>[];
+  final frontends = <FrontendRuntimeStatus>[];
+  TransportFailureInfo? failure;
+  NetworkQualitySnapshot? networkQuality;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        phase = _decodePhase(reader.varint(field));
+      case 2:
+        transport = _emptyToNull(reader.string(field));
+      case 3:
+        family = _emptyToNull(reader.string(field));
+      case 6:
+        final statistics = reader.message(field);
+        while (!statistics.isDone) {
+          final statistic = statistics.field();
+          switch (statistic.number) {
+            case 1:
+              connectedSeconds = statistics.varint(statistic);
+            case 2:
+              uploaded = statistics.varint(statistic);
+            case 3:
+              downloaded = statistics.varint(statistic);
+            case 4:
+              uploadRate = statistics.varint(statistic);
+            case 5:
+              downloadRate = statistics.varint(statistic);
+            default:
+              statistics.skip(statistic);
+          }
+        }
+      case 7:
+        exit = _decodeExit(reader.message(field));
+      case 8:
+        final error = _decodeError(reader.message(field));
+        warning = error.message;
+        errorCode = error.code;
+        errorRetryable = error.retryable;
+      case 9:
+        killSwitchState = _decodeKillSwitchState(reader.varint(field));
+      case 10:
+        platformLockdown = reader.varint(field) == 3;
+      case 11:
+        reconnectCount = reader.varint(field);
+      case 12:
+        activeListeners.add(reader.string(field));
+      case 15:
+        frontends.add(_decodeFrontendStatus(reader.message(field)));
+      case 16:
+        failure = _decodeTransportFailure(reader.message(field));
+      case 17:
+        networkQuality = _decodeNetworkQuality(reader.message(field));
+      case 18:
+        final value = reader.varint(field);
+        sessionCongestionControl = value >= 1 && value <= 4
+            ? _decodeCongestionControl(value)
+            : null;
+      case 19:
+        dataPlane = switch (reader.varint(field)) {
+          1 => DataPlaneMode.connectIp,
+          2 => DataPlaneMode.l4Proxy,
+          _ => null,
+        };
+      case 20:
+        l4 = _decodeL4Snapshot(reader.message(field));
+      case 22:
+        chainMetadata = _decodeChainJson(reader.message(field));
+        chainExit = ChainExitStatus.fromMap(chainMetadata);
+      case 21:
+        vpnGate = VpnGateStatus.fromMap(
+          _decodeVpnGate(reader.message(field), 'status'),
+        );
+      default:
+        // Includes reserved field 14 (legacy captive-portal countdown).
+        reader.skip(field);
+    }
+  }
+  if (chainExit.currentProfile != null && chainMetadata != null) {
+    // Share the existing internal connection presentation without repurposing
+    // the legacy VPN Gate wire field. Protobuf field order is irrelevant.
+    vpnGate = VpnGateStatus.fromMap(chainMetadata);
+  }
+  return EngineSnapshot(
+    phase: phase,
+    sessionCongestionControl: sessionCongestionControl,
+    dataPlane: dataPlane,
+    l4: l4,
+    vpnGate: vpnGate,
+    chainExit: chainExit,
+    transport: transport,
+    addressFamily: family,
+    connectedAt: connectedSeconds == 0
+        ? null
+        : DateTime.now().subtract(Duration(seconds: connectedSeconds)),
+    downloadBytesPerSecond: downloadRate,
+    uploadBytesPerSecond: uploadRate,
+    downloadedBytes: downloaded,
+    uploadedBytes: uploaded,
+    exit: exit,
+    warning: warning,
+    reconnectCount: reconnectCount,
+    killSwitchState: killSwitchState,
+    platformLockdown: platformLockdown,
+    activeListeners: List<String>.unmodifiable(activeListeners),
+    frontends: List<FrontendRuntimeStatus>.unmodifiable(frontends),
+    errorCode: failure?.code ?? errorCode,
+    errorRetryable: failure?.retryable ?? errorRetryable,
+    failure: failure,
+    networkQuality: networkQuality,
+  );
+}
+
+L4Snapshot _decodeL4Snapshot(_ProtoReader reader) {
+  const fields = <int, String>{
+    1: 'connect_verified',
+    2: 'sessions',
+    3: 'draining_sessions',
+    4: 'active_flows',
+    5: 'pending_flows',
+    6: 'connect_successes',
+    7: 'connect_failures',
+    8: 'connect_timeouts',
+    9: 'buffer_bytes',
+    10: 'budget_rejections',
+    11: 'send_backpressure',
+    12: 'receive_backpressure',
+    13: 'udp_rejected',
+    14: 'dns_successes',
+    15: 'dns_failures',
+    16: 'dns_timeouts',
+    17: 'migration_preserved_flows',
+    18: 'reconnect_terminated_flows',
+    19: 'tun_flows',
+    20: 'half_open_flows',
+    21: 'connect_latency_us',
+    22: 'unsupported_packets',
+  };
+  final values = <Object?, Object?>{};
+  while (!reader.isDone) {
+    final field = reader.field();
+    final key = fields[field.number];
+    if (field.number == 23) {
+      values['performance'] = _decodeL4Performance(reader.message(field));
+    } else if (key == null) {
+      reader.skip(field);
+    } else {
+      final value = reader.varint(field);
+      values[key] = field.number == 1 ? value != 0 : value;
+    }
+  }
+  return L4Snapshot.fromMap(values);
+}
+
+Map<Object?, Object?> _decodeL4Performance(_ProtoReader reader) {
+  final values = <Object?, Object?>{
+    for (final k in l4PerformanceScalarFields.take(22)) k: 0,
+    'actor_no_progress_wakeups': 0,
+  };
+  while (!reader.isDone) {
+    final field = reader.field();
+    if (field.number <= 32) {
+      final key = l4PerformanceScalarFields[field.number - 1];
+      values[key] = field.number == 27 || field.number == 29
+          ? reader.string(field)
+          : reader.varint(field);
+    } else if (field.number == 33 || field.number == 34) {
+      values[field.number == 33 ? 'command_wait' : 'tun_write_wait'] =
+          _decodeL4Wait(reader.message(field));
+    } else if (field.number >= 35 && field.number <= 38) {
+      values[l4PerformanceQueueFields[field.number - 35]] = _decodeL4Queue(
+        reader.message(field),
+      );
+    } else if (field.number == 39) {
+      values['actor_no_progress_wakeups'] = reader.varint(field);
+    } else if (field.number == 40) {
+      values['receive'] = _decodeL4Receive(reader.message(field));
+    } else {
+      reader.skip(field);
+    }
+  }
+  return values;
+}
+
+Map<Object?, Object?> _decodeL4Wait(_ProtoReader reader) {
+  final values = <Object?, Object?>{'samples': 0, 'sum_us': 0, 'max_us': 0};
+  final buckets = <int>[];
+  while (!reader.isDone) {
+    final field = reader.field();
+    if (field.number <= 3) {
+      values[['samples', 'sum_us', 'max_us'][field.number - 1]] = reader.varint(
+        field,
+      );
+    } else if (field.number == 4) {
+      if (field.wireType == 0) {
+        buckets.add(reader.varint(field));
+      } else {
+        final packed = reader.message(field);
+        while (!packed.isDone) {
+          buckets.add(packed._varint());
+          if (buckets.length > 32) {
+            throw const FormatException('L4 histogram exceeds bound');
+          }
+        }
+      }
+      if (buckets.length > 32) {
+        throw const FormatException('L4 histogram exceeds bound');
+      }
+    } else {
+      reader.skip(field);
+    }
+  }
+  values['buckets'] = buckets;
+  return values;
+}
+
+Map<Object?, Object?> _decodeL4Receive(_ProtoReader reader) {
+  final history = <Map<Object?, Object?>>[];
+  final values = <Object?, Object?>{
+    'history': history,
+    for (final key in [5, 6, 7, 8, 9, 13]) l4ReceiveCounterFields[key]: 0,
+  };
+  while (!reader.isDone) {
+    final field = reader.field();
+    final counter = l4ReceiveCounterFields[field.number];
+    final state = l4ReceiveStringFields[field.number];
+    if (counter != null) {
+      values[counter] = reader.varint(field);
+    } else if (state != null) {
+      values[state] = reader.string(field);
+    } else if (field.number == 12) {
+      if (history.length == 120) {
+        throw const FormatException('L4 receive history exceeds bound');
+      }
+      final item = <Object?, Object?>{
+        'path_reset': false,
+        for (final key in [1, 2, 4, 5, 6]) l4ReceiveIntervalFields[key]: 0,
+      };
+      final nested = reader.message(field);
+      while (!nested.isDone) {
+        final part = nested.field();
+        final key = l4ReceiveIntervalFields[part.number];
+        if (part.number == 3) {
+          item['path_reset'] = nested.varint(part) != 0;
+        } else if (key != null) {
+          item[key] = nested.varint(part);
+        } else {
+          nested.skip(part);
+        }
+      }
+      history.add(item);
+    } else {
+      reader.skip(field);
+    }
+  }
+  return values;
+}
+
+Map<Object?, Object?> _decodeL4Queue(_ProtoReader reader) {
+  const keys = ['packets', 'bytes', 'high_water_packets', 'high_water_bytes'];
+  final values = <Object?, Object?>{for (final k in keys) k: 0};
+  while (!reader.isDone) {
+    final field = reader.field();
+    if (field.number <= 4) {
+      values[keys[field.number - 1]] = reader.varint(field);
+    } else if (field.number == 5) {
+      values['wait'] = _decodeL4Wait(reader.message(field));
+    } else {
+      reader.skip(field);
+    }
+  }
+  return values;
+}
+
+String? _decodeKillSwitchState(int value) {
+  return switch (value) {
+    1 => 'notApplicable',
+    2 => 'inactive',
+    3 => 'active',
+    5 => 'error',
+    _ => null,
+  };
+}
+
+int _congestionControlWireValue(CongestionControlAlgorithm algorithm) =>
+    switch (algorithm) {
+      CongestionControlAlgorithm.cubic => 1,
+      CongestionControlAlgorithm.reno => 2,
+      CongestionControlAlgorithm.bbr => 3,
+      CongestionControlAlgorithm.bbr3 => 4,
+    };
+
+CongestionControlAlgorithm _decodeCongestionControl(int value) =>
+    switch (value) {
+      1 => CongestionControlAlgorithm.cubic,
+      2 => CongestionControlAlgorithm.reno,
+      3 => CongestionControlAlgorithm.bbr,
+      4 => CongestionControlAlgorithm.bbr3,
+      _ => throw const FormatException('Unknown congestion control algorithm'),
+    };
+
+FrontendRuntimeStatus _decodeFrontendStatus(_ProtoReader reader) {
+  var kind = FrontendKind.tunnel;
+  var phase = FrontendPhase.error;
+  final listeners = <String>[];
+  String? errorCode;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        final value = reader.varint(field);
+        if (value >= 1 && value <= FrontendKind.values.length) {
+          kind = FrontendKind.values[value - 1];
+        }
+      case 2:
+        final value = reader.varint(field);
+        if (value >= 1 && value <= FrontendPhase.values.length) {
+          phase = FrontendPhase.values[value - 1];
+        }
+      case 3:
+        listeners.add(reader.string(field));
+      case 4:
+        errorCode = _decodeError(reader.message(field)).code;
+      default:
+        reader.skip(field);
+    }
+  }
+  return FrontendRuntimeStatus(
+    kind: kind,
+    phase: phase,
+    listeners: List<String>.unmodifiable(listeners),
+    errorCode: errorCode,
+  );
+}
+
+ExitInfo _decodeExit(_ProtoReader reader) {
+  String? ipv4;
+  String? ipv6;
+  _Geo? ipv4Location;
+  _Geo? ipv6Location;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        ipv4 = _emptyToNull(reader.string(field));
+      case 2:
+        ipv6 = _emptyToNull(reader.string(field));
+      case 3:
+        ipv4Location = _decodeGeo(reader.message(field));
+      case 4:
+        ipv6Location = _decodeGeo(reader.message(field));
+      default:
+        reader.skip(field);
+    }
+  }
+  final location = ipv4Location ?? ipv6Location;
+  return ExitInfo(
+    city: location?.city,
+    country: location?.country,
+    countryCode: location?.countryCode,
+    flagSvg: location?.flagSvg,
+    ipv4: ipv4,
+    ipv6: ipv6,
+  );
+}
+
+_Geo _decodeGeo(_ProtoReader reader) {
+  String? countryCode;
+  String? country;
+  String? city;
+  String? flagSvg;
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 2:
+        countryCode = _emptyToNull(reader.string(field));
+      case 3:
+        country = _emptyToNull(reader.string(field));
+      case 5:
+        city = _emptyToNull(reader.string(field));
+      case 7:
+        flagSvg = _emptyToNull(reader.string(field));
+      default:
+        reader.skip(field);
+    }
+  }
+  return _Geo(countryCode, country, city, flagSvg);
+}
+
+ConnectionPhase _decodePhase(int value) {
+  return switch (value) {
+    1 => ConnectionPhase.disconnected,
+    2 => ConnectionPhase.preparing,
+    3 => ConnectionPhase.connectingH3,
+    4 => ConnectionPhase.connectingH2,
+    5 => ConnectionPhase.connected,
+    6 => ConnectionPhase.degraded,
+    7 => ConnectionPhase.reconnecting,
+    8 => ConnectionPhase.disconnecting,
+    // 9 was captivePortalPaused (removed).
+    10 => ConnectionPhase.error,
+    _ => ConnectionPhase.error,
+  };
+}
+
+String? _emptyToNull(String value) => value.isEmpty ? null : value;
+
+class _StructuredEngineError {
+  const _StructuredEngineError(this.code, this.message, this.retryable);
+
+  final String code;
+  final String message;
+  final bool retryable;
+}
+
+class _Geo {
+  const _Geo(this.countryCode, this.country, this.city, this.flagSvg);
+
+  final String? countryCode;
+  final String? country;
+  final String? city;
+  final String? flagSvg;
+}
+
+class _ProtoField {
+  const _ProtoField(this.number, this.wireType);
+
+  final int number;
+  final int wireType;
+}
+
+class _ProtoReader {
+  _ProtoReader(this._bytes);
+
+  final Uint8List _bytes;
+  int _offset = 0;
+
+  bool get isDone => _offset == _bytes.length;
+
+  _ProtoField field() {
+    final tag = _varint();
+    final number = tag >> 3;
+    final wireType = tag & 7;
+    if (number == 0 || !<int>{0, 1, 2, 5}.contains(wireType)) {
+      throw const FormatException('Invalid protobuf field');
+    }
+    return _ProtoField(number, wireType);
+  }
+
+  int varint(_ProtoField field) {
+    _expect(field, 0);
+    return _varint();
+  }
+
+  String string(_ProtoField field) {
+    return utf8.decode(_lengthDelimited(field), allowMalformed: false);
+  }
+
+  _ProtoReader message(_ProtoField field) {
+    return _ProtoReader(_lengthDelimited(field));
+  }
+
+  void skip(_ProtoField field) {
+    switch (field.wireType) {
+      case 0:
+        _varint();
+      case 1:
+        _advance(8);
+      case 2:
+        _advance(_varint());
+      case 5:
+        _advance(4);
+      default:
+        throw const FormatException('Unsupported protobuf wire type');
+    }
+  }
+
+  Uint8List _lengthDelimited(_ProtoField field) {
+    _expect(field, 2);
+    final length = _varint();
+    final start = _offset;
+    _advance(length);
+    return Uint8List.sublistView(_bytes, start, _offset);
+  }
+
+  int _varint() {
+    var value = 0;
+    for (var shift = 0; shift < 70; shift += 7) {
+      if (_offset >= _bytes.length) {
+        throw const FormatException('Truncated protobuf varint');
+      }
+      final byte = _bytes[_offset++];
+      if (shift == 63 && byte > 1) {
+        throw const FormatException('Oversized protobuf varint');
+      }
+      value |= (byte & 0x7f) << shift;
+      if (byte & 0x80 == 0) {
+        return value;
+      }
+    }
+    throw const FormatException('Oversized protobuf varint');
+  }
+
+  void _advance(int count) {
+    if (count < 0 || count > _bytes.length - _offset) {
+      throw const FormatException('Truncated protobuf field');
+    }
+    _offset += count;
+  }
+
+  void _expect(_ProtoField field, int wireType) {
+    if (field.wireType != wireType) {
+      throw const FormatException('Unexpected protobuf wire type');
+    }
+  }
+}
+
+Map<String, Object?> _decodeChainJson(_ProtoReader reader) {
+  Map<String, Object?> result = const {};
+  while (!reader.isDone) {
+    final field = reader.field();
+    if (field.number == 1) {
+      result = Map<String, Object?>.from(
+        jsonDecode(reader.string(field)) as Map,
+      );
+    } else {
+      reader.skip(field);
+    }
+  }
+  return result;
+}
+
+void _readBoundedBuckets(
+  _ProtoReader reader,
+  _ProtoField field,
+  List<int> output,
+  int limit,
+) {
+  if (field.wireType == 0) {
+    output.add(reader.varint(field));
+  } else {
+    final packed = reader.message(field);
+    while (!packed.isDone) {
+      output.add(packed._varint());
+      if (output.length > limit) {
+        throw const FormatException('Performance histogram exceeds bound');
+      }
+    }
+  }
+  if (output.length > limit) {
+    throw const FormatException('Performance histogram exceeds bound');
+  }
+}
+
+PerformanceCounters _decodePerformanceCounters(
+  _ProtoReader reader,
+  List<String> fields, {
+  int bucketLimit = 0,
+}) {
+  final values = <String, int>{for (final field in fields) field: 0};
+  final buckets = <int>[];
+  while (!reader.isDone) {
+    final field = reader.field();
+    if (field.number >= 1 && field.number <= fields.length) {
+      values[fields[field.number - 1]] = reader.varint(field);
+    } else if (bucketLimit > 0 && field.number == fields.length + 1) {
+      _readBoundedBuckets(reader, field, buckets, bucketLimit);
+    } else {
+      reader.skip(field);
+    }
+  }
+  return PerformanceCounters(
+    Map.unmodifiable(values),
+    buckets: List.unmodifiable(buckets),
+  );
+}
+
+TransportPerformanceSnapshot _decodeTransportPerformance(_ProtoReader reader) {
+  PerformanceCounters? h2, h3;
+  var copies = 0, timeouts = 0;
+  final h2Buckets = <int>[], h3Buckets = <int>[];
+  while (!reader.isDone) {
+    final field = reader.field();
+    switch (field.number) {
+      case 1:
+        h2 = _decodePerformanceCounters(
+          reader.message(field),
+          h2PerformanceFields,
+        );
+      case 2:
+        h3 = _decodePerformanceCounters(
+          reader.message(field),
+          h3PerformanceFields,
+        );
+      case 3:
+        copies = reader.varint(field);
+      case 4:
+        timeouts = reader.varint(field);
+      case 5:
+        _readBoundedBuckets(reader, field, h2Buckets, 7);
+      case 6:
+        _readBoundedBuckets(reader, field, h3Buckets, 7);
+      default:
+        reader.skip(field);
+    }
+  }
+  return TransportPerformanceSnapshot(
+    h2: h2,
+    h3: h3,
+    incomingCopyBytes: copies,
+    sendTimeouts: timeouts,
+    h2BatchSizes: List.unmodifiable(h2Buckets),
+    h3BatchSizes: List.unmodifiable(h3Buckets),
+  );
+}

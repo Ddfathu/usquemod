@@ -1,0 +1,383 @@
+use usque_core::{
+    KillSwitchState, LockdownState, Profile, classify_reconfigure, reconfigure::ReconfigureClass,
+};
+use usque_ipc::v1;
+
+use crate::{ControlService, ControlServiceError, profile_to_proto};
+
+impl ControlService {
+    pub(crate) async fn reconfigure_active_profile(
+        &self,
+        mut profile: Profile,
+    ) -> Result<v1::ReconfigureResult, ControlServiceError> {
+        profile
+            .validate()
+            .map_err(ControlServiceError::profile_configuration)?;
+        let _mutation = self.mutation_lock.lock().await;
+        self.attach_proxy_auth(&mut profile).await?;
+        let active_profile_id = self
+            .data_plane
+            .lock()
+            .await
+            .as_ref()
+            .map(|runtime| runtime.profile_id);
+        if active_profile_id != Some(profile.id) {
+            return Err(ControlServiceError::InvalidRequest(
+                "only the connected Active Profile can be reconfigured".to_owned(),
+            ));
+        }
+        let previous = self
+            .data_plane
+            .lock()
+            .await
+            .as_ref()
+            .map(|active| active.profile.clone())
+            .ok_or(ControlServiceError::ProfileNotFound(profile.id))?;
+
+        let class = classify_reconfigure(&previous, &profile);
+        if previous
+            .custom_chain()
+            .is_some_and(|s| s.profile_id.is_some())
+            && profile.chain_exit.is_none()
+        {
+            return Err(ControlServiceError::InvalidRequest(
+                "chain_exit capability is required".into(),
+            ));
+        }
+        self.validate_chain_selection(&profile)?;
+        if profile.custom_chain().is_none() && previous.vpn_gate != profile.vpn_gate {
+            self.pin_gate_settings(&profile.vpn_gate).await?;
+        }
+        match class {
+            ReconfigureClass::PersistOnly => {
+                let applied = self.upsert_profile_locked(profile).await?;
+                let snapshot = self.status_snapshot().await;
+                return Ok(v1::ReconfigureResult {
+                    profile: Some(profile_to_proto(&applied)),
+                    snapshot: Some(self.snapshot_with_quality_to_proto(&snapshot)),
+                });
+            }
+            ReconfigureClass::Reject => {
+                return Err(ControlServiceError::InvalidRequest(
+                    "the connected Active Profile cannot be replaced by a different profile"
+                        .to_owned(),
+                ));
+            }
+            ReconfigureClass::HotFrontends
+            | ReconfigureClass::HotTrafficPolicy
+            | ReconfigureClass::HotSystemProxy
+            | ReconfigureClass::HotVpnGate
+            | ReconfigureClass::HotTunnelAttach => {
+                return self.commit_hot(profile, previous, class).await;
+            }
+            ReconfigureClass::ColdReconnect => {}
+        }
+
+        #[cfg(windows)]
+        if profile.frontends.tunnel && self.protected_chain_present().await {
+            let applied = self.upsert_profile_locked(profile).await?;
+            let cancellation = self.gate_startup_cancel.lock().await.clone();
+            let snapshot = Box::pin(self.reconnect_protected_chain(&applied, &cancellation))
+                .await?
+                .ok_or_else(|| {
+                    ControlServiceError::InvalidRequest(
+                        "protected session changed during reconfiguration".into(),
+                    )
+                })?;
+            return Ok(v1::ReconfigureResult {
+                profile: Some(profile_to_proto(&applied)),
+                snapshot: Some(self.snapshot_with_quality_to_proto(&snapshot)),
+            });
+        }
+        self.disconnect_locked().await?;
+        let profile_id = profile.id;
+        let applied = match self.upsert_profile_locked(profile).await {
+            Ok(applied) => applied,
+            Err(error) => {
+                let _ = self.connect_locked(previous.id).await;
+                return Err(error);
+            }
+        };
+        *self.session_profile.lock().await = Some(applied.clone());
+        let snapshot = match self.connect_locked(profile_id).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                if previous.vpn_gate != applied.vpn_gate {
+                    return Err(error);
+                }
+                self.upsert_profile_locked(previous.clone()).await?;
+                *self.session_profile.lock().await = Some(previous.clone());
+                if let Err(rollback_error) = self.connect_locked(previous.id).await {
+                    tracing::error!(%rollback_error, "failed to restore the previous active Profile");
+                }
+                return Err(error);
+            }
+        };
+        Ok(v1::ReconfigureResult {
+            profile: Some(profile_to_proto(&applied)),
+            snapshot: Some(self.snapshot_with_quality_to_proto(&snapshot)),
+        })
+    }
+
+    async fn commit_hot(
+        &self,
+        profile: Profile,
+        previous: Profile,
+        class: ReconfigureClass,
+    ) -> Result<v1::ReconfigureResult, ControlServiceError> {
+        let session_algorithm = previous.congestion_control;
+        let applied = self.upsert_profile_locked(profile).await?;
+        let applied_result = match class {
+            ReconfigureClass::HotTrafficPolicy => Ok(()),
+            ReconfigureClass::HotFrontends => self.hot_reconfigure_frontends(&applied).await,
+            ReconfigureClass::HotSystemProxy => self.hot_apply_system_proxy(&applied).await,
+            ReconfigureClass::HotTunnelAttach => self.hot_tunnel_attach(&applied).await,
+            ReconfigureClass::HotVpnGate => self.hot_replace_gate(&applied).await,
+            ReconfigureClass::Reject
+            | ReconfigureClass::ColdReconnect
+            | ReconfigureClass::PersistOnly => {
+                unreachable!("commit_hot is only for in-place classes")
+            }
+        };
+        if let Err(error) = applied_result {
+            if class == ReconfigureClass::HotVpnGate {
+                return Err(error);
+            }
+            #[cfg(windows)]
+            if let ControlServiceError::PlatformRecoveryPending {
+                operation_id,
+                journal_generation,
+            } = &error
+            {
+                self.begin_windows_connection_intent(applied.id).await;
+                let snapshot = match self
+                    .enter_windows_automatic_recovery(
+                        applied.id,
+                        operation_id.clone(),
+                        *journal_generation,
+                    )
+                    .await
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.clear_windows_connection_intent().await;
+                        let _ = self.upsert_profile_locked(previous).await;
+                        return Err(error);
+                    }
+                };
+                return Ok(v1::ReconfigureResult {
+                    profile: Some(profile_to_proto(&applied)),
+                    snapshot: Some(self.snapshot_with_quality_to_proto(&snapshot)),
+                });
+            }
+            let detach_committed = class == ReconfigureClass::HotTunnelAttach
+                && !applied.frontends.tunnel
+                && self
+                    .data_plane
+                    .lock()
+                    .await
+                    .as_ref()
+                    .is_some_and(|active| !active.runtime.is_vpn());
+            if detach_committed {
+                self.apply_hot_profile_state(&applied).await;
+            } else {
+                let _ = self.upsert_profile_locked(previous).await;
+            }
+            return Err(error);
+        }
+        self.hot_update_traffic_policy(&applied).await?;
+        self.apply_hot_profile_state(&applied).await;
+        let mut confirmed = applied.clone();
+        confirmed.congestion_control = session_algorithm;
+        let generation = {
+            let mut active = self.data_plane.lock().await;
+            active.as_mut().map(|active| {
+                active.profile = confirmed.clone();
+                active.session_generation
+            })
+        };
+        *self.session_profile.lock().await = Some(confirmed.clone());
+        self.publish_settings_runtime(Some(confirmed), generation)
+            .await;
+        let snapshot = self.status_snapshot().await;
+        Ok(v1::ReconfigureResult {
+            profile: Some(profile_to_proto(&applied)),
+            snapshot: Some(self.snapshot_with_quality_to_proto(&snapshot)),
+        })
+    }
+
+    pub(crate) async fn hot_update_traffic_policy(
+        &self,
+        profile: &Profile,
+    ) -> Result<(), ControlServiceError> {
+        let mut data_plane = self.data_plane.lock().await;
+        let active = data_plane
+            .as_mut()
+            .filter(|active| active.profile_id == profile.id)
+            .ok_or_else(|| {
+                ControlServiceError::InvalidRequest("a connected session is required".into())
+            })?;
+        active.runtime.update_traffic_policy(profile.disable_quic)
+    }
+
+    pub(crate) async fn hot_reconfigure_frontends(
+        &self,
+        profile: &Profile,
+    ) -> Result<(), ControlServiceError> {
+        let (previous, error, rollback_failed) = {
+            let mut data_plane = self.data_plane.lock().await;
+            let Some(active) = data_plane.as_mut() else {
+                return Err(ControlServiceError::InvalidRequest(
+                    "a connected session is required".to_owned(),
+                ));
+            };
+            let previous = active.profile.clone();
+            match active.runtime.reconfigure_frontends(profile).await {
+                Ok(()) => {
+                    active.frontends = profile.frontends;
+                    return Ok(());
+                }
+                Err(error) => {
+                    // The transport may have replaced its listeners before
+                    // the system-proxy RPC failed. A configuration-file
+                    // rollback alone cannot restore the applied session.
+                    let rollback = active.runtime.reconfigure_frontends(&previous).await;
+                    if rollback.is_ok() {
+                        active.frontends = previous.frontends;
+                    }
+                    (previous, error, rollback.is_err())
+                }
+            }
+        };
+        self.finish_failed_hot_update(&previous, &error, rollback_failed)
+            .await;
+        Err(error)
+    }
+
+    pub(crate) async fn hot_apply_system_proxy(
+        &self,
+        profile: &Profile,
+    ) -> Result<(), ControlServiceError> {
+        let (previous, error, rollback_failed) = {
+            let mut data_plane = self.data_plane.lock().await;
+            let Some(active) = data_plane.as_mut() else {
+                return Err(ControlServiceError::InvalidRequest(
+                    "a connected session is required".to_owned(),
+                ));
+            };
+            let previous = active.profile.clone();
+            match active.runtime.apply_system_proxy(profile).await {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let rollback = active.runtime.apply_system_proxy(&previous).await;
+                    (previous, error, rollback.is_err())
+                }
+            }
+        };
+        self.finish_failed_hot_update(&previous, &error, rollback_failed)
+            .await;
+        Err(error)
+    }
+
+    async fn finish_failed_hot_update(
+        &self,
+        previous: &Profile,
+        error: &ControlServiceError,
+        rollback_failed: bool,
+    ) {
+        if rollback_failed {
+            // Do not advertise the previous confirmed profile when its
+            // listeners/proxy could not be restored. Keep cleanup owned by
+            // the normal Disconnect path and preserve the first error.
+            tracing::warn!("hot network update rollback failed; stopping the connection");
+            let _ = self.disconnect_locked_deferred().await;
+            self.mark_connection_error(error).await;
+            self.start_queued_shutdown().await;
+        } else {
+            self.apply_hot_profile_state(previous).await;
+        }
+    }
+
+    pub(crate) async fn hot_tunnel_attach(
+        &self,
+        profile: &Profile,
+    ) -> Result<(), ControlServiceError> {
+        let mut data_plane = self.data_plane.lock().await;
+        let Some(mut active) = data_plane.take() else {
+            return Err(ControlServiceError::InvalidRequest(
+                "a connected session is required".to_owned(),
+            ));
+        };
+        match active
+            .runtime
+            .with_tunnel(
+                profile,
+                #[cfg(windows)]
+                &self.windows_device,
+            )
+            .await
+        {
+            Ok(runtime) => {
+                active.runtime = runtime;
+                active.frontends = profile.frontends;
+                *data_plane = Some(active);
+                Ok(())
+            }
+            Err((runtime, error)) => {
+                let detached = !profile.frontends.tunnel && !runtime.is_vpn();
+                active.runtime = runtime;
+                if detached {
+                    active.frontends.tunnel = false;
+                }
+                let previous = active.profile.clone();
+                let rollback_failed = if profile.frontends.tunnel && !active.runtime.is_vpn() {
+                    // Attaching VPN first releases a standalone system-proxy
+                    // lease. Restore it when attach returns the live proxy
+                    // data plane after a failure.
+                    active.runtime.apply_system_proxy(&previous).await.is_err()
+                } else {
+                    false
+                };
+                *data_plane = Some(active);
+                drop(data_plane);
+                if !detached {
+                    self.finish_failed_hot_update(&previous, &error, rollback_failed)
+                        .await;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) async fn apply_hot_profile_state(&self, profile: &Profile) {
+        let data_plane = self.data_plane.lock().await;
+        let mut state = self.state.lock().await;
+        let Some(active) = data_plane.as_ref() else {
+            return;
+        };
+        let warnings = state.snapshot().warnings.clone();
+        state.update_runtime_metadata(
+            active.runtime.health().reconnect_count(),
+            active
+                .runtime
+                .listeners()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            warnings,
+        );
+        state.update_frontends(active.runtime.frontend_statuses(active.frontends));
+        state.update_safety_state(
+            if profile.frontends.tunnel && active.runtime.is_vpn() {
+                if profile.kill_switch {
+                    KillSwitchState::Active
+                } else {
+                    KillSwitchState::Inactive
+                }
+            } else {
+                KillSwitchState::NotApplicable
+            },
+            LockdownState::NotSupported,
+        );
+    }
+}

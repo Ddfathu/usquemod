@@ -1,0 +1,2190 @@
+use std::collections::{BTreeMap, HashSet};
+use std::fmt;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+pub use ipnet::IpNet;
+use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
+use thiserror::Error;
+use uuid::Uuid;
+use zeroize::Zeroizing;
+
+use crate::identity::IdentityProvider;
+
+mod account;
+#[cfg(test)]
+mod bypass_tests;
+mod congestion;
+mod data_plane;
+mod initial_identity;
+mod network;
+
+pub use account::{Account, ManagedEndpointIps};
+pub use congestion::CongestionControlAlgorithm;
+pub use data_plane::{CONSUMER_L4_SNI, DataPlaneMode, ZERO_TRUST_L4_SNI, l4_server_name};
+pub use initial_identity::{InitialIdentityOperation, InitialIdentityPhase};
+pub use network::SharedNetworkSettings;
+
+pub const CURRENT_SCHEMA_VERSION: u32 = 21;
+/// Vault namespace for device-wide proxy-listener secrets. Never a profile id.
+pub const SHARED_NETWORK_SECRET_ID: Uuid =
+    Uuid::from_u128(0x9f1c_6b20_5a7e_4d3a_9c11_00c0_ffee_0001);
+pub const MAX_PROXY_AUTH_BYTES: usize = 255;
+pub const DEFAULT_ENDPOINT_V4: Ipv4Addr = Ipv4Addr::new(162, 159, 198, 2);
+pub const DEFAULT_ENDPOINT_V6: Ipv6Addr = Ipv6Addr::new(0x2606, 0x4700, 0x0103, 0, 0, 0, 0, 2);
+pub const DEFAULT_PORT: u16 = 443;
+pub const DEFAULT_SNI: &str = "speed.cloudflare.com";
+pub const DEFAULT_MTU: u16 = 1280;
+pub const DEFAULT_DNS_V4: Ipv4Addr = Ipv4Addr::new(1, 1, 1, 1);
+pub const DEFAULT_DNS_V6: Ipv6Addr = Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111);
+pub const DEFAULT_PROFILE_ID: Uuid = Uuid::from_u128(0x8c30_b771_9ebd_457a_b67b_bbc7_4a1d_dba6);
+pub const MAX_PROFILES: usize = 128;
+pub const MAX_DNS_SERVERS: usize = 8;
+pub const MAX_SPLIT_EXCLUSIONS: usize = 256;
+pub const MAX_BYPASS_DOMAINS: usize = 256;
+pub const MAX_PROXY_LISTENERS_PER_PROTOCOL: usize = 16;
+pub const MAX_GEO_DIRECT_COUNTRIES: usize = 32;
+pub const MAX_DIRECT_DNS_BOOTSTRAP_IPS: usize = 8;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingIdentityReplacement {
+    /// Windows stores the previous identity under a vault-only UUID. Android
+    /// keeps one encrypted rollback envelope under the live Profile instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backup_identity_id: Option<Uuid>,
+    /// `false` means the transaction marker exists but live credentials have
+    /// not been touched. Once armed, startup must restore the rollback record.
+    #[serde(default)]
+    pub armed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppConfig {
+    pub schema_version: u32,
+    pub active_profile_id: Option<Uuid>,
+    /// Device-wide connection settings. Zero Trust accounts may replace only
+    /// the endpoint IPv4/IPv6 pair with registration-owned addresses.
+    #[serde(default)]
+    pub network: SharedNetworkSettings,
+    pub profiles: Vec<Account>,
+    pub preferences: AppPreferences,
+    /// Non-secret provider boundary used to classify a profile even if its
+    /// secure IdentityMetadata record is missing or corrupted.
+    #[serde(default)]
+    pub identity_bindings: BTreeMap<Uuid, IdentityProvider>,
+    #[serde(default)]
+    pub pending_identity_deletions: Vec<Uuid>,
+    /// Vault identities that must be deleted locally without revoking their
+    /// remote registration. Replacement rollback uses this for duplicate
+    /// backup records that now refer to the still-live identity.
+    #[serde(default)]
+    pub pending_identity_local_deletions: Vec<Uuid>,
+    /// Profile identities durably staged before the non-secret profile is
+    /// committed. Startup recovery deletes these orphaned records.
+    #[serde(default)]
+    pub pending_identity_creations: Vec<Uuid>,
+    /// Identity replacements with a durable write-ahead state.
+    #[serde(default)]
+    pub pending_identity_replacements: BTreeMap<Uuid, PendingIdentityReplacement>,
+    /// First-run intent only; credentials and callback assertions stay in the vault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_identity_operation: Option<InitialIdentityOperation>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        let account = Account::default_account();
+        Self {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            active_profile_id: Some(account.id),
+            network: SharedNetworkSettings::default(),
+            profiles: vec![account],
+            preferences: AppPreferences::default(),
+            identity_bindings: BTreeMap::new(),
+            pending_identity_deletions: Vec::new(),
+            pending_identity_local_deletions: Vec::new(),
+            pending_identity_creations: Vec::new(),
+            pending_identity_replacements: BTreeMap::new(),
+            initial_identity_operation: None,
+        }
+    }
+}
+
+impl AppConfig {
+    pub fn account(&self, id: Uuid) -> Option<&Account> {
+        self.profiles.iter().find(|account| account.id == id)
+    }
+
+    pub fn account_mut(&mut self, id: Uuid) -> Option<&mut Account> {
+        self.profiles.iter_mut().find(|account| account.id == id)
+    }
+
+    pub fn runtime_profile(&self, id: Uuid) -> Option<Profile> {
+        Some(self.network.hydrate(self.account(id)?))
+    }
+
+    pub fn runtime_profiles(&self) -> Vec<Profile> {
+        self.profiles
+            .iter()
+            .map(|account| self.network.hydrate(account))
+            .collect()
+    }
+
+    pub fn active_profile(&self) -> Option<Profile> {
+        self.runtime_profile(self.active_profile_id?)
+    }
+
+    pub fn is_zero_trust_account(&self, id: Uuid) -> bool {
+        matches!(
+            self.identity_bindings.get(&id),
+            Some(IdentityProvider::ZeroTrust { .. })
+        )
+    }
+
+    pub fn zero_trust_endpoint_needs_reauthentication(&self, id: Uuid) -> bool {
+        self.is_zero_trust_account(id)
+            && self
+                .account(id)
+                .is_some_and(|account| account.managed_endpoint_ips.is_none())
+    }
+
+    pub fn rename_account(&mut self, id: Uuid, name: String) -> Result<Profile, ConfigError> {
+        let account = self
+            .account_mut(id)
+            .ok_or(ConfigError::MissingActiveProfile(id))?;
+        account.name = name;
+        self.runtime_profile(id)
+            .ok_or(ConfigError::MissingActiveProfile(id))
+    }
+
+    /// Apply a runtime profile snapshot. New accounts inherit existing network.
+    /// Existing Zero Trust accounts retain registration-owned IPv4/IPv6 while
+    /// updating the shared port, SNI, and remaining network settings.
+    pub fn upsert_runtime_profile(&mut self, incoming: Profile) -> Result<Profile, ConfigError> {
+        let mut incoming = incoming;
+        if self.account(incoming.id).is_some()
+            && incoming.chain_exit.is_none()
+            && self.network.chain_exit.as_ref().is_some_and(|s| {
+                s.source != crate::chain_exit::ChainSource::VpnGate && s.profile_id.is_some()
+            })
+        {
+            return Err(ConfigError::ChainExitCapabilityRequired);
+        }
+        incoming.canonicalize_geo_direct()?;
+        incoming.canonicalize_direct_dns();
+        incoming.validate()?;
+        let id = incoming.id;
+        let name = incoming.name.clone();
+        let bound_zero_trust = matches!(
+            self.identity_bindings.get(&id),
+            Some(IdentityProvider::ZeroTrust { .. })
+        );
+        match self.profiles.iter().position(|account| account.id == id) {
+            None => {
+                self.profiles.push(Account {
+                    id,
+                    name,
+                    managed_endpoint_ips: None,
+                });
+            }
+            Some(index) => {
+                let keep_username = incoming.proxy.listener_auth_username().is_none();
+                let keep_shared_endpoint_ips =
+                    bound_zero_trust || self.profiles[index].managed_endpoint_ips.is_some();
+                self.profiles[index].name = name;
+                let mut network = SharedNetworkSettings::from_profile(&incoming);
+                if keep_shared_endpoint_ips {
+                    network.endpoint.ipv4 = self.network.endpoint.ipv4;
+                    network.endpoint.ipv6 = self.network.endpoint.ipv6;
+                    network.endpoint.selection = self.network.endpoint.selection;
+                }
+                if keep_username {
+                    network.proxy.auth_username = self.network.proxy.auth_username.clone();
+                }
+                self.network = network;
+            }
+        }
+        self.runtime_profile(id)
+            .ok_or(ConfigError::MissingActiveProfile(id))
+    }
+
+    pub fn insert_account(
+        &mut self,
+        id: Uuid,
+        name: String,
+        managed_endpoint_ips: Option<ManagedEndpointIps>,
+    ) -> Result<Profile, ConfigError> {
+        if self.account(id).is_some() {
+            return Err(ConfigError::DuplicateProfileId(id));
+        }
+        self.profiles.push(Account {
+            id,
+            name,
+            managed_endpoint_ips,
+        });
+        let profile = self
+            .runtime_profile(id)
+            .ok_or(ConfigError::MissingActiveProfile(id))?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    pub fn set_managed_endpoint_ips(
+        &mut self,
+        id: Uuid,
+        managed_endpoint_ips: ManagedEndpointIps,
+    ) -> Result<Profile, ConfigError> {
+        self.account_mut(id)
+            .ok_or(ConfigError::MissingActiveProfile(id))?
+            .managed_endpoint_ips = Some(managed_endpoint_ips);
+        let profile = self
+            .runtime_profile(id)
+            .ok_or(ConfigError::MissingActiveProfile(id))?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(operation) = &self.initial_identity_operation {
+            operation.validate()?;
+            if self.account(operation.profile_id).is_none() {
+                return Err(ConfigError::InvalidInitialIdentityOperation);
+            }
+        }
+        if self.schema_version > CURRENT_SCHEMA_VERSION {
+            return Err(ConfigError::NewerSchema {
+                found: self.schema_version,
+                supported: CURRENT_SCHEMA_VERSION,
+            });
+        }
+
+        if self.profiles.is_empty() {
+            return Err(ConfigError::NoProfiles);
+        }
+        self.network.direct_dns.validate()?;
+        if self.profiles.len() > MAX_PROFILES {
+            return Err(ConfigError::TooManyProfiles(self.profiles.len()));
+        }
+
+        let mut ids = HashSet::new();
+        let network = self.network.clone();
+        for account in &self.profiles {
+            if !ids.insert(account.id) {
+                return Err(ConfigError::DuplicateProfileId(account.id));
+            }
+            let name = account.name.trim();
+            if name.is_empty() || name.chars().count() > 64 {
+                return Err(ConfigError::InvalidProfileName);
+            }
+            network.hydrate(account).validate()?;
+        }
+
+        if self.identity_bindings.len() > MAX_PROFILES {
+            return Err(ConfigError::TooManyIdentityBindings(
+                self.identity_bindings.len(),
+            ));
+        }
+        for (profile_id, provider) in &self.identity_bindings {
+            if !ids.contains(profile_id) {
+                return Err(ConfigError::IdentityBindingWithoutProfile(*profile_id));
+            }
+            if let IdentityProvider::ZeroTrust { organization } = provider
+                && IdentityProvider::zero_trust(organization.clone()).is_err()
+            {
+                return Err(ConfigError::InvalidIdentityBinding(*profile_id));
+            }
+        }
+
+        if self.pending_identity_deletions.len() > MAX_PROFILES {
+            return Err(ConfigError::TooManyPendingIdentityDeletions(
+                self.pending_identity_deletions.len(),
+            ));
+        }
+        let mut pending = HashSet::new();
+        for profile_id in &self.pending_identity_deletions {
+            if !pending.insert(*profile_id) {
+                return Err(ConfigError::DuplicatePendingIdentityDeletion(*profile_id));
+            }
+            if ids.contains(profile_id) {
+                return Err(ConfigError::PendingIdentityStillReferenced(*profile_id));
+            }
+        }
+
+        if self.pending_identity_local_deletions.len() > MAX_PROFILES {
+            return Err(ConfigError::TooManyPendingIdentityLocalDeletions(
+                self.pending_identity_local_deletions.len(),
+            ));
+        }
+        let mut pending_local = HashSet::new();
+        for profile_id in &self.pending_identity_local_deletions {
+            if !pending_local.insert(*profile_id) {
+                return Err(ConfigError::DuplicatePendingIdentityLocalDeletion(
+                    *profile_id,
+                ));
+            }
+            if ids.contains(profile_id) || pending.contains(profile_id) {
+                return Err(ConfigError::InvalidPendingIdentityLocalDeletion(
+                    *profile_id,
+                ));
+            }
+        }
+
+        if self.pending_identity_creations.len() > MAX_PROFILES {
+            return Err(ConfigError::TooManyPendingIdentityCreations(
+                self.pending_identity_creations.len(),
+            ));
+        }
+        let mut pending_creations = HashSet::new();
+        for profile_id in &self.pending_identity_creations {
+            if !pending_creations.insert(*profile_id) {
+                return Err(ConfigError::DuplicatePendingIdentityCreation(*profile_id));
+            }
+            if ids.contains(profile_id) {
+                return Err(ConfigError::PendingIdentityCreationAlreadyReferenced(
+                    *profile_id,
+                ));
+            }
+            if pending.contains(profile_id) || pending_local.contains(profile_id) {
+                return Err(ConfigError::PendingIdentityCreationAndDeletion(*profile_id));
+            }
+        }
+
+        if self.pending_identity_replacements.len() > MAX_PROFILES {
+            return Err(ConfigError::TooManyPendingIdentityReplacements(
+                self.pending_identity_replacements.len(),
+            ));
+        }
+        let mut replacement_backups = HashSet::new();
+        for (profile_id, replacement) in &self.pending_identity_replacements {
+            if !ids.contains(profile_id) {
+                return Err(ConfigError::PendingIdentityReplacementWithoutProfile(
+                    *profile_id,
+                ));
+            }
+            if pending.contains(profile_id)
+                || pending_local.contains(profile_id)
+                || pending_creations.contains(profile_id)
+            {
+                return Err(ConfigError::ConflictingPendingIdentityOperation(
+                    *profile_id,
+                ));
+            }
+            if let Some(backup_id) = replacement.backup_identity_id
+                && (ids.contains(&backup_id)
+                    || pending.contains(&backup_id)
+                    || pending_local.contains(&backup_id)
+                    || pending_creations.contains(&backup_id)
+                    || !replacement_backups.insert(backup_id))
+            {
+                return Err(ConfigError::InvalidPendingIdentityReplacementBackup(
+                    backup_id,
+                ));
+            }
+        }
+
+        match self.active_profile_id {
+            Some(active) if !ids.contains(&active) => {
+                return Err(ConfigError::MissingActiveProfile(active));
+            }
+            None => return Err(ConfigError::NoActiveProfile),
+            Some(_) => {}
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppPreferences {
+    pub locale: AppLocale,
+    pub theme: ThemeMode,
+    pub update_check_enabled: bool,
+    pub log_level: LogLevel,
+    #[serde(default)]
+    pub profiles_migrated_from_flutter: bool,
+}
+
+impl Default for AppPreferences {
+    fn default() -> Self {
+        Self {
+            locale: AppLocale::System,
+            theme: ThemeMode::System,
+            update_check_enabled: true,
+            log_level: LogLevel::Info,
+            profiles_migrated_from_flutter: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AppLocale {
+    #[default]
+    System,
+    English,
+    SimplifiedChinese,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    #[default]
+    Info,
+    Debug,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Profile {
+    pub id: Uuid,
+    pub name: String,
+    pub mode: OperatingMode,
+    /// Independently selectable local consumers of the one active MASQUE
+    /// channel. `mode` remains serialized only for v1 wire/config migration.
+    #[serde(default)]
+    pub frontends: FrontendSettings,
+    pub transport: TransportPolicy,
+    #[serde(default)]
+    pub data_plane: DataPlaneMode,
+    #[serde(default)]
+    pub congestion_control: CongestionControlAlgorithm,
+    pub endpoint: EndpointSettings,
+    /// Selects the physical address family used to reach the MASQUE endpoint.
+    /// It never restricts IPv4 or IPv6 payloads carried inside CONNECT-IP.
+    pub ip_policy: IpPolicy,
+    pub mtu: u16,
+    pub dns_mode: DnsMode,
+    pub dns_servers: Vec<IpAddr>,
+    pub allow_lan: bool,
+    /// Block application UDP/443 on tunnel paths, after GEO direct routing.
+    #[serde(default)]
+    pub disable_quic: bool,
+    pub split_exclusions: Vec<IpNet>,
+    pub kill_switch: bool,
+    pub auto_connect: bool,
+    pub proxy: ProxySettings,
+    /// Uppercase ISO 3166-1 alpha-2 codes sent DIRECT. Empty disables the feature.
+    #[serde(default)]
+    pub geo_direct_countries: Vec<String>,
+    #[serde(default)]
+    pub bypass_domains: Vec<String>,
+    /// Resolver used only for GeoSite traffic routed directly over the
+    /// physical network. The default preserves the system-resolver behavior.
+    #[serde(default)]
+    pub direct_dns: DirectDnsSettings,
+    /// Additional final exit; independent from the WARP transport/backend.
+    #[serde(default)]
+    pub vpn_gate: crate::vpngate::VpnGateSettings,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_exit: Option<crate::chain_exit::ChainExitSettings>,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        let mut profile = Self {
+            id: DEFAULT_PROFILE_ID,
+            name: "Default".to_owned(),
+            mode: OperatingMode::legacy_platform_default(),
+            frontends: FrontendSettings::default(),
+            transport: TransportPolicy::Auto,
+            data_plane: DataPlaneMode::ConnectIp,
+            congestion_control: CongestionControlAlgorithm::default(),
+            endpoint: EndpointSettings::default(),
+            ip_policy: IpPolicy::Auto,
+            mtu: DEFAULT_MTU,
+            dns_mode: DnsMode::Tunnel,
+            dns_servers: default_dns_servers(),
+            allow_lan: true,
+            disable_quic: false,
+            split_exclusions: Vec::new(),
+            kill_switch: true,
+            auto_connect: false,
+            proxy: ProxySettings::default(),
+            geo_direct_countries: Vec::new(),
+            bypass_domains: Vec::new(),
+            direct_dns: DirectDnsSettings::default(),
+            vpn_gate: crate::vpngate::VpnGateSettings::default(),
+            chain_exit: None,
+        };
+        profile.canonicalize_mode();
+        profile
+    }
+}
+
+impl Profile {
+    pub fn chain_enabled(&self) -> bool {
+        self.chain_exit
+            .as_ref()
+            .map_or(self.vpn_gate.enabled, |s| s.enabled)
+    }
+    pub fn custom_chain(&self) -> Option<&crate::chain_exit::ChainExitSettings> {
+        self.chain_exit
+            .as_ref()
+            .filter(|s| s.source != crate::chain_exit::ChainSource::VpnGate)
+    }
+    pub fn disable_chain(&mut self) {
+        self.vpn_gate.enabled = false;
+        if let Some(chain) = &mut self.chain_exit {
+            chain.enabled = false;
+        }
+    }
+    /// `mode` is the persisted projection of `frontends`.
+    pub fn canonicalize_mode(&mut self) {
+        self.mode = if self.frontends.tunnel {
+            OperatingMode::Vpn
+        } else if self.frontends.http && !self.frontends.socks5 {
+            OperatingMode::HttpProxy
+        } else {
+            OperatingMode::Socks5
+        };
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        let trimmed_name = self.name.trim();
+        if trimmed_name.is_empty() || trimmed_name.chars().count() > 64 {
+            return Err(ConfigError::InvalidProfileName);
+        }
+        self.endpoint.validate()?;
+
+        if let Some(chain) = &self.chain_exit {
+            chain
+                .validate()
+                .map_err(|_| ConfigError::InvalidVpnGateSelection)?;
+            if chain.source == crate::chain_exit::ChainSource::VpnGate {
+                let mut gate = self.vpn_gate.clone();
+                gate.enabled = chain.enabled;
+                gate.validate()
+                    .map_err(|_| ConfigError::InvalidVpnGateSelection)?;
+            }
+            if chain.source == crate::chain_exit::ChainSource::VpnGate
+                && chain.enabled
+                && self.vpn_gate.selection.is_none()
+            {
+                return Err(ConfigError::InvalidVpnGateSelection);
+            }
+        } else {
+            self.vpn_gate
+                .validate()
+                .map_err(|_| ConfigError::InvalidVpnGateSelection)?;
+        }
+
+        if !(1280..=9000).contains(&self.mtu) {
+            return Err(ConfigError::InvalidMtu(self.mtu));
+        }
+        if self.dns_servers.is_empty() {
+            return Err(ConfigError::MissingDnsServer);
+        }
+        if self.dns_servers.len() > MAX_DNS_SERVERS {
+            return Err(ConfigError::TooManyDnsServers(self.dns_servers.len()));
+        }
+        if self.dns_servers.iter().collect::<HashSet<_>>().len() != self.dns_servers.len() {
+            return Err(ConfigError::DuplicateDnsServer);
+        }
+        if self.split_exclusions.len() > MAX_SPLIT_EXCLUSIONS {
+            return Err(ConfigError::TooManySplitExclusions(
+                self.split_exclusions.len(),
+            ));
+        }
+        if self.split_exclusions.iter().collect::<HashSet<_>>().len() != self.split_exclusions.len()
+        {
+            return Err(ConfigError::DuplicateSplitExclusion);
+        }
+        normalize_geo_direct_countries(&self.geo_direct_countries)?;
+        normalize_bypass_domains(&self.bypass_domains)?;
+        self.direct_dns.validate()?;
+        if self.frontends.tunnel {
+            if self.dns_mode == DnsMode::System {
+                return Err(ConfigError::VpnSystemDnsForbidden);
+            }
+            if let Some(server) = self
+                .dns_servers
+                .iter()
+                .copied()
+                .find(|server| invalid_vpn_dns_address(*server))
+            {
+                return Err(ConfigError::InvalidVpnDnsServer(server));
+            }
+            if let Some(server) = self.dns_servers.iter().copied().find(|server| {
+                self.split_exclusions
+                    .iter()
+                    .any(|network| network.contains(server))
+                    || self.endpoint.selection == EndpointSelection::Custom
+                        && (*server == IpAddr::V4(self.endpoint.ipv4)
+                            || *server == IpAddr::V6(self.endpoint.ipv6))
+                    || self.allow_lan && is_lan_bypass_address(*server)
+            }) {
+                return Err(ConfigError::VpnDnsServerBypassed(server));
+            }
+        }
+        self.proxy.validate()?;
+        if self.proxy.dns_mode == ProxyDnsMode::EdgeResolved
+            && self.data_plane != DataPlaneMode::L4Proxy
+            && !self
+                .custom_chain()
+                .is_some_and(|c| c.enabled && c.source.is_proxy())
+        {
+            return Err(ConfigError::EdgeDnsRequiresL4);
+        }
+        if self.frontends.socks5 && self.proxy.socks5_listeners.is_empty() {
+            return Err(ConfigError::MissingSocks5Listener);
+        }
+        if self.frontends.http && self.proxy.http_listeners.is_empty() {
+            return Err(ConfigError::MissingHttpListener);
+        }
+        if self.proxy.system_proxy && !self.frontends.http {
+            return Err(ConfigError::SystemProxyRequiresHttpMode);
+        }
+        if self.proxy.system_proxy
+            && !self
+                .proxy
+                .http_listeners
+                .iter()
+                .any(|listener| listener.ip().is_loopback())
+        {
+            return Err(ConfigError::SystemProxyRequiresLoopback);
+        }
+        Ok(())
+    }
+
+    pub fn reset_network_defaults(&mut self) {
+        self.frontends = FrontendSettings::default();
+        self.canonicalize_mode();
+        self.transport = TransportPolicy::Auto;
+        self.data_plane = DataPlaneMode::ConnectIp;
+        self.endpoint = EndpointSettings::default();
+        self.ip_policy = IpPolicy::Auto;
+        self.mtu = DEFAULT_MTU;
+        self.dns_mode = DnsMode::Tunnel;
+        self.dns_servers = default_dns_servers();
+        self.allow_lan = false;
+        self.disable_quic = false;
+        self.split_exclusions.clear();
+        self.proxy = ProxySettings::default();
+        self.geo_direct_countries.clear();
+        self.bypass_domains.clear();
+        self.direct_dns = DirectDnsSettings::default();
+        self.vpn_gate = crate::vpngate::VpnGateSettings::default();
+        self.chain_exit = None;
+    }
+
+    pub fn has_domain_direct_rules(&self) -> bool {
+        !self.geo_direct_countries.is_empty() || !self.bypass_domains.is_empty()
+    }
+
+    pub fn canonicalize_geo_direct(&mut self) -> Result<(), ConfigError> {
+        self.geo_direct_countries = normalize_geo_direct_countries(&self.geo_direct_countries)?;
+        self.bypass_domains = normalize_bypass_domains(&self.bypass_domains)?;
+        let mut seen = HashSet::new();
+        self.split_exclusions = self
+            .split_exclusions
+            .iter()
+            .map(|net| net.trunc())
+            .filter(|net| seen.insert(*net))
+            .collect();
+        Ok(())
+    }
+
+    pub fn canonicalize_direct_dns(&mut self) {
+        self.direct_dns.canonicalize();
+    }
+
+    pub fn validate_geo_cache(&self, cache_dir: &std::path::Path) -> Result<(), ConfigError> {
+        crate::geo_rules::validate_geo_direct_cache(self, cache_dir)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrontendSettings {
+    pub tunnel: bool,
+    pub socks5: bool,
+    pub http: bool,
+}
+
+impl FrontendSettings {
+    pub const fn windows_default() -> Self {
+        Self {
+            tunnel: true,
+            socks5: true,
+            http: true,
+        }
+    }
+
+    pub const fn android_default() -> Self {
+        Self {
+            tunnel: true,
+            socks5: true,
+            http: true,
+        }
+    }
+
+    pub const fn platform_default() -> Self {
+        if cfg!(target_os = "android") {
+            Self::android_default()
+        } else {
+            Self::windows_default()
+        }
+    }
+
+    pub const fn any(self) -> bool {
+        self.tunnel || self.socks5 || self.http
+    }
+}
+
+impl Default for FrontendSettings {
+    fn default() -> Self {
+        Self::platform_default()
+    }
+}
+
+pub(crate) fn invalid_vpn_dns_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_unspecified()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_multicast()
+                || address.is_broadcast()
+        }
+        IpAddr::V6(address) => {
+            address.is_unspecified()
+                || address.is_loopback()
+                || address.is_unicast_link_local()
+                || address.is_multicast()
+        }
+    }
+}
+
+fn invalid_direct_dns_bootstrap(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            address.is_unspecified() || address.is_multicast() || address.is_broadcast()
+        }
+        IpAddr::V6(address) => {
+            address.is_unspecified() || address.is_multicast() || address.is_unicast_link_local()
+        }
+    }
+}
+
+fn is_lan_bypass_address(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            let [first, second, ..] = address.octets();
+            first == 10
+                || first == 172 && (16..=31).contains(&second)
+                || first == 192 && second == 168
+                || first == 169 && second == 254
+        }
+        IpAddr::V6(address) => {
+            let [first, second, ..] = address.octets();
+            first & 0xfe == 0xfc || first == 0xfe && second & 0xc0 == 0x80
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatingMode {
+    #[default]
+    Vpn,
+    Socks5,
+    HttpProxy,
+}
+
+impl OperatingMode {
+    pub const fn legacy_platform_default() -> Self {
+        if cfg!(target_os = "android") {
+            Self::Vpn
+        } else {
+            Self::Socks5
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportPolicy {
+    #[default]
+    Auto,
+    Http3,
+    Http2,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+/// Policy for selecting the outer MASQUE endpoint address family.
+///
+/// Even the `Only` variants keep IPv4 and IPv6 enabled inside CONNECT-IP.
+pub enum IpPolicy {
+    #[default]
+    Auto,
+    PreferIpv4,
+    PreferIpv6,
+    Ipv4Only,
+    Ipv6Only,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsMode {
+    #[default]
+    Tunnel,
+    LocalConfigured,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DirectDnsMode {
+    #[default]
+    PhysicalSystem,
+    Doh,
+    Dot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DirectDnsSettings {
+    #[serde(default)]
+    pub mode: DirectDnsMode,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server_name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub doh_path: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bootstrap_ips: Vec<IpAddr>,
+    #[serde(default, skip_serializing_if = "direct_dns_port_is_zero")]
+    pub port: u16,
+}
+
+fn direct_dns_port_is_zero(port: &u16) -> bool {
+    *port == 0
+}
+
+/// Normalize a suffix rule without permitting URL syntax or numeric hosts.
+pub fn canonical_bypass_domain(name: &str) -> Option<String> {
+    canonical_direct_dns_name(name.strip_suffix('.').unwrap_or(name))
+}
+
+pub fn normalize_bypass_domains(values: &[String]) -> Result<Vec<String>, ConfigError> {
+    if values.len() > MAX_BYPASS_DOMAINS {
+        return Err(ConfigError::TooManyBypassDomains);
+    }
+    let mut seen = HashSet::new();
+    let mut result = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        let name =
+            canonical_bypass_domain(value).ok_or(ConfigError::InvalidBypassDomain(index + 1))?;
+        if seen.insert(name.clone()) {
+            result.push(name);
+        }
+    }
+    Ok(result)
+}
+
+fn canonical_direct_dns_name(name: &str) -> Option<String> {
+    if name.is_empty()
+        || name.chars().count() > 253
+        || name.chars().any(|character| {
+            character.is_whitespace() || character.is_control() || ":/\\?#@%*[]".contains(character)
+        })
+    {
+        return None;
+    }
+    // Url's IDNA implementation is already used by the control plane. Reject
+    // URL syntax before parsing, then validate the normalized TLS DNS name.
+    let url = reqwest::Url::parse(&format!("https://{name}/")).ok()?;
+    let normalized = url.host_str()?.to_owned();
+    if !valid_dns_name(&normalized)
+        || !matches!(
+            rustls::pki_types::ServerName::try_from(normalized.clone()),
+            Ok(rustls::pki_types::ServerName::DnsName(_))
+        )
+    {
+        return None;
+    }
+    Some(normalized)
+}
+
+impl Default for DirectDnsSettings {
+    fn default() -> Self {
+        Self {
+            mode: DirectDnsMode::PhysicalSystem,
+            server_name: String::new(),
+            doh_path: String::new(),
+            bootstrap_ips: Vec::new(),
+            port: 0,
+        }
+    }
+}
+
+impl DirectDnsSettings {
+    pub fn canonicalize(&mut self) {
+        match self.mode {
+            DirectDnsMode::PhysicalSystem => *self = Self::default(),
+            DirectDnsMode::Doh => {
+                if let Some(normalized) = canonical_direct_dns_name(&self.server_name) {
+                    self.server_name = normalized;
+                }
+                if self.doh_path.is_empty() {
+                    self.doh_path = "/dns-query".to_owned();
+                }
+                if self.port == 0 {
+                    self.port = 443;
+                }
+            }
+            DirectDnsMode::Dot => {
+                if let Some(normalized) = canonical_direct_dns_name(&self.server_name) {
+                    self.server_name = normalized;
+                }
+                if self.port == 0 {
+                    self.port = 853;
+                }
+            }
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.mode == DirectDnsMode::PhysicalSystem {
+            if self != &Self::default() {
+                return Err(ConfigError::NonCanonicalPhysicalDirectDns);
+            }
+            return Ok(());
+        }
+        if canonical_direct_dns_name(&self.server_name).is_none() {
+            return Err(ConfigError::InvalidDirectDnsServerName);
+        }
+        if self.port == 0 {
+            return Err(ConfigError::InvalidDirectDnsPort);
+        }
+        if self.bootstrap_ips.is_empty() {
+            return Err(ConfigError::MissingDirectDnsBootstrapIp);
+        }
+        if self.bootstrap_ips.len() > MAX_DIRECT_DNS_BOOTSTRAP_IPS {
+            return Err(ConfigError::TooManyDirectDnsBootstrapIps(
+                self.bootstrap_ips.len(),
+            ));
+        }
+        if self.bootstrap_ips.iter().collect::<HashSet<_>>().len() != self.bootstrap_ips.len() {
+            return Err(ConfigError::DuplicateDirectDnsBootstrapIp);
+        }
+        if self
+            .bootstrap_ips
+            .iter()
+            .copied()
+            .any(invalid_direct_dns_bootstrap)
+        {
+            return Err(ConfigError::InvalidDirectDnsBootstrapIp);
+        }
+        match self.mode {
+            DirectDnsMode::Doh => {
+                if self.doh_path.len() > 256
+                    || !self.doh_path.starts_with('/')
+                    || self.doh_path.starts_with("//")
+                    || self
+                        .doh_path
+                        .bytes()
+                        .any(|byte| !(33..=126).contains(&byte))
+                    || self.doh_path.contains(['?', '#', '\\'])
+                    || self.doh_path.contains("://")
+                {
+                    return Err(ConfigError::InvalidDirectDnsDohPath);
+                }
+            }
+            DirectDnsMode::Dot if !self.doh_path.is_empty() => {
+                return Err(ConfigError::DirectDnsDotPathForbidden);
+            }
+            DirectDnsMode::PhysicalSystem | DirectDnsMode::Dot => {}
+        }
+        Ok(())
+    }
+}
+
+/// Address selection is independent of the saved custom address pair.
+/// Missing legacy fields preserve manual endpoint selection.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EndpointSelection {
+    Automatic,
+    #[default]
+    Custom,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EndpointSettings {
+    pub ipv4: Ipv4Addr,
+    pub ipv6: Ipv6Addr,
+    pub port: u16,
+    pub sni: String,
+    #[serde(default)]
+    pub selection: EndpointSelection,
+}
+
+impl Default for EndpointSettings {
+    fn default() -> Self {
+        Self {
+            ipv4: DEFAULT_ENDPOINT_V4,
+            ipv6: DEFAULT_ENDPOINT_V6,
+            port: DEFAULT_PORT,
+            sni: DEFAULT_SNI.to_owned(),
+            selection: EndpointSelection::Automatic,
+        }
+    }
+}
+
+impl EndpointSettings {
+    pub fn is_zero_trust_managed(&self) -> bool {
+        self.sni
+            .eq_ignore_ascii_case("zt-masque.cloudflareclient.com")
+            || self.ipv4.octets()[..3] == [162, 159, 197]
+            || self.ipv6.segments()[..3] == [0x2606, 0x4700, 0x0102]
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.port == 0 {
+            return Err(ConfigError::InvalidPort);
+        }
+        if !valid_dns_name(&self.sni) {
+            return Err(ConfigError::InvalidSni(self.sni.clone()));
+        }
+        Ok(())
+    }
+
+    pub fn ipv4_socket(&self) -> SocketAddr {
+        SocketAddr::new(self.ipv4.into(), self.port)
+    }
+
+    pub fn ipv6_socket(&self) -> SocketAddr {
+        SocketAddr::new(self.ipv6.into(), self.port)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProxySettings {
+    pub socks5_listeners: Vec<SocketAddr>,
+    pub http_listeners: Vec<SocketAddr>,
+    pub system_proxy: bool,
+    pub udp_idle_timeout_seconds: u32,
+    #[serde(default)]
+    pub dns_mode: ProxyDnsMode,
+    #[serde(default = "default_dns_servers")]
+    pub dns_servers: Vec<IpAddr>,
+    /// Optional SOCKS5/HTTP listener username. Empty or omitted means no auth.
+    /// The matching password is stored only in the secret vault.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_username: Option<String>,
+    /// In-memory password loaded from the vault for a live listener. Never
+    /// written to profile JSON.
+    #[serde(skip)]
+    pub auth_password: Option<Zeroizing<Vec<u8>>>,
+}
+
+impl fmt::Debug for ProxySettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxySettings")
+            .field("socks5_listeners", &self.socks5_listeners)
+            .field("http_listeners", &self.http_listeners)
+            .field("system_proxy", &self.system_proxy)
+            .field("udp_idle_timeout_seconds", &self.udp_idle_timeout_seconds)
+            .field("dns_mode", &self.dns_mode)
+            .field("dns_servers", &self.dns_servers)
+            .field("auth_username", &self.auth_username)
+            .field(
+                "auth_password",
+                &self.auth_password.as_ref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
+}
+
+impl Default for ProxySettings {
+    fn default() -> Self {
+        Self {
+            socks5_listeners: vec![
+                SocketAddr::from(([127, 0, 0, 1], 1080)),
+                SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 1080),
+            ],
+            http_listeners: vec![
+                SocketAddr::from(([127, 0, 0, 1], 8080)),
+                SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 8080),
+            ],
+            system_proxy: false,
+            udp_idle_timeout_seconds: 60,
+            dns_mode: ProxyDnsMode::Remote,
+            dns_servers: default_dns_servers(),
+            auth_username: None,
+            auth_password: None,
+        }
+    }
+}
+
+impl ProxySettings {
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.socks5_listeners.len() > MAX_PROXY_LISTENERS_PER_PROTOCOL
+            || self.http_listeners.len() > MAX_PROXY_LISTENERS_PER_PROTOCOL
+        {
+            return Err(ConfigError::TooManyProxyListeners);
+        }
+        if !(1..=3_600).contains(&self.udp_idle_timeout_seconds) {
+            return Err(ConfigError::InvalidUdpIdleTimeout(
+                self.udp_idle_timeout_seconds,
+            ));
+        }
+        if self.dns_servers.is_empty() {
+            return Err(ConfigError::MissingDnsServer);
+        }
+        if self.dns_servers.len() > MAX_DNS_SERVERS {
+            return Err(ConfigError::TooManyDnsServers(self.dns_servers.len()));
+        }
+        if self.dns_servers.iter().collect::<HashSet<_>>().len() != self.dns_servers.len() {
+            return Err(ConfigError::DuplicateDnsServer);
+        }
+
+        let mut listeners = HashSet::new();
+        for listener in self
+            .socks5_listeners
+            .iter()
+            .chain(self.http_listeners.iter())
+        {
+            if listener.port() == 0 {
+                return Err(ConfigError::InvalidPort);
+            }
+            if !listeners.insert(*listener) {
+                return Err(ConfigError::DuplicateProxyListener(*listener));
+            }
+        }
+        if let Some(username) = self.listener_auth_username() {
+            validate_proxy_username(username)?;
+        }
+        Ok(())
+    }
+
+    pub fn listener_auth_username(&self) -> Option<&str> {
+        self.auth_username
+            .as_deref()
+            .filter(|value| !value.is_empty())
+    }
+
+    pub fn normalize_auth(&mut self) {
+        if self.auth_username.as_deref().is_some_and(str::is_empty) {
+            self.auth_username = None;
+        }
+        if self.auth_username.is_none() {
+            self.auth_password = None;
+        }
+    }
+
+    pub fn listener_credentials(&self) -> Result<Option<ProxyAuthCredentials>, ConfigError> {
+        match self.listener_auth_username() {
+            None => Ok(None),
+            Some(username) => {
+                let password = self
+                    .auth_password
+                    .as_deref()
+                    .filter(|value| !value.is_empty())
+                    .ok_or(ConfigError::ProxyAuthRequiresPassword)?;
+                Ok(Some(ProxyAuthCredentials::parse(username, password)?))
+            }
+        }
+    }
+
+    pub fn exposes_lan(&self, mode: OperatingMode) -> bool {
+        let listeners = match mode {
+            OperatingMode::Vpn => return false,
+            OperatingMode::Socks5 => &self.socks5_listeners,
+            OperatingMode::HttpProxy => &self.http_listeners,
+        };
+        listeners.iter().any(|address| !address.ip().is_loopback())
+    }
+
+    pub fn socks5_exposes_lan(&self) -> bool {
+        self.socks5_listeners
+            .iter()
+            .any(|address| !address.ip().is_loopback())
+    }
+
+    pub fn http_exposes_lan(&self) -> bool {
+        self.http_listeners
+            .iter()
+            .any(|address| !address.ip().is_loopback())
+    }
+}
+
+fn default_dns_servers() -> Vec<IpAddr> {
+    vec![DEFAULT_DNS_V4.into(), DEFAULT_DNS_V6.into()]
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyDnsMode {
+    #[default]
+    Remote,
+    LocalConfigured,
+    System,
+    /// Pass a proxy hostname to the L4 CONNECT server without local resolution.
+    EdgeResolved,
+}
+
+/// SOCKS5 RFC 1929 / HTTP Basic credentials for a local listener.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProxyAuthCredentials {
+    username: String,
+    password: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for ProxyAuthCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyAuthCredentials")
+            .field("username", &self.username)
+            .field("password", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl ProxyAuthCredentials {
+    pub fn parse(username: &str, password: &[u8]) -> Result<Self, ConfigError> {
+        validate_proxy_username(username)?;
+        validate_proxy_password(password)?;
+        Ok(Self {
+            username: username.to_owned(),
+            password: Zeroizing::new(password.to_vec()),
+        })
+    }
+
+    pub fn username(&self) -> &str {
+        &self.username
+    }
+
+    pub fn username_bytes(&self) -> &[u8] {
+        self.username.as_bytes()
+    }
+
+    pub fn password_bytes(&self) -> &[u8] {
+        &self.password
+    }
+
+    pub fn matches(&self, username: &[u8], password: &[u8]) -> bool {
+        bool::from(self.username_bytes().ct_eq(username) & self.password_bytes().ct_eq(password))
+    }
+
+    pub fn decode_http_basic(header: &str) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut parts = header.splitn(2, char::is_whitespace);
+        let scheme = parts.next()?;
+        let encoded = parts.next()?.trim();
+        if !scheme.eq_ignore_ascii_case("basic") || encoded.is_empty() {
+            return None;
+        }
+        let decoded = BASE64_STANDARD.decode(encoded).ok()?;
+        let separator = decoded.iter().position(|byte| *byte == b':')?;
+        let username = decoded[..separator].to_vec();
+        let password = decoded[separator + 1..].to_vec();
+        Some((username, password))
+    }
+}
+
+pub fn validate_proxy_username(username: &str) -> Result<(), ConfigError> {
+    let bytes = username.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > MAX_PROXY_AUTH_BYTES
+        || bytes.contains(&b':')
+        || bytes.contains(&0)
+    {
+        return Err(ConfigError::InvalidProxyAuthUsername);
+    }
+    Ok(())
+}
+
+pub fn validate_proxy_password(password: &[u8]) -> Result<(), ConfigError> {
+    if password.is_empty() || password.len() > MAX_PROXY_AUTH_BYTES {
+        return Err(ConfigError::InvalidProxyAuthPassword);
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_geo_direct_countries(
+    values: &[String],
+) -> Result<Vec<String>, ConfigError> {
+    if values.len() > MAX_GEO_DIRECT_COUNTRIES {
+        return Err(ConfigError::TooManyGeoDirectCountries(values.len()));
+    }
+    let mut seen = HashSet::new();
+    let mut countries = Vec::with_capacity(values.len());
+    for value in values {
+        let parsed = usque_geo::CountryCode::parse(value)
+            .map_err(|_| ConfigError::InvalidGeoDirectCountry(value.clone()))?;
+        let code = parsed.as_str().to_owned();
+        if !seen.insert(code.clone()) {
+            return Err(ConfigError::DuplicateGeoDirectCountry);
+        }
+        countries.push(code);
+    }
+    Ok(countries)
+}
+
+fn valid_dns_name(value: &str) -> bool {
+    if value.is_empty()
+        || value.len() > 253
+        || value.ends_with('.')
+        || value.chars().any(char::is_whitespace)
+    {
+        return false;
+    }
+    value.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    })
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ConfigError {
+    #[error("initial identity operation is invalid")]
+    InvalidInitialIdentityOperation,
+    #[error("no more than 256 bypass domains are allowed")]
+    TooManyBypassDomains,
+    #[error("invalid bypass domain at entry {0}")]
+    InvalidBypassDomain(usize),
+    #[error("chain_exit capability is required to replace an imported exit")]
+    ChainExitCapabilityRequired,
+    #[error("VPN Gate requires a valid pinned server selection")]
+    InvalidVpnGateSelection,
+    #[error("edge-resolved proxy DNS requires the L4 data plane")]
+    EdgeDnsRequiresL4,
+    #[error("profile name must contain 1 to 64 visible characters")]
+    InvalidProfileName,
+    #[error("SNI is not a valid DNS name: {0}")]
+    InvalidSni(String),
+    #[error("port must be between 1 and 65535")]
+    InvalidPort,
+    #[error("SOCKS5 UDP idle timeout must be between 1 and 3600 seconds, got {0}")]
+    InvalidUdpIdleTimeout(u32),
+    #[error("MTU must be between 1280 and 9000, got {0}")]
+    InvalidMtu(u16),
+    #[error("at least one DNS server is required")]
+    MissingDnsServer,
+    #[error("no more than {MAX_DNS_SERVERS} DNS servers are allowed, got {0}")]
+    TooManyDnsServers(usize),
+    #[error("duplicate DNS server")]
+    DuplicateDnsServer,
+    #[error("physical-system direct DNS settings must use the canonical empty form")]
+    NonCanonicalPhysicalDirectDns,
+    #[error("encrypted direct DNS requires a valid server name")]
+    InvalidDirectDnsServerName,
+    #[error("encrypted direct DNS port must be between 1 and 65535")]
+    InvalidDirectDnsPort,
+    #[error("encrypted direct DNS requires at least one bootstrap IP")]
+    MissingDirectDnsBootstrapIp,
+    #[error(
+        "no more than {MAX_DIRECT_DNS_BOOTSTRAP_IPS} direct DNS bootstrap IPs are allowed, got {0}"
+    )]
+    TooManyDirectDnsBootstrapIps(usize),
+    #[error("duplicate direct DNS bootstrap IP")]
+    DuplicateDirectDnsBootstrapIp,
+    #[error("direct DNS bootstrap IP must be unicast")]
+    InvalidDirectDnsBootstrapIp,
+    #[error("DoH path must be an absolute path without whitespace or a fragment")]
+    InvalidDirectDnsDohPath,
+    #[error("DoT settings cannot contain a DoH path")]
+    DirectDnsDotPathForbidden,
+    #[error("VPN mode cannot use the physical system DNS resolver")]
+    VpnSystemDnsForbidden,
+    #[error("VPN DNS server {0} is not a routable unicast address")]
+    InvalidVpnDnsServer(IpAddr),
+    #[error("VPN DNS server {0} is covered by a LAN or CIDR bypass")]
+    VpnDnsServerBypassed(IpAddr),
+    #[error("no more than {MAX_SPLIT_EXCLUSIONS} split exclusions are allowed, got {0}")]
+    TooManySplitExclusions(usize),
+    #[error("duplicate split exclusion")]
+    DuplicateSplitExclusion,
+    #[error("no more than {MAX_GEO_DIRECT_COUNTRIES} direct countries are allowed, got {0}")]
+    TooManyGeoDirectCountries(usize),
+    #[error("duplicate direct country")]
+    DuplicateGeoDirectCountry,
+    #[error("invalid direct country code: {0}")]
+    InvalidGeoDirectCountry(String),
+    #[error("download GeoIP data for {0} before enabling it")]
+    GeoDirectCountryNotDownloaded(String),
+    #[error("at least one SOCKS5 listener is required while SOCKS5 is enabled")]
+    MissingSocks5Listener,
+    #[error("at least one HTTP listener is required while HTTP is enabled")]
+    MissingHttpListener,
+    #[error(
+        "no more than {MAX_PROXY_LISTENERS_PER_PROTOCOL} listeners per proxy protocol are allowed"
+    )]
+    TooManyProxyListeners,
+    #[error("duplicate proxy listener: {0}")]
+    DuplicateProxyListener(SocketAddr),
+    #[error("Windows system proxy requires the HTTP frontend")]
+    SystemProxyRequiresHttpMode,
+    #[error("Windows system proxy requires at least one Loopback HTTP listener")]
+    SystemProxyRequiresLoopback,
+    #[error("proxy username must be 1 to 255 bytes and cannot contain ':' or NUL")]
+    InvalidProxyAuthUsername,
+    #[error("proxy password must be 1 to 255 bytes")]
+    InvalidProxyAuthPassword,
+    #[error("proxy username requires a password")]
+    ProxyAuthRequiresPassword,
+    #[error("duplicate profile ID: {0}")]
+    DuplicateProfileId(Uuid),
+    #[error("at least one profile is required")]
+    NoProfiles,
+    #[error("no more than {MAX_PROFILES} profiles are allowed, got {0}")]
+    TooManyProfiles(usize),
+    #[error("an active profile is required")]
+    NoActiveProfile,
+    #[error("active profile does not exist: {0}")]
+    MissingActiveProfile(Uuid),
+    #[error("no more than {MAX_PROFILES} identity bindings are allowed, got {0}")]
+    TooManyIdentityBindings(usize),
+    #[error("identity binding references a missing profile: {0}")]
+    IdentityBindingWithoutProfile(Uuid),
+    #[error("identity binding is invalid for profile: {0}")]
+    InvalidIdentityBinding(Uuid),
+    #[error("no more than {MAX_PROFILES} pending identity deletions are allowed, got {0}")]
+    TooManyPendingIdentityDeletions(usize),
+    #[error("duplicate pending identity deletion: {0}")]
+    DuplicatePendingIdentityDeletion(Uuid),
+    #[error("pending identity deletion is still referenced by a profile: {0}")]
+    PendingIdentityStillReferenced(Uuid),
+    #[error("no more than {MAX_PROFILES} pending local identity deletions are allowed, got {0}")]
+    TooManyPendingIdentityLocalDeletions(usize),
+    #[error("duplicate pending local identity deletion: {0}")]
+    DuplicatePendingIdentityLocalDeletion(Uuid),
+    #[error("pending local identity deletion is invalid or still referenced: {0}")]
+    InvalidPendingIdentityLocalDeletion(Uuid),
+    #[error("no more than {MAX_PROFILES} pending identity creations are allowed, got {0}")]
+    TooManyPendingIdentityCreations(usize),
+    #[error("duplicate pending identity creation: {0}")]
+    DuplicatePendingIdentityCreation(Uuid),
+    #[error("pending identity creation is already referenced by a profile: {0}")]
+    PendingIdentityCreationAlreadyReferenced(Uuid),
+    #[error("identity cannot be pending creation and deletion at the same time: {0}")]
+    PendingIdentityCreationAndDeletion(Uuid),
+    #[error("no more than {MAX_PROFILES} pending identity replacements are allowed, got {0}")]
+    TooManyPendingIdentityReplacements(usize),
+    #[error("pending identity replacement references a missing profile: {0}")]
+    PendingIdentityReplacementWithoutProfile(Uuid),
+    #[error("profile has conflicting pending identity operations: {0}")]
+    ConflictingPendingIdentityOperation(Uuid),
+    #[error("pending identity replacement backup is invalid or duplicated: {0}")]
+    InvalidPendingIdentityReplacementBackup(Uuid),
+    #[error("configuration schema {found} is newer than supported schema {supported}")]
+    NewerSchema { found: u32, supported: u32 },
+}
+
+impl ConfigError {
+    pub const fn stable_code(&self) -> Option<&'static str> {
+        match self {
+            Self::NonCanonicalPhysicalDirectDns => Some("DIRECT_DNS_PHYSICAL_NOT_CANONICAL"),
+            Self::InvalidDirectDnsServerName => Some("DIRECT_DNS_SERVER_NAME_INVALID"),
+            Self::InvalidDirectDnsPort => Some("DIRECT_DNS_PORT_INVALID"),
+            Self::MissingDirectDnsBootstrapIp => Some("DIRECT_DNS_BOOTSTRAP_REQUIRED"),
+            Self::TooManyDirectDnsBootstrapIps(_) => Some("DIRECT_DNS_BOOTSTRAP_TOO_MANY"),
+            Self::DuplicateDirectDnsBootstrapIp => Some("DIRECT_DNS_BOOTSTRAP_DUPLICATE"),
+            Self::InvalidDirectDnsBootstrapIp => Some("DIRECT_DNS_BOOTSTRAP_INVALID"),
+            Self::InvalidDirectDnsDohPath => Some("DIRECT_DNS_DOH_PATH_INVALID"),
+            Self::DirectDnsDotPathForbidden => Some("DIRECT_DNS_DOT_PATH_FORBIDDEN"),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lan_bypass_defaults_on_but_preserves_saved_settings() {
+        let mut network = SharedNetworkSettings::default();
+        assert!(network.allow_lan);
+        network.allow_lan = false;
+        let saved = serde_json::to_string(&network).expect("serialize settings");
+        let restored: SharedNetworkSettings =
+            serde_json::from_str(&saved).expect("deserialize settings");
+        assert!(!restored.allow_lan);
+    }
+
+    #[test]
+    fn defaults_match_the_product_contract() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../oracle/fixtures/defaults.json"))
+                .expect("parse sanitized oracle defaults");
+        assert_eq!(fixture["schema_version"], 1);
+
+        let profile = Profile::default();
+        assert_eq!(
+            profile.endpoint.ipv4.to_string(),
+            fixture["endpoint_v4"].as_str().expect("endpoint_v4")
+        );
+        assert_eq!(
+            profile.endpoint.ipv6.to_string(),
+            fixture["endpoint_v6"].as_str().expect("endpoint_v6")
+        );
+        assert_eq!(
+            u64::from(profile.endpoint.port),
+            fixture["endpoint_port"].as_u64().expect("endpoint_port")
+        );
+        assert_eq!(profile.endpoint.sni, fixture["sni"].as_str().expect("sni"));
+        assert_eq!(
+            u64::from(profile.mtu),
+            fixture["mtu"].as_u64().expect("mtu")
+        );
+        assert_eq!(
+            profile
+                .dns_servers
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            fixture["fallback_dns"]
+                .as_array()
+                .expect("fallback_dns")
+                .iter()
+                .map(|value| value.as_str().expect("DNS string").to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            profile
+                .proxy
+                .socks5_listeners
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            fixture["socks5_listeners"]
+                .as_array()
+                .expect("socks5_listeners")
+                .iter()
+                .map(|value| value.as_str().expect("SOCKS5 listener").to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            profile
+                .proxy
+                .http_listeners
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            fixture["http_listeners"]
+                .as_array()
+                .expect("http_listeners")
+                .iter()
+                .map(|value| value.as_str().expect("HTTP listener").to_owned())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(profile.mode, OperatingMode::Vpn);
+        assert_eq!(profile.frontends, FrontendSettings::platform_default());
+        assert_eq!(profile.transport, TransportPolicy::Auto);
+        assert!(profile.kill_switch);
+        assert!(!profile.proxy.system_proxy);
+        assert_eq!(profile.proxy.dns_servers, profile.dns_servers);
+        assert!(!profile.proxy.exposes_lan(OperatingMode::Socks5));
+    }
+
+    #[test]
+    fn canonicalize_mode_follows_frontends() {
+        let mut profile = Profile::default();
+        assert_eq!(profile.mode, OperatingMode::Vpn);
+        assert!(profile.frontends.tunnel);
+        profile.frontends.tunnel = false;
+        profile.canonicalize_mode();
+        assert_eq!(profile.mode, OperatingMode::Socks5);
+        profile.frontends.socks5 = false;
+        profile.canonicalize_mode();
+        assert_eq!(profile.mode, OperatingMode::HttpProxy);
+    }
+
+    #[test]
+    fn platform_frontend_defaults_enable_all_outputs() {
+        assert_eq!(
+            FrontendSettings::windows_default(),
+            FrontendSettings {
+                tunnel: true,
+                socks5: true,
+                http: true,
+            }
+        );
+        assert_eq!(
+            FrontendSettings::android_default(),
+            FrontendSettings {
+                tunnel: true,
+                socks5: true,
+                http: true,
+            }
+        );
+    }
+
+    #[test]
+    fn exposed_proxy_is_reported_without_adding_auth() {
+        let proxy = ProxySettings {
+            socks5_listeners: vec!["0.0.0.0:1080".parse().unwrap()],
+            ..ProxySettings::default()
+        };
+        assert!(proxy.exposes_lan(OperatingMode::Socks5));
+        assert!(proxy.validate().is_ok());
+        assert!(proxy.listener_credentials().unwrap().is_none());
+    }
+
+    #[test]
+    fn proxy_username_is_validated_and_password_stays_off_the_struct_contract() {
+        let mut proxy = ProxySettings {
+            auth_username: Some("user:name".to_owned()),
+            ..ProxySettings::default()
+        };
+        assert_eq!(proxy.validate(), Err(ConfigError::InvalidProxyAuthUsername));
+        proxy.auth_username = Some("\0user".to_owned());
+        assert_eq!(proxy.validate(), Err(ConfigError::InvalidProxyAuthUsername));
+        proxy.auth_username = Some("a".repeat(256));
+        assert_eq!(proxy.validate(), Err(ConfigError::InvalidProxyAuthUsername));
+        proxy.auth_username = Some("lan-user".to_owned());
+        assert_eq!(proxy.validate(), Ok(()));
+        assert_eq!(
+            proxy.listener_credentials(),
+            Err(ConfigError::ProxyAuthRequiresPassword)
+        );
+
+        let credentials = ProxyAuthCredentials::parse("lan-user", b"s3cret").unwrap();
+        assert!(credentials.matches(b"lan-user", b"s3cret"));
+        assert!(!credentials.matches(b"lan-user", b"wrong"));
+        assert!(!credentials.matches(b"other", b"s3cret"));
+        assert!(format!("{credentials:?}").contains("[REDACTED]"));
+        assert!(!format!("{credentials:?}").contains("s3cret"));
+        assert_eq!(
+            ProxyAuthCredentials::parse("", b"s3cret"),
+            Err(ConfigError::InvalidProxyAuthUsername)
+        );
+        assert_eq!(
+            ProxyAuthCredentials::parse("lan-user", b""),
+            Err(ConfigError::InvalidProxyAuthPassword)
+        );
+        let (user, pass) =
+            ProxyAuthCredentials::decode_http_basic("Basic bGFuLXVzZXI6czNjcmV0").unwrap();
+        assert_eq!(user, b"lan-user");
+        assert_eq!(pass, b"s3cret");
+    }
+
+    #[test]
+    fn udp_idle_timeout_is_bounded() {
+        let mut proxy = ProxySettings {
+            udp_idle_timeout_seconds: 0,
+            ..ProxySettings::default()
+        };
+        assert_eq!(proxy.validate(), Err(ConfigError::InvalidUdpIdleTimeout(0)));
+        proxy.udp_idle_timeout_seconds = 3_601;
+        assert_eq!(
+            proxy.validate(),
+            Err(ConfigError::InvalidUdpIdleTimeout(3_601))
+        );
+    }
+
+    #[test]
+    fn active_profile_must_exist() {
+        let config = AppConfig {
+            active_profile_id: Some(Uuid::nil()),
+            ..AppConfig::default()
+        };
+        assert!(matches!(
+            config.validate(),
+            Err(ConfigError::MissingActiveProfile(_))
+        ));
+    }
+
+    #[test]
+    fn configuration_collections_are_bounded_and_unique() {
+        let mut profile = Profile::default();
+        profile.dns_servers.push(DEFAULT_DNS_V4.into());
+        assert_eq!(profile.validate(), Err(ConfigError::DuplicateDnsServer));
+
+        profile.dns_servers = default_dns_servers();
+        profile.proxy.dns_servers.push(DEFAULT_DNS_V4.into());
+        assert_eq!(profile.validate(), Err(ConfigError::DuplicateDnsServer));
+
+        let empty = AppConfig {
+            active_profile_id: None,
+            profiles: Vec::new(),
+            ..AppConfig::default()
+        };
+        assert_eq!(empty.validate(), Err(ConfigError::NoProfiles));
+    }
+
+    #[test]
+    fn vpn_dns_cannot_escape_through_system_or_bypass_routes() {
+        let mut profile = Profile {
+            dns_mode: DnsMode::System,
+            frontends: FrontendSettings {
+                tunnel: true,
+                socks5: false,
+                http: false,
+            },
+            proxy: ProxySettings {
+                system_proxy: false,
+                ..ProxySettings::default()
+            },
+            ..Profile::default()
+        };
+        assert_eq!(profile.validate(), Err(ConfigError::VpnSystemDnsForbidden));
+
+        profile.dns_mode = DnsMode::Tunnel;
+        profile.dns_servers = vec!["127.0.0.1".parse().unwrap()];
+        assert_eq!(
+            profile.validate(),
+            Err(ConfigError::InvalidVpnDnsServer(
+                "127.0.0.1".parse().unwrap()
+            ))
+        );
+
+        // Endpoint-only policies do not disable the opposite family inside
+        // CONNECT-IP, so an IPv6 tunnel DNS server remains valid over an
+        // IPv4-only MASQUE ingress.
+        profile.ip_policy = IpPolicy::Ipv4Only;
+        profile.dns_servers = vec!["2606:4700:4700::1111".parse().unwrap()];
+        assert_eq!(profile.validate(), Ok(()));
+
+        profile.dns_servers = vec!["1.1.1.1".parse().unwrap()];
+        profile.split_exclusions = vec!["1.1.1.0/24".parse().unwrap()];
+        assert_eq!(
+            profile.validate(),
+            Err(ConfigError::VpnDnsServerBypassed(
+                "1.1.1.1".parse().unwrap()
+            ))
+        );
+
+        profile.split_exclusions.clear();
+        profile.dns_servers = vec![IpAddr::V4(profile.endpoint.ipv4)];
+        assert_eq!(profile.validate(), Ok(()));
+        profile.endpoint.selection = EndpointSelection::Custom;
+        assert_eq!(
+            profile.validate(),
+            Err(ConfigError::VpnDnsServerBypassed(IpAddr::V4(
+                profile.endpoint.ipv4
+            )))
+        );
+
+        profile.dns_servers = vec!["192.168.1.1".parse().unwrap()];
+        profile.allow_lan = true;
+        assert_eq!(
+            profile.validate(),
+            Err(ConfigError::VpnDnsServerBypassed(
+                "192.168.1.1".parse().unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn locally_configured_vpn_dns_is_still_routed_through_the_tunnel() {
+        let profile = Profile {
+            dns_mode: DnsMode::LocalConfigured,
+            dns_servers: vec!["9.9.9.9".parse().unwrap(), "2620:fe::fe".parse().unwrap()],
+            frontends: FrontendSettings {
+                tunnel: true,
+                socks5: false,
+                http: false,
+            },
+            proxy: ProxySettings {
+                system_proxy: false,
+                ..ProxySettings::default()
+            },
+            ..Profile::default()
+        };
+        assert!(profile.validate().is_ok());
+    }
+
+    #[test]
+    fn pending_identity_deletions_cannot_reference_live_profiles() {
+        let mut config = AppConfig::default();
+        let active = config.active_profile_id.unwrap();
+        config.pending_identity_deletions.push(active);
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::PendingIdentityStillReferenced(active))
+        );
+    }
+
+    #[test]
+    fn pending_identity_creations_are_unreferenced_and_unique() {
+        let mut config = AppConfig::default();
+        let active = config.active_profile_id.unwrap();
+        config.pending_identity_creations.push(active);
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::PendingIdentityCreationAlreadyReferenced(
+                active
+            ))
+        );
+
+        let mut config = AppConfig::default();
+        let pending = Uuid::new_v4();
+        config.pending_identity_creations = vec![pending, pending];
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::DuplicatePendingIdentityCreation(pending))
+        );
+    }
+
+    #[test]
+    fn identity_bindings_are_bounded_valid_and_reference_live_profiles() {
+        let mut config = AppConfig::default();
+        let missing = Uuid::new_v4();
+        config
+            .identity_bindings
+            .insert(missing, IdentityProvider::Consumer);
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::IdentityBindingWithoutProfile(missing))
+        );
+
+        let mut config = AppConfig::default();
+        let active = config.active_profile_id.unwrap();
+        config.identity_bindings.insert(
+            active,
+            IdentityProvider::ZeroTrust {
+                organization: "Invalid.Team".to_owned(),
+            },
+        );
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::InvalidIdentityBinding(active))
+        );
+    }
+
+    #[test]
+    fn new_account_inherits_shared_network_and_ignores_incoming_copy() {
+        let mut config = AppConfig::default();
+        let extra = Profile {
+            id: Uuid::new_v4(),
+            name: "Work".to_owned(),
+            mtu: 1400,
+            endpoint: EndpointSettings {
+                sni: "ignored.example.com".to_owned(),
+                ..EndpointSettings::default()
+            },
+            ..Profile::default()
+        };
+        let extra = config.upsert_runtime_profile(extra).unwrap();
+        assert_eq!(extra.mtu, DEFAULT_MTU);
+        assert_eq!(extra.endpoint.sni, DEFAULT_SNI);
+
+        let mut edited = config.active_profile().unwrap();
+        edited.mtu = 1400;
+        edited.auto_connect = true;
+        config.upsert_runtime_profile(edited).unwrap();
+
+        assert_eq!(config.network.mtu, 1400);
+        assert!(
+            config
+                .runtime_profiles()
+                .iter()
+                .all(|profile| profile.mtu == 1400 && profile.auto_connect)
+        );
+    }
+
+    #[test]
+    fn zero_trust_account_keeps_registered_ips_and_updates_shared_port_and_sni() {
+        let mut config = AppConfig::default();
+        let work_id = Uuid::new_v4();
+        let managed = ManagedEndpointIps {
+            ipv4: Ipv4Addr::new(162, 159, 197, 8),
+            ipv6: Ipv6Addr::new(0x2606, 0x4700, 0x0102, 0, 0, 0, 0, 8),
+        };
+        config.identity_bindings.insert(
+            work_id,
+            IdentityProvider::ZeroTrust {
+                organization: "example-team".to_owned(),
+            },
+        );
+        let work = config
+            .insert_account(work_id, "Work".to_owned(), Some(managed.clone()))
+            .unwrap();
+        assert_eq!(work.endpoint.ipv4, managed.ipv4);
+        assert_eq!(work.endpoint.ipv6, managed.ipv6);
+        assert_eq!(work.endpoint.port, DEFAULT_PORT);
+        assert_eq!(work.endpoint.sni, DEFAULT_SNI);
+
+        let mut work = config.runtime_profile(work_id).unwrap();
+        work.endpoint.ipv4 = Ipv4Addr::new(192, 0, 2, 1);
+        work.endpoint.ipv6 = Ipv6Addr::LOCALHOST;
+        work.endpoint.port = 8443;
+        work.endpoint.sni = "example.com".to_owned();
+        config.upsert_runtime_profile(work).unwrap();
+
+        let work = config.runtime_profile(work_id).unwrap();
+        let home = config.active_profile().unwrap();
+        assert_eq!(work.endpoint.ipv4, managed.ipv4);
+        assert_eq!(work.endpoint.ipv6, managed.ipv6);
+        assert_eq!(home.endpoint.ipv4, DEFAULT_ENDPOINT_V4);
+        assert_eq!(home.endpoint.ipv6, DEFAULT_ENDPOINT_V6);
+        assert_eq!(work.endpoint.port, 8443);
+        assert_eq!(home.endpoint.port, 8443);
+        assert_eq!(work.endpoint.sni, "example.com");
+        assert_eq!(home.endpoint.sni, "example.com");
+        assert_eq!(config.network.endpoint.sni, "example.com");
+    }
+
+    #[test]
+    fn bound_zero_trust_edits_cannot_supply_registration_ips() {
+        let mut config = AppConfig::default();
+        let id = config.active_profile_id.unwrap();
+        config.identity_bindings.insert(
+            id,
+            IdentityProvider::ZeroTrust {
+                organization: "example-team".to_owned(),
+            },
+        );
+        let mut registered = config.active_profile().unwrap();
+        registered.endpoint = EndpointSettings {
+            ipv4: Ipv4Addr::new(162, 159, 197, 2),
+            ipv6: Ipv6Addr::new(0x2606, 0x4700, 0x0102, 0, 0, 0, 0, 2),
+            port: 8443,
+            sni: "shared.example.com".to_owned(),
+            selection: crate::EndpointSelection::Custom,
+        };
+        let stored = config.upsert_runtime_profile(registered).unwrap();
+        assert_eq!(stored.endpoint.ipv4, DEFAULT_ENDPOINT_V4);
+        assert_eq!(stored.endpoint.ipv6, DEFAULT_ENDPOINT_V6);
+        assert_eq!(stored.endpoint.port, 8443);
+        assert_eq!(stored.endpoint.sni, "shared.example.com");
+
+        let managed = ManagedEndpointIps {
+            ipv4: Ipv4Addr::new(162, 159, 197, 2),
+            ipv6: Ipv6Addr::new(0x2606, 0x4700, 0x0102, 0, 0, 0, 0, 2),
+        };
+        let stored = config
+            .set_managed_endpoint_ips(id, managed.clone())
+            .unwrap();
+        assert_eq!(stored.endpoint.ipv4, managed.ipv4);
+        assert_eq!(stored.endpoint.ipv6, managed.ipv6);
+        assert_eq!(stored.endpoint.port, 8443);
+        assert_eq!(stored.endpoint.sni, "shared.example.com");
+    }
+
+    #[test]
+    fn endpoint_values_do_not_classify_an_account_as_zero_trust() {
+        let mut config = AppConfig::default();
+        let id = config.active_profile_id.unwrap();
+        assert!(!config.is_zero_trust_account(id));
+        let mut registered = config.active_profile().unwrap();
+        registered.endpoint = EndpointSettings {
+            ipv4: Ipv4Addr::new(162, 159, 197, 2),
+            ipv6: Ipv6Addr::new(0x2606, 0x4700, 0x0102, 0, 0, 0, 0, 2),
+            port: 443,
+            sni: "zt-masque.cloudflareclient.com".to_owned(),
+            selection: crate::EndpointSelection::Custom,
+        };
+        let stored = config.upsert_runtime_profile(registered).unwrap();
+
+        assert!(stored.endpoint.is_zero_trust_managed());
+        assert_eq!(config.network.endpoint, stored.endpoint);
+        assert!(!config.is_zero_trust_account(id));
+    }
+
+    #[test]
+    fn from_profile_accepts_any_valid_shared_endpoint() {
+        let profile = Profile {
+            endpoint: EndpointSettings {
+                ipv4: Ipv4Addr::new(162, 159, 197, 2),
+                ipv6: Ipv6Addr::new(0x2606, 0x4700, 0x0102, 0, 0, 0, 0, 2),
+                port: 443,
+                sni: "zt-masque.cloudflareclient.com".to_owned(),
+                selection: crate::EndpointSelection::Custom,
+            },
+            mtu: 1400,
+            ..Profile::default()
+        };
+        let network = SharedNetworkSettings::from_profile(&profile);
+        assert_eq!(network.endpoint, profile.endpoint);
+        assert_eq!(network.mtu, 1400);
+    }
+
+    #[test]
+    fn geo_direct_countries_are_unique_bounded_and_iso_alpha2() {
+        let mut profile = Profile {
+            geo_direct_countries: vec!["C".to_owned()],
+            ..Profile::default()
+        };
+        assert_eq!(
+            profile.validate(),
+            Err(ConfigError::InvalidGeoDirectCountry("C".to_owned()))
+        );
+
+        profile.geo_direct_countries = vec!["CN".to_owned(), "cn".to_owned()];
+        assert_eq!(
+            profile.validate(),
+            Err(ConfigError::DuplicateGeoDirectCountry)
+        );
+
+        profile.geo_direct_countries = (0..33)
+            .map(|index| {
+                format!(
+                    "{}{}",
+                    (b'A' + (index / 26) as u8) as char,
+                    (b'A' + (index % 26) as u8) as char
+                )
+            })
+            .collect();
+        assert_eq!(
+            profile.validate(),
+            Err(ConfigError::TooManyGeoDirectCountries(33))
+        );
+
+        profile.geo_direct_countries = vec!["cn".to_owned(), "US".to_owned()];
+        assert!(profile.validate().is_ok());
+        profile.canonicalize_geo_direct().unwrap();
+        assert_eq!(
+            profile.geo_direct_countries,
+            vec!["CN".to_owned(), "US".to_owned()]
+        );
+    }
+
+    #[test]
+    fn reset_network_defaults_clears_geo_direct_countries() {
+        let mut profile = Profile {
+            geo_direct_countries: vec!["CN".to_owned()],
+            ..Profile::default()
+        };
+        profile.reset_network_defaults();
+        assert!(profile.geo_direct_countries.is_empty());
+    }
+
+    #[test]
+    fn direct_dns_defaults_preserve_physical_system_behavior() {
+        let profile = Profile::default();
+        assert_eq!(profile.direct_dns, DirectDnsSettings::default());
+        assert_eq!(profile.direct_dns.validate(), Ok(()));
+    }
+
+    #[test]
+    fn direct_dns_canonicalization_applies_protocol_defaults() {
+        let mut doh = DirectDnsSettings {
+            mode: DirectDnsMode::Doh,
+            server_name: "DNS.Example.COM".to_owned(),
+            bootstrap_ips: vec!["192.0.2.53".parse().unwrap()],
+            ..DirectDnsSettings::default()
+        };
+        doh.canonicalize();
+        assert_eq!(doh.server_name, "dns.example.com");
+        assert_eq!(doh.doh_path, "/dns-query");
+        assert_eq!(doh.port, 443);
+        assert_eq!(doh.validate(), Ok(()));
+
+        let mut dot = DirectDnsSettings {
+            mode: DirectDnsMode::Dot,
+            server_name: "dns.example.com".to_owned(),
+            bootstrap_ips: vec!["2001:db8::53".parse().unwrap()],
+            ..DirectDnsSettings::default()
+        };
+        dot.canonicalize();
+        assert_eq!(dot.port, 853);
+        assert_eq!(dot.validate(), Ok(()));
+    }
+
+    #[test]
+    fn encrypted_dns_configuration_is_canonical_bounded_and_never_trims_bad_names() {
+        let mut settings = DirectDnsSettings {
+            mode: DirectDnsMode::Doh,
+            server_name: "bücher.example".to_owned(),
+            bootstrap_ips: vec!["10.0.0.53".parse().unwrap()],
+            ..DirectDnsSettings::default()
+        };
+        settings.canonicalize();
+        assert_eq!(settings.server_name, "xn--bcher-kva.example");
+        assert!(settings.validate().is_ok());
+        for name in [
+            "dns.example ",
+            " dns.example",
+            "dns..example",
+            "*.example",
+            "dns.example\r\n",
+            "dns.example/path",
+            "user@dns.example",
+            "dns.example?x",
+            "192.0.2.53",
+        ] {
+            settings.server_name = name.to_owned();
+            settings.canonicalize();
+            assert_eq!(
+                settings.validate(),
+                Err(ConfigError::InvalidDirectDnsServerName),
+                "{name:?}"
+            );
+        }
+        settings.server_name = "dns.example".to_owned();
+        for path in [
+            "https://dns.example/dns-query",
+            "//other/dns-query",
+            "/dns-query?x=1",
+            "/dns-query#x",
+            "/dns\r\nquery",
+            "/dns\\query",
+        ] {
+            settings.doh_path = path.to_owned();
+            assert_eq!(
+                settings.validate(),
+                Err(ConfigError::InvalidDirectDnsDohPath)
+            );
+        }
+        settings.doh_path = format!("/{}", "a".repeat(255));
+        assert!(settings.validate().is_ok());
+        settings.doh_path.push('a');
+        assert_eq!(
+            settings.validate(),
+            Err(ConfigError::InvalidDirectDnsDohPath)
+        );
+        settings.doh_path = "/dns-query".to_owned();
+        for address in [
+            "0.0.0.0",
+            "255.255.255.255",
+            "224.0.0.1",
+            "::",
+            "ff02::1",
+            "fe80::53",
+        ] {
+            settings.bootstrap_ips = vec![address.parse().unwrap()];
+            assert_eq!(
+                settings.validate(),
+                Err(ConfigError::InvalidDirectDnsBootstrapIp)
+            );
+        }
+        settings.bootstrap_ips = vec!["10.0.0.53".parse().unwrap(); 2];
+        assert_eq!(
+            settings.validate(),
+            Err(ConfigError::DuplicateDirectDnsBootstrapIp)
+        );
+        settings.mode = DirectDnsMode::PhysicalSystem;
+        settings.canonicalize();
+        assert_eq!(
+            serde_json::to_value(settings).unwrap(),
+            serde_json::json!({"mode": "physical_system"})
+        );
+    }
+
+    #[test]
+    fn invalid_direct_dns_settings_have_stable_codes() {
+        let mut dot = DirectDnsSettings {
+            mode: DirectDnsMode::Dot,
+            server_name: "dns.example.com".to_owned(),
+            doh_path: "/dns-query".to_owned(),
+            bootstrap_ips: vec!["192.0.2.53".parse().unwrap()],
+            port: 853,
+        };
+        let error = dot.validate().unwrap_err();
+        assert_eq!(error, ConfigError::DirectDnsDotPathForbidden);
+        assert_eq!(error.stable_code(), Some("DIRECT_DNS_DOT_PATH_FORBIDDEN"));
+
+        dot.mode = DirectDnsMode::PhysicalSystem;
+        let error = dot.validate().unwrap_err();
+        assert_eq!(error, ConfigError::NonCanonicalPhysicalDirectDns);
+        dot.canonicalize();
+        assert_eq!(dot, DirectDnsSettings::default());
+    }
+}

@@ -1,0 +1,219 @@
+use std::sync::Arc;
+
+use usque_core::Profile;
+
+use crate::NetworkQualitySnapshot;
+use crate::data_plane::DataPlaneRuntime;
+use crate::geo_direct::GeoDirectPolicy;
+use crate::h2::{MasqueTlsIdentity, TransportError};
+use crate::netstack::{ProxyPerformanceSnapshot, RuntimeHealth, RuntimePath, TrafficSnapshot};
+use crate::pin_refresh::EndpointPinRefresher;
+use crate::socket::{SocketProtector, noop_socket_protector};
+use crate::telemetry::ConnectionTimelineSnapshot;
+
+/// One reconnecting MASQUE channel with zero, one, or both local proxy
+/// frontends attached to the same userspace packet stack.
+///
+/// Listener sockets are reserved before the remote session is opened. This
+/// keeps startup atomic and prevents SOCKS5 and HTTP from accidentally opening
+/// separate MASQUE channels for the same active Profile.
+pub struct ProxyRuntime {
+    runtime: Option<DataPlaneRuntime>,
+}
+
+impl ProxyRuntime {
+    pub fn update_traffic_policy(&mut self, disable_quic: bool) {
+        self.inner_mut().update_traffic_policy(disable_quic);
+    }
+    pub fn quiesce_final(&mut self) {
+        self.inner_mut().quiesce_final();
+    }
+    pub async fn fail_gate(&mut self, reason: usque_core::vpngate::GateFailure) {
+        self.inner_mut().fail_gate(reason).await;
+    }
+    pub async fn replace_gate(
+        &mut self,
+        profile: &Profile,
+        selected: Option<(
+            usque_core::vpngate::ServerSummary,
+            usque_core::vpngate::PreparedProfile,
+        )>,
+        policy: Arc<GeoDirectPolicy>,
+        status: tokio::sync::watch::Sender<usque_core::vpngate::GateStatus>,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), TransportError> {
+        self.inner_mut()
+            .replace_gate(profile, selected, policy, status, cancellation)
+            .await?;
+        if cancellation.is_cancelled() {
+            self.quiesce_final();
+            return Err(TransportError::TunnelClosed);
+        }
+        self.activate_final().await
+    }
+    pub async fn activate_final(&mut self) -> Result<(), TransportError> {
+        self.inner_mut().activate_final().await
+    }
+    pub fn internal_network(&self) -> crate::InternalNetwork {
+        self.inner().internal_network()
+    }
+    pub fn warp_internal_network(&self) -> crate::InternalNetwork {
+        self.inner().warp_internal_network()
+    }
+    pub fn gate_status(&self) -> usque_core::vpngate::GateStatus {
+        self.inner().gate_status()
+    }
+    fn inner(&self) -> &DataPlaneRuntime {
+        self.runtime.as_ref().expect("proxy MASQUE runtime")
+    }
+
+    fn inner_mut(&mut self) -> &mut DataPlaneRuntime {
+        self.runtime.as_mut().expect("proxy MASQUE runtime")
+    }
+
+    pub async fn start(
+        profile: &Profile,
+        identity: MasqueTlsIdentity,
+    ) -> Result<Self, TransportError> {
+        Self::start_with_protector(profile, identity, noop_socket_protector()).await
+    }
+
+    pub async fn start_with_protector(
+        profile: &Profile,
+        identity: MasqueTlsIdentity,
+        protector: Arc<dyn SocketProtector>,
+    ) -> Result<Self, TransportError> {
+        Self::start_with_refresh(profile, identity, protector, None).await
+    }
+
+    pub async fn start_with_refresh(
+        profile: &Profile,
+        identity: MasqueTlsIdentity,
+        protector: Arc<dyn SocketProtector>,
+        pin_refresher: Option<Arc<dyn EndpointPinRefresher>>,
+    ) -> Result<Self, TransportError> {
+        Self::start_with_geo_policy(
+            profile,
+            identity,
+            protector,
+            pin_refresher,
+            GeoDirectPolicy::disabled(),
+        )
+        .await
+    }
+
+    /// Starts proxy frontends with an immutable GEO direct-routing policy.
+    ///
+    /// A disabled or incomplete policy always falls back to the MASQUE path.
+    pub async fn start_with_geo_policy(
+        profile: &Profile,
+        identity: MasqueTlsIdentity,
+        protector: Arc<dyn SocketProtector>,
+        pin_refresher: Option<Arc<dyn EndpointPinRefresher>>,
+        geo_policy: GeoDirectPolicy,
+    ) -> Result<Self, TransportError> {
+        Ok(Self {
+            runtime: Some(
+                DataPlaneRuntime::start_with_geo_policy(
+                    profile,
+                    identity,
+                    protector,
+                    pin_refresher,
+                    Arc::new(geo_policy),
+                )
+                .await?,
+            ),
+        })
+    }
+
+    pub fn path(&self) -> RuntimePath {
+        self.inner().path()
+    }
+
+    pub fn l4_snapshot(&self) -> Option<usque_core::L4Snapshot> {
+        self.inner().l4_snapshot()
+    }
+
+    pub fn listeners(&self) -> &[std::net::SocketAddr] {
+        self.inner().listeners()
+    }
+
+    pub fn socks5_listeners(&self) -> &[std::net::SocketAddr] {
+        self.inner().socks5_listeners()
+    }
+
+    pub fn http_listeners(&self) -> &[std::net::SocketAddr] {
+        self.inner().http_listeners()
+    }
+
+    pub fn health(&self) -> RuntimeHealth {
+        self.inner().health()
+    }
+
+    pub fn statistics(&self) -> TrafficSnapshot {
+        self.inner().statistics()
+    }
+
+    pub fn connection_timeline(&self) -> ConnectionTimelineSnapshot {
+        self.inner().connection_timeline()
+    }
+
+    pub fn network_quality(&self) -> NetworkQualitySnapshot {
+        self.inner().network_quality()
+    }
+
+    pub fn diagnostic_dns_context(
+        &self,
+    ) -> (
+        Arc<dyn SocketProtector>,
+        tokio_util::sync::CancellationToken,
+    ) {
+        self.inner().diagnostic_dns_context()
+    }
+
+    pub fn subscribe_network_quality(
+        &self,
+    ) -> tokio::sync::watch::Receiver<NetworkQualitySnapshot> {
+        self.inner().subscribe_network_quality()
+    }
+
+    pub fn performance(&self) -> ProxyPerformanceSnapshot {
+        self.inner().performance()
+    }
+
+    pub fn failure(&self) -> Option<String> {
+        self.inner().failure()
+    }
+
+    pub async fn reconfigure_frontends(&mut self, profile: &Profile) -> Result<(), TransportError> {
+        self.inner_mut().reconfigure_frontends(profile).await
+    }
+
+    pub fn into_data_plane(mut self) -> DataPlaneRuntime {
+        self.runtime.take().expect("proxy MASQUE runtime")
+    }
+
+    pub fn from_data_plane(runtime: DataPlaneRuntime) -> Self {
+        Self {
+            runtime: Some(runtime),
+        }
+    }
+
+    pub fn cancel_immediately(&mut self) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.cancel_immediately();
+        }
+    }
+
+    pub async fn shutdown(&mut self) {
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.shutdown().await;
+        }
+    }
+}
+
+impl Drop for ProxyRuntime {
+    fn drop(&mut self) {
+        self.cancel_immediately();
+    }
+}

@@ -1,0 +1,276 @@
+import 'dart:async';
+import 'dart:math';
+
+import 'package:flutter/foundation.dart';
+
+import '../models/app_models.dart';
+import '../services/engine_client.dart';
+
+/// Owns the submission order and confirmed settings, never a page's draft.
+class NetworkSettingsController extends ChangeNotifier {
+  NetworkSettingsController(this._engine);
+  final EngineClient _engine;
+  Future<void> _tail = Future.value();
+  final Set<String> _retiredEpochs = {};
+  NetworkSettingsState? state;
+  String? saveError;
+  // Only an ordinal is retained; backend target text never reaches diagnostics.
+  int? invalidBypassDomainEntry;
+  bool _queryUnconfirmed = false;
+  final Map<String, _SaveAttempt> _saveAttempts = {};
+  int _observationRevision = 0;
+  bool supported = false;
+  bool _disposed = false;
+  bool _resetting = false;
+  int _dataGeneration = 0;
+
+  Future<void> get flushed => _tail;
+  bool get unconfirmed =>
+      _queryUnconfirmed ||
+      _saveAttempts.values.any((attempt) => attempt.unconfirmed);
+
+  Future<T> enqueue<T>(Future<T> Function() operation) {
+    final result = Completer<T>();
+    _tail = _tail.then((_) async {
+      try {
+        result.complete(await operation());
+      } on Object catch (error, stack) {
+        result.completeError(error, stack);
+      }
+    });
+    return result.future;
+  }
+
+  void accept(NetworkSettingsState incoming) {
+    if (_resetting || _disposed) return;
+    if (_retiredEpochs.contains(incoming.sourceEpoch)) return;
+    final previous = state;
+    if (previous != null) {
+      if (previous.sourceEpoch == incoming.sourceEpoch &&
+          incoming.sequence < previous.sequence) {
+        return;
+      }
+      // A successful query may return the unchanged snapshot. It confirms
+      // communication without allowing duplicate contents to replace state.
+      if (previous.sourceEpoch == incoming.sourceEpoch &&
+          incoming.sequence == previous.sequence) {
+        incoming = previous;
+      }
+      if (previous.sourceEpoch != incoming.sourceEpoch) {
+        _retiredEpochs.add(previous.sourceEpoch);
+      }
+    }
+    final changed = !identical(state, incoming);
+    final wasUnconfirmed = unconfirmed;
+    state = incoming;
+    _observationRevision++;
+    _queryUnconfirmed = false;
+    _confirmPendingSave();
+    if (changed || wasUnconfirmed != unconfirmed) _notify();
+  }
+
+  void _confirmPendingSave() {
+    final confirmed = state;
+    if (confirmed != null && confirmed.persisted == true) {
+      final attempt = _saveAttempts.remove(confirmed.operationId);
+      // The in-flight save keeps this record even after a newer snapshot
+      // replaces the acknowledgement and before its own reply arrives.
+      if (attempt != null) attempt.acknowledged = true;
+    }
+  }
+
+  Future<void> refresh() async {
+    if (!supported || _resetting) return;
+    final generation = _dataGeneration;
+    final revision = _observationRevision;
+    try {
+      final incoming = await _engine.getNetworkSettingsState();
+      if (generation == _dataGeneration) accept(incoming);
+    } on Object {
+      // An older query failure must not invalidate a newer authoritative reply.
+      if (generation == _dataGeneration && revision == _observationRevision) {
+        _queryUnconfirmed = true;
+        _notify();
+      }
+    }
+  }
+
+  Future<bool> save(UsqueProfile values, List<String> fields) {
+    final generation = _dataGeneration;
+    final requestedFields = List<String>.of(fields);
+    return enqueue(() async {
+      if (_resetting || generation != _dataGeneration) return false;
+      if (!supported) {
+        try {
+          supported =
+              (await _engine.getCapabilities())?.networkSettingsApplication ??
+              false;
+        } on Object {
+          supported = false;
+        }
+      }
+      if (_resetting || generation != _dataGeneration) return false;
+      if (!supported) {
+        saveError = 'NETWORK_SETTINGS_UNSUPPORTED';
+        _notify();
+        return false;
+      }
+      final operationId = _operationId();
+      final attempt = _SaveAttempt();
+      _saveAttempts[operationId] = attempt;
+      saveError = null;
+      invalidBypassDomainEntry = null;
+      _notify();
+      try {
+        // Earlier queued saves may have changed the DNS mode or exit. Rebase
+        // these dependencies immediately before sending the field-scoped edit.
+        final prepared = _prepareExitDns(
+          values,
+          requestedFields,
+          state?.sharedNetwork ?? state?.storedProfile,
+        );
+        final result = await _engine.saveNetworkSettings(
+          operationId,
+          values.id,
+          prepared.values,
+          prepared.fields,
+        );
+        if (_resetting || generation != _dataGeneration) return false;
+        accept(result);
+        attempt.unconfirmed = !attempt.acknowledged;
+        return attempt.acknowledged;
+      } on Object catch (error) {
+        if (_resetting || generation != _dataGeneration) return false;
+        if (attempt.acknowledged) return true;
+        final definitive =
+            error is EngineException &&
+            !error.code.startsWith('ENGINE_') &&
+            error.code != 'NETWORK_SETTINGS_UNCONFIRMED';
+        if (definitive) {
+          _saveAttempts.remove(operationId);
+          saveError = error.code;
+          final invalidDomain = RegExp(
+            r'invalid bypass domain at entry (\d+)',
+          ).firstMatch(error.message);
+          invalidBypassDomainEntry = invalidDomain == null
+              ? null
+              : int.tryParse(invalidDomain.group(1)!);
+        } else {
+          attempt.unconfirmed = true;
+          // A mutation is never replayed after an ambiguous reply.
+          try {
+            final incoming = await _engine.getNetworkSettingsState();
+            if (generation == _dataGeneration) accept(incoming);
+          } on Object {
+            /* Retain unknown state and the page's draft. */
+          }
+        }
+        return attempt.acknowledged;
+      } finally {
+        _notify();
+      }
+    });
+  }
+
+  void suspendForReset() {
+    _dataGeneration++;
+    _resetting = true;
+    _observationRevision++;
+    _saveAttempts.clear();
+    _queryUnconfirmed = true;
+  }
+
+  void resumeAfterReset() {
+    _resetting = false;
+  }
+
+  void reset() {
+    final epoch = state?.sourceEpoch;
+    if (epoch != null) _retiredEpochs.add(epoch);
+    _dataGeneration++;
+    state = null;
+    saveError = null;
+    invalidBypassDomainEntry = null;
+    _saveAttempts.clear();
+    _queryUnconfirmed = false;
+    _resetting = false;
+    _observationRevision++;
+    _notify();
+  }
+
+  void _notify() {
+    if (!_disposed) notifyListeners();
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    super.dispose();
+  }
+}
+
+/// Rebase the exit/DNS dependencies of every field-scoped edit before encoding.
+/// Only exit/mode edits repair an inherited, now unsupported DNS choice.
+({UsqueProfile values, List<String> fields}) _prepareExitDns(
+  UsqueProfile values,
+  List<String> fields,
+  UsqueProfile? confirmed,
+) {
+  final changesExit = fields.any(
+    (field) => const ['chain_exit', 'vpn_gate', 'data_plane'].contains(field),
+  );
+  final changesDns = fields.contains('proxy.dns_mode');
+  final current = confirmed ?? values;
+  final legacyGateEdit =
+      fields.contains('vpn_gate') &&
+      !fields.contains('chain_exit') &&
+      values.chainExit == null;
+  if (legacyGateEdit &&
+      current.chainSource != ChainSource.vpnGate &&
+      current.chainExit?.profileId != null) {
+    // A legacy Gate edit must not erase a retained custom selection. Rust
+    // rejects this combination, including when the old chain is disabled.
+    return (values: values, fields: fields);
+  }
+  final chain = legacyGateEdit
+      ? null
+      : fields.contains('chain_exit')
+      ? values.chainExit
+      : current.chainExit;
+  var target = values.copyWith(
+    dataPlane: fields.contains('data_plane')
+        ? values.dataPlane
+        : current.dataPlane,
+    vpnGate: fields.contains('vpn_gate') ? values.vpnGate : current.vpnGate,
+    chainExit: chain,
+    clearChainExit: chain == null,
+    proxy: values.proxy.copyWith(
+      dnsMode: changesDns ? values.proxy.dnsMode : current.proxy.dnsMode,
+    ),
+  );
+  if (!changesExit ||
+      changesDns ||
+      target.proxy.dnsMode != ProxyDnsMode.edgeResolved ||
+      target.dataPlane == DataPlaneMode.l4Proxy ||
+      target.chainExit?.enabled == true && target.chainSource.isProxy) {
+    return (values: target, fields: fields);
+  }
+  target = target.copyWith(
+    proxy: target.proxy.copyWith(dnsMode: ProxyDnsMode.remote),
+  );
+  return (values: target, fields: [...fields, 'proxy.dns_mode']);
+}
+
+class _SaveAttempt {
+  bool acknowledged = false;
+  bool unconfirmed = false;
+}
+
+String _operationId() {
+  final random = Random.secure();
+  final bytes = List.generate(16, (_) => random.nextInt(256));
+  bytes[6] = (bytes[6] & 15) | 64;
+  bytes[8] = (bytes[8] & 63) | 128;
+  final hex = bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
+  return '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
+}

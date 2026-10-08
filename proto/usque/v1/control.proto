@@ -1,0 +1,1403 @@
+syntax = "proto3";
+
+package usque.v1;
+
+enum OperatingMode {
+  OPERATING_MODE_UNSPECIFIED = 0;
+  OPERATING_MODE_VPN = 1;
+  OPERATING_MODE_SOCKS5 = 2;
+  OPERATING_MODE_HTTP_PROXY = 3;
+}
+
+enum FrontendKind {
+  FRONTEND_KIND_UNSPECIFIED = 0;
+  FRONTEND_KIND_TUNNEL = 1;
+  FRONTEND_KIND_SOCKS5 = 2;
+  FRONTEND_KIND_HTTP = 3;
+  FRONTEND_KIND_SYSTEM_PROXY = 4;
+}
+
+enum FrontendPhase {
+  FRONTEND_PHASE_UNSPECIFIED = 0;
+  FRONTEND_PHASE_DISABLED = 1;
+  FRONTEND_PHASE_PREPARING = 2;
+  FRONTEND_PHASE_ACTIVE = 3;
+  FRONTEND_PHASE_DEGRADED = 4;
+  FRONTEND_PHASE_RECONNECTING = 5;
+  FRONTEND_PHASE_ERROR = 6;
+}
+
+enum TransportPolicy {
+  TRANSPORT_POLICY_UNSPECIFIED = 0;
+  TRANSPORT_POLICY_AUTO = 1;
+  TRANSPORT_POLICY_HTTP3 = 2;
+  TRANSPORT_POLICY_HTTP2 = 3;
+}
+
+enum DataPlaneMode {
+  DATA_PLANE_MODE_UNSPECIFIED = 0;
+  DATA_PLANE_MODE_CONNECT_IP = 1;
+  DATA_PLANE_MODE_L4_PROXY = 2;
+}
+
+enum IpPolicy {
+  IP_POLICY_UNSPECIFIED = 0;
+  IP_POLICY_AUTO = 1;
+  IP_POLICY_PREFER_IPV4 = 2;
+  IP_POLICY_PREFER_IPV6 = 3;
+  IP_POLICY_IPV4_ONLY = 4;
+  IP_POLICY_IPV6_ONLY = 5;
+}
+
+// Client-side HTTP/3 only. BBR names quiche's BBRv2 implementation.
+enum CongestionControlAlgorithm {
+  CONGESTION_CONTROL_ALGORITHM_UNSPECIFIED = 0;
+  CONGESTION_CONTROL_ALGORITHM_CUBIC = 1;
+  CONGESTION_CONTROL_ALGORITHM_RENO = 2;
+  CONGESTION_CONTROL_ALGORITHM_BBR = 3;
+  CONGESTION_CONTROL_ALGORITHM_BBR3 = 4;
+}
+
+enum DnsMode {
+  DNS_MODE_UNSPECIFIED = 0;
+  DNS_MODE_TUNNEL = 1;
+  DNS_MODE_LOCAL_CONFIGURED = 2;
+  DNS_MODE_SYSTEM = 3;
+}
+
+enum ProxyDnsMode {
+  PROXY_DNS_MODE_UNSPECIFIED = 0;
+  PROXY_DNS_MODE_REMOTE = 1;
+  PROXY_DNS_MODE_LOCAL_CONFIGURED = 2;
+  PROXY_DNS_MODE_SYSTEM = 3;
+  PROXY_DNS_MODE_EDGE_RESOLVED = 4;
+}
+
+enum DirectDnsMode {
+  DIRECT_DNS_MODE_UNSPECIFIED = 0;
+  DIRECT_DNS_MODE_PHYSICAL_SYSTEM = 1;
+  DIRECT_DNS_MODE_DOH = 2;
+  DIRECT_DNS_MODE_DOT = 3;
+}
+
+enum IdentityProvisioningMethod {
+  IDENTITY_PROVISIONING_METHOD_UNSPECIFIED = 0;
+  IDENTITY_PROVISIONING_METHOD_REGISTER = 1;
+  IDENTITY_PROVISIONING_METHOD_IMPORT_SECRET = 2;
+  IDENTITY_PROVISIONING_METHOD_REGISTER_WITH_LICENSE = 3;
+  IDENTITY_PROVISIONING_METHOD_REGISTER_ZERO_TRUST = 4;
+}
+
+enum IdentityProvider {
+  IDENTITY_PROVIDER_UNSPECIFIED = 0;
+  IDENTITY_PROVIDER_CONSUMER = 1;
+  IDENTITY_PROVIDER_ZERO_TRUST = 2;
+}
+
+enum LicenseState {
+  LICENSE_STATE_UNSPECIFIED = 0;
+  LICENSE_STATE_FREE = 1;
+  LICENSE_STATE_WARP_PLUS = 2;
+  LICENSE_STATE_UNKNOWN = 3;
+  LICENSE_STATE_CLEANUP_PENDING = 4;
+  LICENSE_STATE_NOT_APPLICABLE = 5;
+}
+
+enum ProfileIdentityState {
+  PROFILE_IDENTITY_STATE_UNSPECIFIED = 0;
+  PROFILE_IDENTITY_STATE_READY = 1;
+  PROFILE_IDENTITY_STATE_MISSING = 2;
+  PROFILE_IDENTITY_STATE_INVALID = 3;
+}
+
+enum ConnectionPhase {
+  CONNECTION_PHASE_UNSPECIFIED = 0;
+  CONNECTION_PHASE_DISCONNECTED = 1;
+  CONNECTION_PHASE_PREPARING = 2;
+  CONNECTION_PHASE_CONNECTING_HTTP3 = 3;
+  CONNECTION_PHASE_CONNECTING_HTTP2 = 4;
+  CONNECTION_PHASE_CONNECTED = 5;
+  CONNECTION_PHASE_DEGRADED = 6;
+  CONNECTION_PHASE_RECONNECTING = 7;
+  CONNECTION_PHASE_DISCONNECTING = 8;
+  // 9 was CONNECTION_PHASE_CAPTIVE_PORTAL_PAUSED (removed).
+  reserved 9;
+  CONNECTION_PHASE_ERROR = 10;
+}
+
+enum KillSwitchState {
+  KILL_SWITCH_STATE_UNSPECIFIED = 0;
+  KILL_SWITCH_STATE_NOT_APPLICABLE = 1;
+  KILL_SWITCH_STATE_INACTIVE = 2;
+  KILL_SWITCH_STATE_ACTIVE = 3;
+  // 4 was KILL_SWITCH_STATE_PAUSED (removed with captive-portal pause).
+  reserved 4;
+  KILL_SWITCH_STATE_ERROR = 5;
+}
+
+enum LockdownState {
+  LOCKDOWN_STATE_UNSPECIFIED = 0;
+  LOCKDOWN_STATE_NOT_SUPPORTED = 1;
+  LOCKDOWN_STATE_DISABLED = 2;
+  LOCKDOWN_STATE_ENABLED = 3;
+  LOCKDOWN_STATE_UNKNOWN = 4;
+}
+
+enum EndpointSelection {
+  ENDPOINT_SELECTION_UNSPECIFIED = 0;
+  ENDPOINT_SELECTION_AUTOMATIC = 1;
+  ENDPOINT_SELECTION_CUSTOM = 2;
+}
+
+message EndpointSettings {
+  string ipv4 = 1;
+  string ipv6 = 2;
+  uint32 port = 3;
+  string sni = 4;
+  EndpointSelection selection = 5;
+}
+
+message ProxySettings {
+  repeated string socks5_listeners = 1;
+  repeated string http_listeners = 2;
+  bool system_proxy = 3;
+  uint32 udp_idle_timeout_seconds = 4;
+  ProxyDnsMode dns_mode = 5;
+  repeated string dns_servers = 6;
+  string auth_username = 7;
+}
+
+message FrontendSettings {
+  bool tunnel = 1;
+  bool socks5 = 2;
+  bool http = 3;
+}
+
+message DirectDnsSettings {
+  DirectDnsMode mode = 1;
+  string server_name = 2;
+  string doh_path = 3;
+  repeated string bootstrap_ips = 4;
+  uint32 port = 5;
+}
+
+message Profile {
+  string id = 1;
+  string name = 2;
+  OperatingMode mode = 3;
+  TransportPolicy transport = 4;
+  EndpointSettings endpoint = 5;
+  IpPolicy ip_policy = 6;
+  uint32 mtu = 7;
+  repeated string dns_servers = 8;
+  bool allow_lan = 9;
+  repeated string split_exclusions = 10;
+  bool kill_switch = 11;
+  bool auto_connect = 12;
+  ProxySettings proxy = 13;
+  DnsMode dns_mode = 14;
+  FrontendSettings frontends = 15;
+  repeated string geo_direct_countries = 16;
+  DirectDnsSettings direct_dns = 17;
+  CongestionControlAlgorithm congestion_control = 18;
+  DataPlaneMode data_plane = 19;
+  VpnGateSettings vpn_gate = 20;
+  bool disable_quic = 21;
+  ChainExitSettings chain_exit = 22;
+  repeated string bypass_domains = 23;
+}
+
+message ChainExitSettings {
+  bool enabled = 1;
+  string source = 2;
+  string profile_id = 3;
+  string revision = 4;
+  optional string endpoint_override_ip = 5;
+  optional uint32 endpoint_override_port = 6;
+}
+
+// Single bounded secret-bearing request. It must never enter logs/diagnostics.
+message ChainProfileRequest {
+  string action = 1;
+  string source = 2;
+  string name = 3;
+  string profile_id = 4;
+  string revision = 5;
+  bytes configuration = 6;
+  string username = 7;
+  string password = 8;
+  string private_key_password = 9;
+  ProxyExitConfiguration proxy = 10;
+}
+
+message ProxyExitConfiguration {
+  string host = 1;
+  uint32 port = 2;
+  string auth_mode = 3;
+  repeated string dns_servers = 4;
+  string dns_transport = 5;
+}
+
+// Metadata-only JSON shared with the Android JNI and Flutter model boundary.
+message ChainProfileResponse {
+  string metadata_json = 1;
+}
+
+// Bounded metadata commands; generated keys never cross this interface.
+message WarpWireguardRequest {
+  string command_json = 1;
+}
+
+message WarpWireguardResponse {
+  string metadata_json = 1;
+}
+
+message ChainExitStatus {
+  string metadata_json = 1;
+}
+
+message VpnGateSettings {
+  bool enabled = 1;
+  string server_id = 2;
+  string config_sha256 = 3;
+}
+
+message VpnGateServer {
+  string id = 1;
+  string hostname = 2;
+  string ip = 3;
+  string country_code = 4;
+  string country_name = 5;
+  optional uint64 score = 6;
+  optional uint64 ping_ms = 7;
+  optional uint64 speed_bps = 8;
+  optional uint64 num_vpn_sessions = 9;
+  string config_sha256 = 10;
+  string unsupported_reason = 11;
+  VpnGatePoolMetadata pool = 12;
+  VpnGateFavoriteMetadata favorite = 13;
+}
+
+message VpnGatePoolMetadata {
+  string first_seen_at = 1;
+  string last_seen_at = 2;
+  bool present_in_latest_source = 3;
+  string tcp_status = 4;
+  string tcp_checked_at = 5;
+  optional uint64 tcp_connect_ms = 6;
+  bool in_pool = 7;
+}
+
+message VpnGateFavoriteMetadata {
+  string config_sha256 = 1;
+  uint64 saved_at_unix_ms = 2;
+  string latest_config_sha256 = 3;
+}
+
+message VpnGateNodeRequest {
+  string operation_id = 1;
+  string action = 2;
+  string server_id = 3;
+  string config_sha256 = 4;
+  string expected_favorite_hash = 5;
+}
+
+message VpnGateNodeProgress {
+  string operation_id = 1;
+  string server_id = 2;
+  string config_sha256 = 3;
+  string stage = 4;
+  string error = 5;
+}
+
+message VpnGateCountry {
+  string country_code = 1;
+  string country_name = 2;
+  uint32 server_count = 3;
+}
+
+message FinalNetworkParameters {
+  string ipv4 = 1;
+  string ipv6 = 2;
+  repeated string dns_servers = 3;
+  uint32 mtu = 4;
+}
+
+message VpnGateStatus {
+  string stage = 1;
+  uint64 generation = 2;
+  VpnGateServer current_server = 3;
+  FinalNetworkParameters network = 4;
+  string failure = 5;
+  string warp_stage = 6;
+}
+
+message ListVpnGateRequest {
+  string country_code = 1;
+  bool unknown_country = 2;
+  uint32 offset = 3;
+  uint32 limit = 4;
+  bool include_unsupported = 5;
+  bool favorites_only = 6;
+  // Query in-memory job status without reading directory/configuration files.
+  bool status_only = 7;
+}
+
+message RefreshVpnGateRequest {
+  bool cancel = 1;
+}
+
+message VpnGateDirectory {
+  repeated VpnGateServer servers = 1;
+  repeated VpnGateCountry countries = 2;
+  uint32 total = 3;
+  uint32 source_server_count = 4;
+  optional uint64 fetched_at_unix_ms = 5;
+  string source_url = 6;
+  string refresh_stage = 7;
+  repeated string refresh_failures = 8;
+  bool cached = 9;
+  VpnGateStatus status = 10;
+  VpnGateServer saved_server = 11;
+  uint32 favorite_count = 12;
+  string source_fetched_at = 13;
+  VpnGateNodeProgress node_progress = 14;
+}
+
+message Statistics {
+  uint64 connected_seconds = 1;
+  uint64 bytes_sent = 2;
+  uint64 bytes_received = 3;
+  uint64 upload_bytes_per_second = 4;
+  uint64 download_bytes_per_second = 5;
+}
+
+message GeoLocation {
+  string ip = 1;
+  string country_code = 2;
+  string country = 3;
+  string region = 4;
+  string city = 5;
+  string flag_url = 6;
+  string flag_svg = 7;
+}
+
+message ExitInfo {
+  string ipv4 = 1;
+  string ipv6 = 2;
+  GeoLocation ipv4_location = 3;
+  GeoLocation ipv6_location = 4;
+  int64 checked_at_unix_milliseconds = 5;
+}
+
+message StructuredError {
+  string code = 1;
+  string message = 2;
+  bool retryable = 3;
+}
+
+enum FailureSeverity {
+  FAILURE_SEVERITY_UNSPECIFIED = 0;
+  FAILURE_SEVERITY_INFO = 1;
+  FAILURE_SEVERITY_WARNING = 2;
+  FAILURE_SEVERITY_ERROR = 3;
+  FAILURE_SEVERITY_CRITICAL = 4;
+}
+
+message TransportFailure {
+  string code = 1;
+  string stage = 2;
+  string transport = 3;
+  string address_family = 4;
+  bool retryable = 5;
+  bool fallback_allowed = 6;
+  FailureSeverity severity = 7;
+  string remediation_key = 8;
+  string sanitized_detail = 9;
+}
+
+message ConnectionWarning {
+  string code = 1;
+  string message = 2;
+}
+
+message Capabilities {
+  bool vpn = 1;
+  bool socks5 = 2;
+  bool http_proxy = 3;
+  bool system_proxy = 4;
+  bool platform_lockdown = 5;
+  string operating_system = 6;
+  string architecture = 7;
+  repeated string transports = 8;
+  bool secure_storage = 9;
+  bool composable_frontends = 10;
+  bool hot_reconfigure = 11;
+  bool windows_tray = 12;
+  bool android_quick_settings_tile = 13;
+  bool system_start = 14;
+  bool license_management = 15;
+  bool warp_secret_export = 16;
+  bool diagnostics_sessions = 17;
+  bool connection_timeline = 18;
+  bool deep_diagnostics = 19;
+  bool network_quality = 20;
+  bool encrypted_direct_dns = 21;
+  bool quic_migration = 22;
+  bool automatic_pmtu = 23;
+  repeated CongestionControlAlgorithm h3_congestion_control_algorithms = 24;
+  bool network_settings_application = 25;
+  bool l4_tcp = 26;
+  bool l4_tun_tcp = 27;
+  bool l4_dns_conversion = 28;
+  bool vpn_gate_tcp = 29;
+  bool vpn_gate_pool_favorites = 30;
+  bool application_quic_blocking = 31;
+  bool account_metadata_mutations = 32;
+  bool shared_proxy_auth_application = 33;
+  bool chain_profile_import = 34;
+  bool chain_openvpn_udp = 35;
+  bool chain_wireguard = 36;
+  bool chain_openvpn_multi_endpoint = 37;
+  bool chain_warp_wireguard = 38;
+  bool chain_http_proxy = 39;
+  bool chain_socks5_proxy = 40;
+  bool custom_bypass = 41;
+  bool automatic_endpoints = 42;
+  bool chain_proxy_encrypted_dns = 43;
+}
+
+message FrontendStatus {
+  FrontendKind kind = 1;
+  FrontendPhase phase = 2;
+  repeated string listeners = 3;
+  StructuredError error = 4;
+}
+
+message ConnectionSnapshot {
+  ConnectionPhase phase = 1;
+  string transport = 2;
+  string address_family = 3;
+  bool ipv4_available = 4;
+  bool ipv6_available = 5;
+  Statistics statistics = 6;
+  ExitInfo exit = 7;
+  StructuredError error = 8;
+  KillSwitchState kill_switch_state = 9;
+  LockdownState lockdown_state = 10;
+  uint32 reconnect_count = 11;
+  repeated string active_listeners = 12;
+  repeated ConnectionWarning warnings = 13;
+  // 14 was captive_portal_pause_remaining_seconds (removed).
+  reserved 14;
+  repeated FrontendStatus frontends = 15;
+  TransportFailure failure = 16;
+  NetworkQualitySnapshot network_quality = 17;
+  CongestionControlAlgorithm session_congestion_control = 18;
+  DataPlaneMode data_plane = 19;
+  L4Snapshot l4 = 20;
+  VpnGateStatus vpn_gate = 21;
+  ChainExitStatus chain_exit = 22;
+}
+
+// No destinations, DNS content, connection IDs, or credential material.
+message L4Snapshot {
+  bool connect_verified = 1;
+  uint32 sessions = 2;
+  uint32 draining_sessions = 3;
+  uint32 active_flows = 4;
+  uint32 pending_flows = 5;
+  uint64 connect_successes = 6;
+  uint64 connect_failures = 7;
+  uint64 connect_timeouts = 8;
+  uint64 buffer_bytes = 9;
+  uint64 budget_rejections = 10;
+  uint64 send_backpressure = 11;
+  uint64 receive_backpressure = 12;
+  uint64 udp_rejected = 13;
+  uint64 dns_successes = 14;
+  uint64 dns_failures = 15;
+  uint64 dns_timeouts = 16;
+  uint64 migration_preserved_flows = 17;
+  uint64 reconnect_terminated_flows = 18;
+  uint32 tun_flows = 19;
+  uint32 half_open_flows = 20;
+  uint64 connect_latency_us = 21;
+  uint64 unsupported_packets = 22;
+  L4PerformanceSnapshot performance = 23;
+}
+
+message L4PerformanceSnapshot {
+  uint64 h3_read_calls = 1;
+  uint64 h3_read_bytes = 2;
+  uint64 h3_empty_reads = 3;
+  uint64 receive_pool_allocations = 4;
+  uint64 receive_pool_hits = 5;
+  uint64 receive_pool_evictions = 6;
+  uint64 receive_pool_idle_bytes = 7;
+  uint64 receive_pool_idle_high_watermark = 8;
+  uint64 receive_pool_live_bytes = 9;
+  uint64 receive_pool_live_high_watermark = 10;
+  uint64 adapter_copied_bytes = 11;
+  uint64 tcp_accepted_bytes = 12;
+  uint64 tcp_write_calls = 13;
+  uint64 tcp_partial_writes = 14;
+  uint64 actor_wakeups = 15;
+  uint64 actor_polls = 16;
+  uint64 actor_no_progress_polls = 17;
+  uint64 budget_wakeups = 18;
+  uint64 tun_ingress_packets = 19;
+  uint64 tun_ingress_bytes = 20;
+  uint64 tun_egress_packets = 21;
+  uint64 tun_egress_bytes = 22;
+  optional uint64 tun_write_calls = 23;
+  optional uint64 tun_write_would_block = 24;
+  optional uint64 udp_receive_buffer_bytes = 25;
+  optional uint64 udp_send_buffer_bytes = 26;
+  optional string udp_buffer_source = 27;
+  optional uint32 tun_mtu = 28;
+  optional string tun_mtu_source = 29;
+  optional uint64 tcp_preferred_sockets = 30;
+  optional uint64 tcp_fallback_sockets = 31;
+  optional uint64 tcp_buffer_bytes = 32;
+  L4WaitSnapshot command_wait = 33;
+  L4WaitSnapshot tun_write_wait = 34;
+  L4QueueSnapshot tun_ingress_queue = 35;
+  L4QueueSnapshot tun_egress_queue = 36;
+  L4QueueSnapshot stack_ingress_queue = 37;
+  L4QueueSnapshot stack_egress_queue = 38;
+  uint64 actor_no_progress_wakeups = 39;
+  L4ReceiveSnapshot receive = 40;
+}
+
+message L4ReceiveSnapshot {
+  optional uint64 requested_buffer_bytes = 1;
+  optional string buffer_request_status = 2;
+  optional string overflow_monitoring = 3;
+  optional uint64 socket_drops_reported = 4;
+  uint64 overflow_reports = 5;
+  uint64 ancillary_errors = 6;
+  uint64 recv_syscalls = 7;
+  uint64 received_datagrams = 8;
+  uint64 empty_recv_syscalls = 9;
+  optional string receive_backend = 10;
+  optional string send_backend = 11;
+  repeated L4ReceiveInterval history = 12;
+  uint64 history_dropped = 13;
+  optional uint64 buffer_target_bytes = 14;
+}
+
+message L4ReceiveInterval {
+  uint64 elapsed_ms = 1;
+  uint64 interval_ms = 2;
+  bool path_reset = 3;
+  uint64 h3_read_bytes = 4;
+  uint64 tcp_accepted_bytes = 5;
+  uint64 tun_ingress_bytes = 6;
+  optional uint64 received_datagrams = 7;
+  optional uint64 recv_syscalls = 8;
+  optional uint64 socket_drops = 9;
+  optional uint64 socket_drops_reported = 10;
+}
+
+message L4WaitSnapshot {
+  uint64 samples = 1;
+  uint64 sum_us = 2;
+  uint64 max_us = 3;
+  repeated uint64 buckets = 4;
+}
+
+message L4QueueSnapshot {
+  uint64 packets = 1;
+  uint64 bytes = 2;
+  uint64 high_water_packets = 3;
+  uint64 high_water_bytes = 4;
+  L4WaitSnapshot wait = 5;
+}
+
+message Empty {}
+message GetStatusRequest {}
+message GetCapabilitiesRequest {}
+message ImportLegacyProfilesRequest {
+  repeated Profile profiles = 1;
+  string active_profile_id = 2;
+}
+message ListProfilesRequest {}
+message ConnectRequest {
+  string profile_id = 1;
+}
+message DisconnectRequest {}
+message RetryRequest {}
+message UpsertProfileRequest {
+  Profile profile = 1;
+}
+message RenameProfileRequest {
+  string profile_id = 1;
+  string name = 2;
+}
+message DeleteProfileRequest {
+  string profile_id = 1;
+}
+message SetActiveProfileRequest {
+  string profile_id = 1;
+}
+message ResetProfileRequest {
+  string profile_id = 1;
+}
+message CheckUpdateRequest {
+  bool manual = 1;
+}
+message ExportDiagnosticsRequest {
+  string destination = 1;
+  string diagnostic_session_id = 2;
+}
+
+enum DiagnosticMode {
+  DIAGNOSTIC_MODE_UNSPECIFIED = 0;
+  DIAGNOSTIC_MODE_STANDARD = 1;
+  DIAGNOSTIC_MODE_DEEP = 2;
+}
+
+enum DiagnosticSessionState {
+  DIAGNOSTIC_SESSION_STATE_UNSPECIFIED = 0;
+  DIAGNOSTIC_SESSION_STATE_PENDING = 1;
+  DIAGNOSTIC_SESSION_STATE_RUNNING = 2;
+  DIAGNOSTIC_SESSION_STATE_CANCELLING = 3;
+  DIAGNOSTIC_SESSION_STATE_COMPLETED = 4;
+  DIAGNOSTIC_SESSION_STATE_FAILED = 5;
+  DIAGNOSTIC_SESSION_STATE_CANCELLED = 6;
+}
+
+enum DiagnosticCheckStatus {
+  DIAGNOSTIC_CHECK_STATUS_UNSPECIFIED = 0;
+  DIAGNOSTIC_CHECK_STATUS_PENDING = 1;
+  DIAGNOSTIC_CHECK_STATUS_RUNNING = 2;
+  DIAGNOSTIC_CHECK_STATUS_PASSED = 3;
+  DIAGNOSTIC_CHECK_STATUS_WARNING = 4;
+  DIAGNOSTIC_CHECK_STATUS_FAILED = 5;
+  DIAGNOSTIC_CHECK_STATUS_SKIPPED = 6;
+  DIAGNOSTIC_CHECK_STATUS_CANCELLED = 7;
+}
+
+enum DiagnosticCategory {
+  DIAGNOSTIC_CATEGORY_UNSPECIFIED = 0;
+  DIAGNOSTIC_CATEGORY_LOCAL_COMPONENT = 1;
+  DIAGNOSTIC_CATEGORY_PHYSICAL_NETWORK = 2;
+  DIAGNOSTIC_CATEGORY_TRANSPORT = 3;
+  DIAGNOSTIC_CATEGORY_TUNNEL = 4;
+  DIAGNOSTIC_CATEGORY_PROTECTION = 5;
+  DIAGNOSTIC_CATEGORY_RECOVERY = 6;
+}
+
+message DiagnosticFinding {
+  string check_id = 1;
+  DiagnosticCategory category = 2;
+  DiagnosticCheckStatus status = 3;
+  TransportFailure failure = 4;
+  FailureSeverity severity = 5;
+  string summary_key = 6;
+  string remediation_key = 7;
+  repeated string sanitized_evidence = 8;
+  int64 started_at_unix_milliseconds = 9;
+  uint64 duration_milliseconds = 10;
+  string dependency_reason = 11;
+  DiagnosticObservation observation = 12;
+  repeated DiagnosticEvidence evidence = 13;
+}
+
+// Append-only optional evidence metadata. Absent metadata is unknown.
+message DiagnosticObservation {
+  string source = 1;
+  string availability = 2;
+  uint64 age_milliseconds = 3;
+  string connection_instance_id = 4;
+  uint64 network_generation = 5;
+}
+
+// Exactly one allowlisted token or unsigned number is exported.
+message DiagnosticEvidence {
+  string key = 1;
+  optional uint64 number = 2;
+  string token = 3;
+}
+
+message DiagnosticSummary {
+  uint32 passed = 1;
+  uint32 warnings = 2;
+  uint32 failed = 3;
+  uint32 skipped = 4;
+  uint32 cancelled = 5;
+}
+
+message DiagnosticSession {
+  string session_id = 1;
+  DiagnosticSessionState state = 2;
+  int64 started_at_unix_milliseconds = 3;
+  int64 completed_at_unix_milliseconds = 4;
+  DiagnosticMode mode = 5;
+  string current_check = 6;
+  uint32 progress_percent = 7;
+  repeated DiagnosticFinding findings = 8;
+  DiagnosticSummary summary = 9;
+  repeated string active_checks = 10;
+  uint64 revision = 11;
+}
+
+message StartDiagnosticsRequest {
+  DiagnosticMode mode = 1;
+}
+
+message CancelDiagnosticsRequest {
+  string session_id = 1;
+}
+
+message GetDiagnosticsRequest {}
+message GetConnectionTimelineRequest {}
+message GetNetworkQualityRequest {}
+
+enum ConnectionEventType {
+  CONNECTION_EVENT_TYPE_UNSPECIFIED = 0;
+  CONNECTION_EVENT_TYPE_ATTEMPT_STARTED = 1;
+  CONNECTION_EVENT_TYPE_ENDPOINT_RESOLVED = 2;
+  CONNECTION_EVENT_TYPE_SOCKET_CONNECTED = 3;
+  CONNECTION_EVENT_TYPE_TLS_READY = 4;
+  CONNECTION_EVENT_TYPE_QUIC_READY = 5;
+  CONNECTION_EVENT_TYPE_MASQUE_ACCEPTED = 6;
+  CONNECTION_EVENT_TYPE_PEER_SETTINGS_RECEIVED = 7;
+  CONNECTION_EVENT_TYPE_ADDRESS_ASSIGNED = 8;
+  CONNECTION_EVENT_TYPE_TUNNEL_READY = 9;
+  CONNECTION_EVENT_TYPE_FIRST_PACKET_SENT = 10;
+  CONNECTION_EVENT_TYPE_FIRST_PACKET_RECEIVED = 11;
+  CONNECTION_EVENT_TYPE_FALLBACK_STARTED = 12;
+  CONNECTION_EVENT_TYPE_RECONNECT_SCHEDULED = 13;
+  CONNECTION_EVENT_TYPE_NETWORK_CHANGED = 14;
+  CONNECTION_EVENT_TYPE_RECOVERY_PROBE_STARTED = 15;
+  CONNECTION_EVENT_TYPE_RECOVERY_PROBE_SUCCEEDED = 16;
+  CONNECTION_EVENT_TYPE_RECOVERY_PROBE_FAILED = 17;
+  CONNECTION_EVENT_TYPE_PATH_PROMOTED = 18;
+  CONNECTION_EVENT_TYPE_QUEUE_SATURATED = 19;
+  CONNECTION_EVENT_TYPE_DISCONNECTED = 20;
+  CONNECTION_EVENT_TYPE_FAILED = 21;
+  CONNECTION_EVENT_TYPE_MIGRATION_STARTED = 22;
+  CONNECTION_EVENT_TYPE_MIGRATION_PATH_VALIDATED = 23;
+  CONNECTION_EVENT_TYPE_MIGRATION_PROMOTED = 24;
+  CONNECTION_EVENT_TYPE_MIGRATION_FAILED = 25;
+  CONNECTION_EVENT_TYPE_PMTU_CHANGED = 26;
+  CONNECTION_EVENT_TYPE_PMTU_REVALIDATION_STARTED = 27;
+  CONNECTION_EVENT_TYPE_PMTU_REVALIDATION_FAILED = 28;
+  CONNECTION_EVENT_TYPE_DIRECT_DNS_DEGRADED = 29;
+  CONNECTION_EVENT_TYPE_DIRECT_DNS_RECOVERED = 30;
+  CONNECTION_EVENT_TYPE_QUEUE_BACKPRESSURED = 31;
+}
+
+message ConnectionEvent {
+  uint64 sequence = 1;
+  int64 timestamp_unix_milliseconds = 2;
+  uint64 elapsed_from_attempt_start_milliseconds = 3;
+  ConnectionEventType event_type = 4;
+  string stage = 5;
+  string transport = 6;
+  string address_family = 7;
+  uint64 duration_milliseconds = 8;
+  TransportFailure failure = 9;
+  QueueKind queue_kind = 10;
+}
+
+message ConnectionMetrics {
+  uint64 last_connect_duration_milliseconds = 1;
+  uint64 last_h3_handshake_duration_milliseconds = 2;
+  uint64 last_h2_handshake_duration_milliseconds = 3;
+  uint64 current_smoothed_rtt_milliseconds = 4;
+  bool current_smoothed_rtt_known = 5;
+  uint32 reconnect_count = 6;
+  uint32 fallback_count = 7;
+  uint32 network_change_count = 8;
+  uint64 send_queue_high_watermark = 9;
+  uint64 send_queue_drop_count = 10;
+  string last_failure_code = 11;
+  string last_reconnect_code = 12;
+  uint64 min_rtt_ms = 13;
+  bool min_rtt_known = 14;
+  uint64 rtt_variance_ms = 15;
+  bool rtt_variance_known = 16;
+  uint32 interval_loss_basis_points = 17;
+  bool interval_loss_known = 18;
+  uint64 congestion_window_bytes = 19;
+  bool congestion_window_known = 20;
+  uint64 bytes_in_flight = 21;
+  bool bytes_in_flight_known = 22;
+  uint64 send_rate_bps = 23;
+  bool send_rate_known = 24;
+  uint64 packets_lost = 25;
+  uint64 bytes_lost = 26;
+  uint64 tun_sink_drop_count = 27;
+  uint64 quic_datagram_drop_count = 28;
+  uint64 queue_oldest_age_ms = 29;
+  bool queue_oldest_age_known = 30;
+  uint32 current_pmtu_bytes = 31;
+  bool current_pmtu_known = 32;
+  uint64 migration_attempt_count = 33;
+  uint64 migration_success_count = 34;
+  uint64 migration_failure_count = 35;
+  uint64 last_migration_duration_ms = 36;
+  bool last_migration_duration_known = 37;
+  uint64 udp_send_syscall_count = 38;
+  uint64 udp_recv_syscall_count = 39;
+  uint64 udp_datagram_sent_count = 40;
+  uint64 udp_datagram_received_count = 41;
+  uint64 packet_buffer_pool_hit_count = 42;
+  uint64 packet_buffer_pool_miss_count = 43;
+  uint64 h2_flow_control_stall_count = 44;
+  uint64 h2_flow_control_stall_total_ms = 45;
+  uint64 h2_flow_control_stall_max_ms = 46;
+  uint32 h2_stream_receive_window_bytes = 47;
+  uint32 h2_connection_receive_window_bytes = 48;
+  uint64 direct_dns_success_count = 49;
+  uint64 direct_dns_failure_count = 50;
+  uint64 direct_dns_timeout_count = 51;
+  uint64 direct_dns_last_rtt_ms = 52;
+  bool direct_dns_last_rtt_known = 53;
+  uint64 pmtu_change_count = 54;
+  uint64 pmtu_revalidation_failure_count = 55;
+  MetricAvailability smoothed_rtt_availability = 56;
+  MetricAvailability min_rtt_availability = 57;
+  MetricAvailability rtt_variance_availability = 58;
+  MetricAvailability interval_loss_availability = 59;
+  MetricAvailability congestion_window_availability = 60;
+  MetricAvailability bytes_in_flight_availability = 61;
+  MetricAvailability send_rate_availability = 62;
+  uint64 pmtu_send_too_large_count = 63;
+  uint64 latest_rtt_ms = 64;
+  bool latest_rtt_known = 65;
+  MetricAvailability latest_rtt_availability = 66;
+}
+
+enum MetricAvailability {
+  METRIC_AVAILABILITY_UNSPECIFIED = 0;
+  METRIC_AVAILABILITY_AVAILABLE = 1;
+  METRIC_AVAILABILITY_UNSUPPORTED = 2;
+  METRIC_AVAILABILITY_NOT_READY = 3;
+  METRIC_AVAILABILITY_STALE = 4;
+}
+
+enum NetworkQualityLevel {
+  NETWORK_QUALITY_LEVEL_UNSPECIFIED = 0;
+  NETWORK_QUALITY_LEVEL_GOOD = 1;
+  NETWORK_QUALITY_LEVEL_FAIR = 2;
+  NETWORK_QUALITY_LEVEL_POOR = 3;
+  NETWORK_QUALITY_LEVEL_LIMITED_DATA = 4;
+  NETWORK_QUALITY_LEVEL_DISCONNECTED = 5;
+}
+
+enum QueueKind {
+  QUEUE_KIND_UNSPECIFIED = 0;
+  QUEUE_KIND_TUN_TO_TRANSPORT = 1;
+  QUEUE_KIND_PROXY_TO_TRANSPORT = 2;
+  QUEUE_KIND_TRANSPORT_OUTGOING = 3;
+  QUEUE_KIND_H3_DATAGRAM_SEND = 4;
+  QUEUE_KIND_H3_WIRE_SEND = 5;
+  QUEUE_KIND_TRANSPORT_TO_TUN = 6;
+  QUEUE_KIND_TRANSPORT_TO_PROXY = 7;
+  QUEUE_KIND_DIRECT_DNS = 8;
+  QUEUE_KIND_FINAL_DNS = 9;
+}
+
+message QueueQuality {
+  QueueKind kind = 1;
+  uint64 current_items = 2;
+  uint64 capacity_items = 3;
+  uint64 current_bytes = 4;
+  uint64 capacity_bytes = 5;
+  uint64 high_water_items = 6;
+  uint64 high_water_bytes = 7;
+  uint64 drop_items = 8;
+  uint64 drop_bytes = 9;
+  uint64 oldest_age_ms = 10;
+  bool oldest_age_known = 11;
+  MetricAvailability availability = 12;
+  uint64 enqueue_count = 13;
+  uint64 dequeue_count = 14;
+  bool closed = 15;
+  bool cancelled = 16;
+  QueueBackpressure backpressure = 17;
+}
+
+message PmtuQuality {
+  MetricAvailability availability = 1;
+  uint32 outer_pmtu_bytes = 2;
+  uint32 effective_connect_ip_payload_bytes = 3;
+  string phase_code = 4;
+  uint64 change_count = 5;
+  uint64 revalidation_failure_count = 6;
+  MetricAvailability effective_payload_availability = 7;
+  uint64 send_too_large_count = 8;
+}
+
+message MigrationQuality {
+  string phase_code = 1;
+  uint64 attempt_count = 2;
+  uint64 success_count = 3;
+  uint64 failure_count = 4;
+  uint64 last_duration_ms = 5;
+  bool last_duration_known = 6;
+  string last_reason_code = 7;
+}
+
+message DirectDnsQuality {
+  DirectDnsMode mode = 1;
+  string phase_code = 2;
+  uint64 success_count = 3;
+  uint64 failure_count = 4;
+  uint64 timeout_count = 5;
+  uint64 last_rtt_ms = 6;
+  bool last_rtt_known = 7;
+  string last_reason_code = 8;
+}
+
+message NetworkQualitySnapshot {
+  uint64 sampled_at_unix_ms = 1;
+  string connection_instance_id = 2;
+  NetworkQualityLevel level = 3;
+  ConnectionMetrics metrics = 4;
+  repeated QueueQuality queues = 5;
+  PmtuQuality pmtu = 6;
+  MigrationQuality migration = 7;
+  DirectDnsQuality direct_dns = 8;
+  // At most 16 real source observations; not interpolated or persisted.
+  repeated NetworkQualitySample samples = 9;
+  UdpSocketReceiveSnapshot udp_socket_receive = 10;
+  TransportPerformance transport_performance = 11;
+}
+
+message UdpSocketReceiveSnapshot {
+  optional uint64 receive_buffer_bytes = 1;
+  optional uint64 send_buffer_bytes = 2;
+  L4ReceiveSnapshot observation = 3;
+}
+
+message NetworkQualitySample {
+  // Sequence and monotonic clock reset with connection_instance_id.
+  uint64 sequence = 1;
+  uint64 sampled_at_unix_ms = 2;
+  uint64 monotonic_millis = 3;
+  optional uint64 downloaded_bytes = 4;
+  optional uint64 uploaded_bytes = 5;
+  optional uint64 rtt_ms = 6;
+  optional uint32 loss_basis_points = 7;
+}
+
+message NetworkQualityUpdated {
+  NetworkQualitySnapshot snapshot = 1;
+}
+
+message ConnectionTimeline {
+  repeated ConnectionEvent events = 1;
+  ConnectionMetrics metrics = 2;
+  uint64 dropped_event_count = 3;
+  string connection_instance_id = 4;
+  bool retained = 5;
+  uint64 session_generation = 6;
+  DiagnosticObservation observation = 7;
+}
+message ClearAllDataRequest {
+  bool confirmed = 1;
+}
+message ProvisionIdentityRequest {
+  string profile_id = 1;
+  bytes warp_secret = 2;
+  bool terms_accepted = 3;
+  string locale = 4;
+  string device_name = 5;
+  bytes license_key = 6;
+  IdentityProvisioningMethod method = 7;
+  ZeroTrustEnrollment zero_trust = 8;
+}
+
+// Initial provisioning never replaces an existing identity. Transport timeouts
+// are reconciled through the durable operation state instead of replayed.
+message InitialIdentityRequest {
+  string operation_id = 1;
+  string profile_id = 2;
+  IdentityProvisioning provisioning = 3;
+  // Recover local results only; never reserve an operation or register remotely.
+  bool resume_only = 4;
+}
+message GetInitialIdentityStateRequest {
+  string profile_id = 1;
+}
+enum InitialIdentityPhase {
+  INITIAL_IDENTITY_PHASE_UNSPECIFIED = 0;
+  INITIAL_IDENTITY_PHASE_IDLE = 1;
+  INITIAL_IDENTITY_PHASE_PENDING = 2;
+  INITIAL_IDENTITY_PHASE_INTERRUPTED = 3;
+  INITIAL_IDENTITY_PHASE_COMPLETED = 4;
+  INITIAL_IDENTITY_PHASE_FAILED = 5;
+}
+message InitialIdentityState {
+  string operation_id = 1;
+  string profile_id = 2;
+  InitialIdentityPhase phase = 3;
+  string error_code = 4;
+  bool reused = 5;
+}
+
+message ZeroTrustEnrollment {
+  string team_name = 1;
+  bytes callback_uri = 2;
+}
+
+message IdentityProvisioning {
+  IdentityProvisioningMethod method = 1;
+  bytes warp_secret = 2;
+  bool terms_accepted = 3;
+  string locale = 4;
+  string device_name = 5;
+  bytes license_key = 6;
+  ZeroTrustEnrollment zero_trust = 7;
+}
+
+message CreateProfileWithIdentityRequest {
+  Profile profile = 1;
+  IdentityProvisioning identity = 2;
+}
+
+message ProfileIdentityStatus {
+  string profile_id = 1;
+  ProfileIdentityState state = 2;
+  LicenseState license_state = 3;
+  string account_type = 4;
+  bool cleanup_pending = 5;
+  IdentityProvider provider = 6;
+  string organization = 7;
+}
+
+message ReconfigureActiveProfileRequest {
+  Profile profile = 1;
+}
+
+message CopyLicenseKeyRequest {
+  string profile_id = 1;
+}
+
+message UpdateLicenseKeyRequest {
+  string profile_id = 1;
+  bytes license_key = 2;
+}
+
+message UnbindLicenseKeyRequest {
+  string profile_id = 1;
+}
+
+message ExportWarpSecretRequest {
+  string profile_id = 1;
+  string destination = 2;
+  bool confirmed = 3;
+}
+
+message UpdateProxyAuthRequest {
+  string profile_id = 1;
+  string username = 2;
+  bytes password = 3;
+  bool confirmed = 4;
+}
+
+message ListGeoRulesRequest {}
+
+message DownloadGeoRulesRequest {
+  string country_code = 1;
+}
+
+message UpdateAllGeoRulesRequest {}
+
+message GeoRulesEntry {
+  string country_code = 1;
+  bool has_geoip = 2;
+  bool has_geosite = 3;
+  int64 last_updated_unix_milliseconds = 4;
+}
+
+message GeoRulesList {
+  repeated GeoRulesEntry entries = 1;
+  int64 last_successful_update_unix_milliseconds = 2;
+  bool has_global_geosite = 3;
+  int64 global_geosite_updated_unix_milliseconds = 4;
+}
+
+enum GeoRulesUpdateStatus {
+  GEO_RULES_UPDATE_STATUS_UNSPECIFIED = 0;
+  GEO_RULES_UPDATE_STATUS_UP_TO_DATE = 1;
+  GEO_RULES_UPDATE_STATUS_UPDATED = 2;
+  GEO_RULES_UPDATE_STATUS_FAILED = 3;
+}
+
+message GeoRulesUpdateResult {
+  string country_code = 1;
+  GeoRulesUpdateStatus status = 2;
+  string reason = 3;
+  string artifact_kind = 4;
+  // "country" for GeoIP and "global" for the shared V2Fly dlc.dat.
+  string artifact_scope = 5;
+}
+
+message GeoRulesUpdateResults {
+  repeated GeoRulesUpdateResult results = 1;
+}
+
+message GeoRulesProgress {
+  string current_file = 1;
+  uint32 completed = 2;
+  uint32 total = 3;
+}
+
+message ReconfigureResult {
+  Profile profile = 1;
+  ConnectionSnapshot snapshot = 2;
+}
+
+message SaveNetworkSettingsRequest {
+  string operation_id = 1;
+  string account_id = 2;
+  Profile values = 3;
+  repeated string changed_fields = 4;
+}
+
+message GetNetworkSettingsStateRequest {}
+
+enum NetworkSettingsApplyStatus {
+  NETWORK_SETTINGS_APPLY_STATUS_UNSPECIFIED = 0;
+  NETWORK_SETTINGS_APPLY_STATUS_NOT_REQUIRED = 1;
+  NETWORK_SETTINGS_APPLY_STATUS_APPLYING = 2;
+  NETWORK_SETTINGS_APPLY_STATUS_APPLIED = 3;
+  NETWORK_SETTINGS_APPLY_STATUS_DEFERRED = 4;
+  NETWORK_SETTINGS_APPLY_STATUS_FAILED = 5;
+  NETWORK_SETTINGS_APPLY_STATUS_UNKNOWN = 6;
+}
+
+message NetworkSettingsState {
+  string source_epoch = 1;
+  uint64 sequence = 2;
+  string operation_id = 3;
+  string session_id = 4;
+  Profile stored_profile = 5;
+  Profile applied_profile = 6;
+  NetworkSettingsApplyStatus apply_status = 7;
+  repeated string deferred_fields = 8;
+  string error_code = 9;
+  optional bool persisted = 10;
+  // Shared settings without a registration-owned endpoint overlay.
+  Profile shared_network_profile = 11;
+}
+
+message ControlRequest {
+  string request_id = 1;
+  // 19 was PauseCaptivePortalRequest (removed).
+  reserved 19;
+  oneof payload {
+    GetStatusRequest get_status = 10;
+    ListProfilesRequest list_profiles = 11;
+    ConnectRequest connect = 12;
+    DisconnectRequest disconnect = 13;
+    RetryRequest retry = 14;
+    UpsertProfileRequest upsert_profile = 15;
+    DeleteProfileRequest delete_profile = 16;
+    SetActiveProfileRequest set_active_profile = 17;
+    ResetProfileRequest reset_profile = 18;
+    CheckUpdateRequest check_update = 20;
+    ExportDiagnosticsRequest export_diagnostics = 21;
+    ClearAllDataRequest clear_all_data = 22;
+    ProvisionIdentityRequest provision_identity = 23;
+    GetCapabilitiesRequest get_capabilities = 24;
+    ImportLegacyProfilesRequest import_legacy_profiles = 25;
+    CreateProfileWithIdentityRequest create_profile_with_identity = 26;
+    ReconfigureActiveProfileRequest reconfigure_active_profile = 27;
+    CopyLicenseKeyRequest copy_license_key = 28;
+    UpdateLicenseKeyRequest update_license_key = 29;
+    UnbindLicenseKeyRequest unbind_license_key = 30;
+    ExportWarpSecretRequest export_warp_secret = 31;
+    UpdateProxyAuthRequest update_proxy_auth = 32;
+    ListGeoRulesRequest list_geo_rules = 33;
+    DownloadGeoRulesRequest download_geo_rules = 34;
+    UpdateAllGeoRulesRequest update_all_geo_rules = 35;
+    StartDiagnosticsRequest start_diagnostics = 36;
+    CancelDiagnosticsRequest cancel_diagnostics = 37;
+    GetDiagnosticsRequest get_diagnostics = 38;
+    GetConnectionTimelineRequest get_connection_timeline = 39;
+    GetNetworkQualityRequest get_network_quality = 40;
+    SaveNetworkSettingsRequest save_network_settings = 41;
+    GetNetworkSettingsStateRequest get_network_settings_state = 42;
+    ListVpnGateRequest list_vpn_gate = 43;
+    RefreshVpnGateRequest refresh_vpn_gate = 44;
+    VpnGateNodeRequest vpn_gate_node = 45;
+    RenameProfileRequest rename_profile = 46;
+    ChainProfileRequest chain_profile = 47;
+    WarpWireguardRequest warp_wireguard = 48;
+    InitialIdentityRequest initial_identity = 49;
+    GetInitialIdentityStateRequest get_initial_identity_state = 50;
+  }
+}
+
+message ProfileList {
+  repeated Profile profiles = 1;
+  string active_profile_id = 2;
+  repeated ProfileIdentityStatus identity_statuses = 3;
+  Profile shared_network_profile = 4;
+}
+
+message UpdatePackage {
+  string name = 1;
+  string download_url = 2;
+  uint64 size = 3;
+  string sha256 = 4;
+  string platform = 5;
+  string variant = 6;
+}
+
+message UpdateInfo {
+  bool available = 1;
+  string version = 2;
+  string release_url = 3;
+  UpdatePackage package = 4;
+}
+
+message ControlResponse {
+  string request_id = 1;
+  StructuredError error = 2;
+  oneof payload {
+    Empty empty = 10;
+    ConnectionSnapshot status = 11;
+    ProfileList profile_list = 12;
+    Profile profile = 13;
+    UpdateInfo update = 14;
+    Capabilities capabilities = 15;
+    ReconfigureResult reconfigure = 16;
+    GeoRulesList geo_rules_list = 17;
+    GeoRulesUpdateResults geo_rules_update = 18;
+    DiagnosticSession diagnostics = 19;
+    ConnectionTimeline connection_timeline = 20;
+    NetworkQualitySnapshot network_quality = 21;
+    NetworkSettingsState network_settings = 22;
+    VpnGateDirectory vpn_gate_directory = 23;
+    ChainProfileResponse chain_profiles = 24;
+    WarpWireguardResponse warp_wireguard = 25;
+    InitialIdentityState initial_identity_state = 26;
+  }
+}
+
+message StateChanged {
+  ConnectionSnapshot snapshot = 1;
+}
+message StatisticsUpdated {
+  Statistics statistics = 1;
+}
+message ExitInfoUpdated {
+  ExitInfo exit = 1;
+}
+message WarningRaised {
+  string code = 1;
+  string message = 2;
+}
+message CapabilitiesChanged {
+  Capabilities capabilities = 1;
+}
+message NetworkChanged {
+  uint64 generation = 1;
+  bool online = 2;
+}
+message DiagnosticsProgress {
+  string stage = 1;
+  uint32 percent = 2;
+  bool complete = 3;
+}
+
+message DiagnosticSessionStarted {
+  DiagnosticSession session = 1;
+}
+
+message DiagnosticCheckStarted {
+  string session_id = 1;
+  DiagnosticFinding finding = 2;
+}
+
+message DiagnosticCheckCompleted {
+  string session_id = 1;
+  DiagnosticFinding finding = 2;
+}
+
+message DiagnosticSessionCompleted {
+  DiagnosticSession session = 1;
+}
+
+message DiagnosticSessionCancelled {
+  DiagnosticSession session = 1;
+}
+
+message DiagnosticSessionSnapshot {
+  DiagnosticSession session = 1;
+}
+
+message EventEnvelope {
+  uint64 sequence = 1;
+  oneof payload {
+    StateChanged state_changed = 10;
+    StatisticsUpdated statistics_updated = 11;
+    ExitInfoUpdated exit_info_updated = 12;
+    WarningRaised warning_raised = 13;
+    CapabilitiesChanged capabilities_changed = 14;
+    NetworkChanged network_changed = 15;
+    DiagnosticsProgress diagnostics_progress = 16;
+    GeoRulesProgress geo_rules_progress = 17;
+    DiagnosticSessionStarted diagnostic_session_started = 18;
+    DiagnosticCheckStarted diagnostic_check_started = 19;
+    DiagnosticCheckCompleted diagnostic_check_completed = 20;
+    DiagnosticSessionCompleted diagnostic_session_completed = 21;
+    DiagnosticSessionCancelled diagnostic_session_cancelled = 22;
+    NetworkQualityUpdated network_quality_updated = 23;
+    NetworkSettingsState network_settings_changed = 24;
+    DiagnosticSessionSnapshot diagnostics_snapshot = 25;
+  }
+}
+
+message QueueBackpressure {
+  uint64 waits = 1;
+  uint64 active = 2;
+  uint64 completed = 3;
+  uint64 cancelled = 4;
+  uint64 closed = 5;
+  uint64 errors = 6;
+  uint64 total_us = 7;
+  uint64 max_us = 8;
+  repeated uint64 buckets = 9;
+}
+
+message H2ReceivePerformance {
+  uint64 data_frames = 1;
+  uint64 data_bytes = 2;
+  uint64 assembly_copy_bytes = 3;
+  uint64 batches = 4;
+  uint64 packets = 5;
+  uint64 packet_bytes = 6;
+}
+
+message H3SendPerformance {
+  uint64 application_batches = 1;
+  uint64 application_packets = 2;
+  uint64 application_bytes = 3;
+  uint64 encode_pool_exhausted = 4;
+  uint64 datagram_queue_full = 5;
+  uint64 pmtu_deferred = 6;
+  uint64 wire_queue_full = 7;
+  uint64 quantum_limited = 8;
+  uint64 quic_no_progress_with_backlog = 9;
+  uint64 udp_would_block = 10;
+  uint64 udp_partial_sends = 11;
+  uint64 udp_message_too_large = 12;
+}
+
+message TransportPerformance {
+  H2ReceivePerformance h2 = 1;
+  H3SendPerformance h3 = 2;
+  uint64 incoming_copy_bytes = 3;
+  uint64 send_timeouts = 4;
+  repeated uint64 h2_batch_sizes = 5;
+  repeated uint64 h3_batch_sizes = 6;
+}

@@ -1,0 +1,472 @@
+from __future__ import annotations
+
+import re
+import tempfile
+import unittest
+from pathlib import Path
+
+import release_contract
+
+CJK = re.compile("[\\u3400-\\u9fff]")
+
+
+class ReleaseContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.tag = "v0.2.9"
+        self.commit = "a" * 40
+        for name in release_contract.expected_artifact_names(self.tag):
+            (self.root / name).write_bytes(name.encode())
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_manifest_requires_the_exact_eight_artifacts(self) -> None:
+        manifest = release_contract.create_manifest(
+            self.root, self.tag, self.commit, "b" * 64, "c" * 64
+        )
+        index = release_contract.artifact_index(manifest)
+        self.assertEqual(8, len(index))
+        release_contract.verify_artifacts(self.root, manifest)
+        self.assertFalse((self.root / "SHA256SUMS").exists())
+        for name in index:
+            self.assertFalse((self.root / f"{name}.sha256").exists())
+
+    def test_manifest_rejects_an_unexpected_primary_artifact(self) -> None:
+        (self.root / "unexpected.apk").write_bytes(b"no")
+        with self.assertRaises(release_contract.ContractError):
+            release_contract.create_manifest(self.root, self.tag, self.commit, "b" * 64, "c" * 64)
+
+    def test_artifact_tampering_is_rejected(self) -> None:
+        manifest = release_contract.create_manifest(
+            self.root, self.tag, self.commit, "b" * 64, "c" * 64
+        )
+        first = self.root / manifest["artifacts"][0]["name"]
+        first.write_bytes(b"tampered")
+        with self.assertRaises(release_contract.ContractError):
+            release_contract.verify_artifacts(self.root, manifest)
+
+    def test_manifest_rejects_invalid_signer_fingerprints(self) -> None:
+        with self.assertRaises(release_contract.ContractError):
+            release_contract.create_manifest(
+                self.root, self.tag, self.commit, "not-a-digest", "c" * 64
+            )
+
+    def test_manifest_rejects_an_incomplete_artifact_index(self) -> None:
+        manifest = release_contract.create_manifest(
+            self.root, self.tag, self.commit, "b" * 64, "c" * 64
+        )
+        manifest["artifacts"].pop()
+        with self.assertRaises(release_contract.ContractError):
+            release_contract.artifact_index(manifest)
+
+
+class ReleaseNotesContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.template = (
+            Path(__file__).resolve().parent.parent / ".github" / "RELEASE_NOTES_TEMPLATE.md"
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def render(self, template: Path | None = None) -> str:
+        return release_contract.render_release_notes(
+            template or self.template,
+            "v9.8.7-beta.3",
+            "Example/Usque",
+            "b" * 64,
+            "c" * 64,
+        )
+
+    def test_checked_in_template_renders_bilingual_official_links(self) -> None:
+        rendered = self.render()
+
+        self.assertNotIn("{{", rendered)
+        self.assertIn("Usque v9.8.7-beta.3 official release", rendered)
+        self.assertIn("usque-v9.8.7-beta.3-windows-x64-v2.exe", rendered)
+        self.assertNotIn("usque-v9.8.7-beta.3-windows-x64-v2.msi", rendered)
+        self.assertIn("usque-v9.8.7-beta.3-android-universal.apk", rendered)
+        self.assertIn("`" + "b" * 64 + "`", rendered)
+        self.assertIn("`" + "c" * 64 + "`", rendered)
+        self.assertLess(rendered.index("Download packages only"), rendered.index("请仅从此"))
+
+    def test_notes_preserve_download_badges_and_folded_bilingual_structure(self) -> None:
+        rendered = self.render()
+        # Release-specific prose changes every release; assert only the structure.
+        headings = release_contract.RELEASE_NOTES_REQUIRED_HEADINGS
+        positions = [rendered.index(heading) for heading in headings]
+        self.assertEqual(positions, sorted(positions))
+        download_start = rendered.index("## Download / 下载")
+        download_end = rendered.index("\n<details>", download_start)
+        detail_tags = list(re.finditer(r"<details\b[^>]*>", rendered))
+        self.assertTrue(all(match.group() == "<details>" for match in detail_tags))
+        details = [match.start() for match in detail_tags]
+        closings = [match.start() for match in re.finditer("</details>", rendered)]
+        self.assertTrue(details)
+        self.assertEqual(len(details), len(closings))
+        for start, end in zip(details, closings, strict=True):
+            self.assertLess(download_end, start)
+            self.assertLess(start, end)
+            block = rendered[start:end]
+            summaries = re.findall(r"<summary>([^<]+)</summary>", block)
+            self.assertEqual(len(summaries), 1, block[:80])
+            english, separator, chinese = summaries[0].partition(" / ")
+            self.assertTrue(separator and english.strip(), summaries[0])
+            self.assertRegex(chinese, CJK)
+            self.assertNotRegex(english, CJK)
+        for start, end in zip(closings, details[1:], strict=False):
+            self.assertLess(start, end)
+        download = rendered[download_start:download_end]
+        expected = release_contract.expected_artifact_names("v9.8.7-beta.3")
+        installers = {name for name in expected if not name.endswith(".msi")}
+        linked = re.findall(r"/releases/download/v9\.8\.7-beta\.3/(usque-[^)]+)", download)
+        self.assertEqual(len(linked), 6)
+        self.assertEqual(set(linked), installers)
+        badges = re.findall(r"!\[([^\]]+)\]\(([^)]+)\)", download)
+        self.assertEqual(len(badges), 8)
+        for alt, url in badges:
+            self.assertTrue(alt.strip())
+            self.assertTrue(
+                url.startswith(
+                    "https://github.com/Example/Usque/blob/v9.8.7-beta.3/docs/assets/release/"
+                )
+            )
+            self.assertTrue(url.endswith(".svg?raw=true"))
+        self.assertIn("Android 8.0+ (API 26)", download)
+        self.assertIn("Windows 10 22H2+ (build 19045)", download)
+        lines = rendered.splitlines()
+        for index, line in enumerate(lines):
+            if line.startswith("- ") and " / " not in line:
+                self.assertTrue(lines[index + 1].startswith("  <br>"), line)
+                self.assertEqual(lines[index + 2], "", "Separate bilingual list items: " + line)
+
+    def test_version_summary_puts_each_english_paragraph_before_its_chinese(self) -> None:
+        rendered = self.render()
+        title = "## Usque v9.8.7-beta.3 official release / Usque v9.8.7-beta.3 正式版发布"
+        self.assertEqual(rendered.count(title), 1)
+        summary_start = rendered.index(title) + len(title)
+        summary = rendered[summary_start : rendered.index("## Highlights / 更新亮点")]
+        paragraphs = [part.strip() for part in summary.split("\n\n") if part.strip()]
+        self.assertTrue(paragraphs)
+        self.assertEqual(len(paragraphs) % 2, 0, paragraphs)
+        for english, chinese in zip(paragraphs[::2], paragraphs[1::2], strict=True):
+            self.assertTrue(english.startswith("Usque v9.8.7-beta.3 "), english)
+            self.assertNotRegex(english, CJK)
+            self.assertTrue(chinese.startswith("Usque v9.8.7-beta.3 "), chinese)
+            self.assertRegex(chinese, CJK)
+
+    def test_current_notes_describe_shipped_chain_features_without_retired_scanning(self) -> None:
+        rendered = self.render()
+        self.assertIn("is a feature and reliability release", rendered)
+        self.assertIn("功能与可靠性版本", rendered)
+        self.assertIn("filename-based names", rendered)
+        self.assertIn("3, 4, 5, 5, 5 and 5 seconds", rendered)
+        self.assertIn("3、4、5、5、5、5 秒", rendered)
+        self.assertIn("Download size is not installed disk usage", rendered)
+        self.assertNotRegex(rendered.lower(), r"endpoint scan|pause and resume|smaller downloads")
+        self.assertNotIn("端点扫描", rendered)
+
+    def test_rejects_missing_or_unknown_template_tokens(self) -> None:
+        invalid = Path(self.temporary.name) / "invalid.md"
+        invalid.write_text(
+            self.template.read_text(encoding="utf-8").replace(
+                "{{android_signer_sha256}}", "{{sponsor_url}}"
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(release_contract.ContractError):
+            self.render(invalid)
+
+    def test_rejects_links_outside_the_official_repository(self) -> None:
+        invalid = Path(self.temporary.name) / "external.md"
+        invalid.write_text(
+            self.template.read_text(encoding="utf-8")
+            + "\n[External promotion](https://example.com/promo)\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(release_contract.ContractError):
+            self.render(invalid)
+
+
+class ReleaseWorkflowPolicyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.workflow = (
+            Path(__file__).resolve().parent.parent / ".github" / "workflows" / "release.yml"
+        ).read_text(encoding="utf-8")
+
+    def job(self, name: str) -> str:
+        match = re.search(
+            rf"(?ms)^  {re.escape(name)}:\n.*?(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            self.workflow,
+        )
+        self.assertIsNotNone(match, f"release workflow job is missing: {name}")
+        assert match is not None
+        return match.group(0)
+
+    def test_protected_validation_requires_a_private_repository_and_opt_in(self) -> None:
+        for name in (
+            "windows-reliability",
+            "android-reliability",
+            "network-leak-reliability",
+            "performance-reliability",
+        ):
+            self.assertIn(
+                "if: ${{ github.event.repository.private == true && "
+                "vars.RUN_PROTECTED_RELEASE_VALIDATION == 'true' }}",
+                self.job(name),
+            )
+
+    def test_every_lab_artifact_upload_is_guarded_by_repository_privacy(self) -> None:
+        jobs = re.findall(
+            r"(?ms)^  ([A-Za-z0-9_-]+):\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+            self.workflow,
+        )
+        guarded_jobs = set()
+        for name, job in jobs:
+            # Reports and raw performance samples also require the same boundary.
+            if not re.search(
+                r"name: usque-(?:restricted-|reliability-report-|performance-raw-|"
+                r"protected-validation-summary)",
+                job,
+            ):
+                continue
+            condition = re.search(r"^    if: (.+)$", job, re.MULTILINE)
+            self.assertIsNotNone(condition, f"lab artifact job lacks a guard: {name}")
+            assert condition is not None
+            self.assertRegex(
+                condition.group(1),
+                r"^\$\{\{ (?:always\(\) && )?github\.event\.repository\.private == true && ",
+            )
+            self.assertNotIn("||", condition.group(1), f"privacy guard can be bypassed: {name}")
+            guarded_jobs.add(name)
+        self.assertEqual(
+            guarded_jobs,
+            {
+                "windows-reliability",
+                "android-reliability",
+                "network-leak-reliability",
+                "performance-reliability",
+                "protected-reliability-summary",
+            },
+        )
+
+    def test_publication_depends_on_staged_candidate_not_protected_runners(self) -> None:
+        publish = self.job("publish")
+        self.assertIn("needs: stage-candidate", publish)
+        self.assertNotIn("protected-reliability-summary", publish)
+        self.assertIn("sha256sum -- *.exe *.msi *.apk > SHA256SUMS", publish)
+        self.assertIn('wc -l)" -eq 18', publish)
+
+    def test_windows_release_signs_msi_engine_and_final_bundle(self) -> None:
+        windows = self.job("windows")
+        self.assertIn("build_windows_installer_payload.ps1", windows)
+        self.assertIn("build_windows_bundle.ps1", windows)
+        self.assertIn("wix -- burn detach", windows)
+        self.assertIn("wix -- burn reattach", windows)
+        self.assertIn("verify_windows_bundle.ps1", windows)
+        self.assertIn("-VerifyAuthenticode", windows)
+
+    def test_performance_lab_uses_v2_samples_and_repository_budget_math(self) -> None:
+        performance = self.job("performance-reliability")
+        self.assertIn("PERFORMANCE_ACCEPTED_BASELINE_COMMIT", performance)
+        self.assertIn("--schema-version 2", performance)
+        self.assertIn("--repetitions 7", performance)
+        self.assertIn("tool/performance_gate.py evaluate", performance)
+        evaluator = performance.split("python tool/performance_gate.py evaluate", 1)[1].split(
+            "      - name:", 1
+        )[0]
+        self.assertIn('--baseline-commit "$PERFORMANCE_BASELINE_COMMIT"', evaluator)
+        self.assertIn("tool/performance_budget.json", performance)
+        self.assertIn("tool/performance_scenarios.json", performance)
+        self.assertIn("tool/schemas/performance_report.schema.json", performance)
+        self.assertIn("*-raw-samples.json", performance)
+        self.assertNotIn("Informational controlled performance baseline", performance)
+
+
+class WindowsInstallerValidationPolicyTests(unittest.TestCase):
+    def test_ci_validates_every_compiled_culture_before_creating_transforms(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        culture_loop = re.search(
+            r"(?ms)^          foreach \(\$culture in \$cultures\) \{\n.*?^          \}",
+            workflow,
+        )
+        self.assertIsNotNone(culture_loop)
+        assert culture_loop is not None
+        self.assertIn(
+            "dotnet tool run wix -- msi validate -sice ICE61 $output",
+            culture_loop.group(0),
+        )
+        self.assertIn('throw "MSI ICE validation failed for $culture."', culture_loop.group(0))
+        self.assertIn("tool/test_windows_msi_localization.ps1", workflow)
+
+    def test_language_builder_does_not_discard_native_diagnostics(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        builder = (root / "tool/build_windows_installer_payload.ps1").read_text(encoding="utf-8")
+        calls = re.findall(r"(?m)^\s*& \$buildMsi\b[^|]+\| ([^\n]+)", builder)
+        self.assertEqual(["Out-Host", "Out-Host"], calls)
+
+    def test_bundle_signature_gate_restores_engine_without_skipping_authenticode(self) -> None:
+        root = Path(__file__).resolve().parent.parent
+        verifier = (root / "tool/verify_windows_bundle.ps1").read_text(encoding="utf-8")
+        self.assertIn('"extract_windows_burn_engine.ps1"', verifier)
+        self.assertNotIn("wix -- burn detach", verifier)
+        restored_check = verifier.split('"extract_windows_burn_engine.ps1"', 1)[1]
+        self.assertIn('"verify_windows_authenticode.ps1"', restored_check)
+        self.assertIn("-Path $detachedEngine", restored_check)
+        self.assertIn("-SignerSha256 $SignerSha256", restored_check)
+        workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        self.assertIn("tool/test_windows_burn_engine.ps1", workflow)
+
+
+class ReleaseVersionContractTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        (self.root / ".github" / "workflows").mkdir(parents=True)
+        self.locale_directory = self.root / "apps" / "usque_gui" / "lib" / "core" / "l10n"
+        self.locale_directory.mkdir(parents=True)
+        (self.locale_directory / "catalogs.dart").write_text(
+            "import 'en.dart';\nimport 'zh_cn.dart';\n", encoding="utf-8"
+        )
+        (self.root / "Cargo.toml").write_text(
+            '[workspace]\n[workspace.package]\nversion = "0.2.9"\n',
+            encoding="utf-8",
+        )
+        (self.root / "apps" / "usque_gui" / "pubspec.yaml").write_text(
+            "name: usque\nversion: 0.2.9+23\n", encoding="utf-8"
+        )
+        for name in ("en.dart", "zh_cn.dart"):
+            (self.locale_directory / name).write_text(
+                "const catalog = <String, String>{\n  'app_version': 'Usque 0.2.9',\n};\n",
+                encoding="utf-8",
+            )
+        self.workflow_path = self.root / ".github" / "workflows" / "release.yml"
+        self.workflow_path.write_text(
+            "on:\n"
+            "  push:\n"
+            "    tags:\n"
+            '      - "v0.2.9"\n'
+            "env:\n"
+            "  RELEASE_TAG: v0.2.9\n"
+            '  ANDROID_VERSION_CODE: "23"\n',
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def test_accepts_consistent_release_version_surfaces(self) -> None:
+        release_contract.verify_release_version(self.root, "v0.2.9", 23)
+
+    def test_accepts_supplemental_feature_translations(self) -> None:
+        (self.locale_directory / "network_quality.dart").write_text(
+            "const quality = <String, String>{\n  'nq_range': 'Range',\n};\n",
+            encoding="utf-8",
+        )
+        release_contract.verify_release_version(self.root, "v0.2.9", 23)
+
+    def test_rejects_supplemental_version_overrides(self) -> None:
+        for version in ("0.2.9", "0.2.1"):
+            with self.subTest(version=version):
+                (self.locale_directory / "network_quality.dart").write_text(
+                    "const quality = <String, String>{\n"
+                    f"  'app_version': 'Usque {version}',\n"
+                    "};\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(release_contract.ContractError, "network_quality.dart"):
+                    release_contract.verify_release_version(self.root, "v0.2.9", 23)
+
+    def test_rejects_missing_or_duplicate_registered_locale_versions(self) -> None:
+        for entries in ("", "  'app_version': 'Usque 0.2.9',\n" * 2):
+            with self.subTest(entries=entries):
+                (self.locale_directory / "en.dart").write_text(
+                    "const catalog = <String, String>{\n" + entries + "};\n", encoding="utf-8"
+                )
+                with self.assertRaisesRegex(release_contract.ContractError, "en.dart"):
+                    release_contract.verify_release_version(self.root, "v0.2.9", 23)
+
+    def test_rejects_inline_supplemental_version_overrides(self) -> None:
+        for quote in ("'", '"'):
+            with self.subTest(quote=quote):
+                (self.locale_directory / "network_quality.dart").write_text(
+                    "const quality = <String, String>{"
+                    f"{quote}app_version{quote}: {quote}Usque 0.2.1{quote}"
+                    "};\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(release_contract.ContractError, "network_quality.dart"):
+                    release_contract.verify_release_version(self.root, "v0.2.9", 23)
+
+    def test_rejects_missing_registered_locale(self) -> None:
+        (self.locale_directory / "en.dart").unlink()
+        with self.assertRaisesRegex(release_contract.ContractError, "en.dart"):
+            release_contract.verify_release_version(self.root, "v0.2.9", 23)
+
+    def test_rejects_missing_catalog_registry(self) -> None:
+        (self.locale_directory / "catalogs.dart").unlink()
+        with self.assertRaisesRegex(release_contract.ContractError, "catalogs.dart"):
+            release_contract.verify_release_version(self.root, "v0.2.9", 23)
+
+    def test_rejects_empty_duplicate_or_unsupported_catalog_imports(self) -> None:
+        for imports in (
+            "",
+            "import 'en.dart';\nimport 'en.dart';\n",
+            "import '../en.dart';\n",
+            "import 'en.dart';\nimport 'zh_cn.dart' as zh;\n",
+        ):
+            with self.subTest(imports=imports):
+                (self.locale_directory / "catalogs.dart").write_text(imports, encoding="utf-8")
+                with self.assertRaises(release_contract.ContractError):
+                    release_contract.verify_release_version(self.root, "v0.2.9", 23)
+
+    def test_rejects_cargo_or_flutter_version_drift(self) -> None:
+        (self.root / "Cargo.toml").write_text(
+            '[workspace]\n[workspace.package]\nversion = "0.2.10"\n',
+            encoding="utf-8",
+        )
+        with self.assertRaises(release_contract.ContractError):
+            release_contract.verify_release_version(self.root, "v0.2.9", 23)
+
+        (self.root / "Cargo.toml").write_text(
+            '[workspace]\n[workspace.package]\nversion = "0.2.9"\n',
+            encoding="utf-8",
+        )
+        (self.root / "apps" / "usque_gui" / "pubspec.yaml").write_text(
+            "name: usque\nversion: 0.2.10+23\n", encoding="utf-8"
+        )
+        with self.assertRaises(release_contract.ContractError):
+            release_contract.verify_release_version(self.root, "v0.2.9", 23)
+
+    def test_rejects_locale_or_workflow_version_drift(self) -> None:
+        locale = self.root / "apps" / "usque_gui" / "lib" / "core" / "l10n" / "en.dart"
+        locale.write_text(
+            "const catalog = <String, String>{\n  'app_version': 'Usque 0.2.1',\n};\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(release_contract.ContractError):
+            release_contract.verify_release_version(self.root, "v0.2.9", 23)
+
+        locale.write_text(
+            "const catalog = <String, String>{\n  'app_version': 'Usque 0.2.9',\n};\n",
+            encoding="utf-8",
+        )
+        self.workflow_path.write_text(
+            self.workflow_path.read_text(encoding="utf-8").replace(
+                "RELEASE_TAG: v0.2.9", "RELEASE_TAG: v0.2.10"
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaises(release_contract.ContractError):
+            release_contract.verify_release_version(self.root, "v0.2.9", 23)
+
+
+if __name__ == "__main__":
+    unittest.main()

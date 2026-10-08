@@ -1,0 +1,1054 @@
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
+
+use async_trait::async_trait;
+use usque_ipc::agent_v1::AgentCapabilities;
+use uuid::Uuid;
+use windows_sys::Win32::System::Threading::GetProcessId;
+
+use crate::{
+    AGENT_PROTOCOL_VERSION, AuthenticatedCaller,
+    coordinator::{
+        BackendError, PrivilegedBackend, StepOutput, StepParameter, SystemProxySettings,
+        TunnelInspection,
+    },
+    journal::{MutationKind, MutationReceipt, MutationState, RecoveryJournal},
+    plan::ValidatedTunnelPlan,
+    windows::{
+        network,
+        packet_session::{PacketMapping, PacketPump, close_remote_packet_handles},
+        system_proxy, wfp,
+        wintun::{self, WintunAdapter, WintunLibrary},
+    },
+};
+
+#[derive(Clone)]
+pub struct WindowsBackend {
+    inner: Arc<BackendInner>,
+}
+
+struct BackendInner {
+    resources: Mutex<WindowsResources>,
+    removal: Mutex<Option<(Uuid, wintun::AdapterRemovalState)>>,
+}
+
+#[derive(Default)]
+struct WindowsResources {
+    library: Option<Arc<WintunLibrary>>,
+    adapter: Option<WintunAdapter>,
+    pump: Option<PacketPump>,
+    session_guard: Option<wfp::SessionGuard>,
+}
+
+impl WindowsBackend {
+    /// Loads and hash-verifies the pinned Wintun DLL without creating an
+    /// adapter or changing host networking.
+    pub fn open(wintun_path: &Path) -> Result<Self, BackendError> {
+        let library =
+            WintunLibrary::load(wintun_path).map_err(|error| backend_error(error.to_string()))?;
+        Ok(Self {
+            inner: Arc::new(BackendInner {
+                removal: Mutex::new(None),
+                resources: Mutex::new(WindowsResources {
+                    library: Some(library),
+                    adapter: None,
+                    pump: None,
+                    session_guard: None,
+                }),
+            }),
+        })
+    }
+
+    pub fn capabilities(&self) -> AgentCapabilities {
+        AgentCapabilities {
+            wintun: true,
+            // These are enabled only as each audited backend is linked.
+            wfp_kill_switch: true,
+            interface_addresses: true,
+            interface_dns: true,
+            system_proxy: true,
+            shared_packet_ring: true,
+            operating_system: "windows".to_owned(),
+            architecture: std::env::consts::ARCH.to_owned(),
+            protocol_version: AGENT_PROTOCOL_VERSION,
+            dynamic_direct_egress: true,
+            physical_dns_snapshot: true,
+            exact_generation_egress: true,
+            guarded_recovery: true,
+            automatic_recovery: true,
+            deferred_network_configuration: true,
+            reusable_tun_device: true,
+            automatic_endpoint_leases: true,
+            protected_tunnel_replacement: true,
+        }
+    }
+}
+
+#[async_trait]
+impl PrivilegedBackend for WindowsBackend {
+    async fn plan_replacement_guard(
+        &self,
+        plan: &crate::journal::ReplacementGuardPlan,
+    ) -> Result<MutationReceipt, BackendError> {
+        wfp::plan_replacement_guard(plan).map_err(wfp_backend_error)
+    }
+
+    async fn apply_replacement_guard(
+        &self,
+        receipt: MutationReceipt,
+        plan: &crate::journal::ReplacementGuardPlan,
+        caller: &AuthenticatedCaller,
+    ) -> Result<MutationReceipt, BackendError> {
+        let plan = plan.clone();
+        let path = caller.executable_path.clone();
+        tokio::task::spawn_blocking(move || {
+            wfp::apply_replacement_guard(receipt, &plan, &path).map_err(wfp_backend_error)
+        })
+        .await
+        .map_err(|_| backend_error("replacement guard worker failed"))?
+    }
+
+    async fn inspect_replacement_guard(
+        &self,
+        receipt: &MutationReceipt,
+    ) -> Result<bool, BackendError> {
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || {
+            wfp::replacement_guard_present(&receipt).map_err(wfp_backend_error)
+        })
+        .await
+        .map_err(|_| backend_error("replacement guard inspection failed"))?
+    }
+
+    async fn restore_replacement_guard(
+        &self,
+        receipt: &MutationReceipt,
+    ) -> Result<(), BackendError> {
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || {
+            wfp::restore_replacement_guard(&receipt).map_err(wfp_backend_error)
+        })
+        .await
+        .map_err(|_| backend_error("replacement guard cleanup failed"))?
+    }
+
+    async fn inspect_guard_policy(
+        &self,
+        receipt: &MutationReceipt,
+        persistent: bool,
+    ) -> Result<bool, BackendError> {
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || {
+            wfp::policy_present(&receipt, persistent).map_err(wfp_backend_error)
+        })
+        .await
+        .map_err(|_| backend_error("guard policy inspection failed"))?
+    }
+    async fn create_device(
+        &self,
+        receipt: MutationReceipt,
+    ) -> Result<MutationReceipt, BackendError> {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || {
+            let MutationReceipt::WintunAdapter {
+                adapter_name,
+                adapter_guid,
+                ..
+            } = &receipt
+            else {
+                return Err(BackendError::AdapterIdentity);
+            };
+            if *adapter_name != crate::journal::ManagedDevice::name(*adapter_guid) {
+                return Err(BackendError::AdapterIdentity);
+            }
+            create_adapter_receipt(&inner, receipt)
+        })
+        .await
+        .map_err(|_| backend_error("device creation worker failed"))?
+    }
+
+    async fn inspect_idle_device(&self, receipt: &MutationReceipt) -> Result<bool, BackendError> {
+        let inner = Arc::clone(&self.inner);
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || {
+            let MutationReceipt::WintunAdapter {
+                adapter_guid,
+                interface_luid,
+                ..
+            } = &receipt
+            else {
+                return Err(BackendError::AdapterIdentity);
+            };
+            let resources = lock_resources(&inner)?;
+            if resources.pump.is_some()
+                || !resources
+                    .adapter
+                    .as_ref()
+                    .is_some_and(|adapter| adapter.luid() == *interface_luid)
+            {
+                return Ok(false);
+            }
+            Ok(
+                network::inspect_adapter_identity(&receipt).map_err(inspection_backend_error)?
+                    && wintun::device_instance_present(*adapter_guid)
+                        .map_err(wintun_backend_error)?,
+            )
+        })
+        .await
+        .map_err(|_| backend_error("device inspection worker failed"))?
+    }
+
+    async fn plan_step(
+        &self,
+        kind: MutationKind,
+        plan: &ValidatedTunnelPlan,
+        _caller: &AuthenticatedCaller,
+        parameter: StepParameter,
+    ) -> Result<MutationReceipt, BackendError> {
+        match kind {
+            MutationKind::WfpMetadata => Ok(wfp::plan_metadata()),
+            MutationKind::WintunAdapter => Ok(MutationReceipt::WintunAdapter {
+                adapter_name: adapter_name(plan),
+                adapter_guid: Uuid::new_v4(),
+                interface_luid: 0,
+            }),
+            MutationKind::PacketSession => {
+                let StepParameter::PacketRing { capacity } = parameter else {
+                    return Err(backend_error("packet-ring capacity is missing"));
+                };
+                Ok(MutationReceipt::PacketSession {
+                    session_id: Uuid::new_v4(),
+                    ring_capacity: capacity,
+                })
+            }
+            MutationKind::EndpointBypass => network::plan_endpoint_bypass(
+                &plan.endpoint_candidates,
+                &plan.control_api_candidates,
+            )
+            .map_err(network_backend_error),
+            MutationKind::KillSwitch => {
+                let interface_luid = current_adapter_luid(&self.inner)?;
+                wfp::plan_kill_switch(plan, interface_luid)
+                    .map_err(|error| backend_error(error.to_string()))
+            }
+            MutationKind::InterfaceConfiguration => {
+                let interface_luid = current_adapter_luid(&self.inner)?;
+                network::plan_interface_configuration(interface_luid, plan)
+                    .map_err(|error| backend_error(error.to_string()))
+            }
+            MutationKind::Dns => {
+                let interface_luid = current_adapter_luid(&self.inner)?;
+                network::plan_dns(interface_luid, plan)
+                    .map_err(|error| backend_error(error.to_string()))
+            }
+            MutationKind::DefaultRoutes => {
+                let interface_luid = current_adapter_luid(&self.inner)?;
+                network::plan_default_routes(interface_luid, plan)
+                    .map_err(|error| backend_error(error.to_string()))
+            }
+            MutationKind::SystemProxy => Err(unavailable("system proxy")),
+        }
+    }
+
+    async fn apply_step(
+        &self,
+        receipt: MutationReceipt,
+        plan: &ValidatedTunnelPlan,
+        caller: &AuthenticatedCaller,
+    ) -> Result<(MutationReceipt, StepOutput), BackendError> {
+        let inner = Arc::clone(&self.inner);
+        let plan = plan.clone();
+        let caller = caller.clone();
+        tokio::task::spawn_blocking(move || apply_sync(&inner, receipt, &plan, &caller))
+            .await
+            .map_err(|error| backend_error(format!("privileged worker failed: {error}")))?
+    }
+
+    async fn restore_step(&self, receipt: &MutationReceipt) -> Result<(), BackendError> {
+        self.restore_step_with_adapter(receipt, None).await
+    }
+
+    async fn restore_step_with_adapter(
+        &self,
+        receipt: &MutationReceipt,
+        adapter: Option<&MutationReceipt>,
+    ) -> Result<(), BackendError> {
+        let inner = Arc::clone(&self.inner);
+        let receipt = receipt.clone();
+        let adapter = adapter.cloned();
+        tokio::task::spawn_blocking(move || restore_sync(&inner, &receipt, adapter.as_ref()))
+            .await
+            .map_err(|error| backend_error(format!("privileged recovery worker failed: {error}")))?
+    }
+
+    async fn inspect_adapter(&self, receipt: &MutationReceipt) -> Result<bool, BackendError> {
+        let receipt = receipt.clone();
+        tokio::task::spawn_blocking(move || {
+            wintun::adapter_resources_present(&receipt).map_err(wintun_backend_error)
+        })
+        .await
+        .map_err(|_| backend_error("adapter inspection worker failed"))?
+    }
+
+    fn inspect_adapter_diagnostics(
+        &self,
+        receipt: &MutationReceipt,
+    ) -> (
+        usque_ipc::agent_v1::RecoveryResourceObservation,
+        usque_ipc::agent_v1::RecoveryResourceObservation,
+    ) {
+        wintun::inspect_adapter_diagnostics(receipt)
+    }
+
+    async fn inspect_tunnel(
+        &self,
+        journal: &RecoveryJournal,
+    ) -> Result<TunnelInspection, BackendError> {
+        let journal = journal.clone();
+        tokio::task::spawn_blocking(move || inspect_tunnel_sync(&journal))
+            .await
+            .map_err(|_| backend_error("tunnel inspection worker failed"))?
+    }
+
+    async fn resume_packet_session(
+        &self,
+        adapter: &MutationReceipt,
+        session: &MutationReceipt,
+        plan: &ValidatedTunnelPlan,
+        caller: &AuthenticatedCaller,
+    ) -> Result<crate::coordinator::PacketSessionHandles, BackendError> {
+        let inner = Arc::clone(&self.inner);
+        let adapter = adapter.clone();
+        let session = session.clone();
+        let plan = plan.clone();
+        let caller = caller.clone();
+        tokio::task::spawn_blocking(move || {
+            resume_packet_session_sync(&inner, &adapter, &session, &plan, &caller)
+        })
+        .await
+        .map_err(|error| backend_error(format!("packet-session resume worker failed: {error}")))?
+    }
+
+    async fn plan_system_proxy(
+        &self,
+        operation_id: Uuid,
+        caller: &AuthenticatedCaller,
+        settings: &SystemProxySettings,
+    ) -> Result<MutationReceipt, BackendError> {
+        let caller = caller.clone();
+        let settings = settings.clone();
+        tokio::task::spawn_blocking(move || {
+            system_proxy::plan(operation_id, &caller, &settings)
+                .map_err(|error| backend_error(error.to_string()))
+        })
+        .await
+        .map_err(|error| backend_error(format!("system-proxy planning worker failed: {error}")))?
+    }
+
+    async fn apply_system_proxy(
+        &self,
+        receipt: MutationReceipt,
+    ) -> Result<MutationReceipt, BackendError> {
+        tokio::task::spawn_blocking(move || {
+            system_proxy::apply(receipt).map_err(|error| backend_error(error.to_string()))
+        })
+        .await
+        .map_err(|error| backend_error(format!("system-proxy worker failed: {error}")))?
+    }
+}
+
+fn inspect_tunnel_sync(journal: &RecoveryJournal) -> Result<TunnelInspection, BackendError> {
+    let plan = journal
+        .plan
+        .as_ref()
+        .ok_or_else(|| backend_error("missing tunnel plan"))?;
+    let adapter = journal
+        .adapter_receipt()
+        .ok_or_else(|| backend_error("missing adapter receipt"))?;
+    let MutationReceipt::WintunAdapter { adapter_guid, .. } = adapter else {
+        return Err(BackendError::AdapterIdentity);
+    };
+    if !network::inspect_adapter_identity(adapter).map_err(inspection_backend_error)?
+        || !wintun::device_instance_present(*adapter_guid).map_err(wintun_backend_error)?
+    {
+        return Ok(TunnelInspection::NeedsRecovery);
+    }
+    for kind in [
+        MutationKind::WintunAdapter,
+        MutationKind::EndpointBypass,
+        MutationKind::InterfaceConfiguration,
+        MutationKind::Dns,
+        MutationKind::PacketSession,
+        MutationKind::DefaultRoutes,
+    ] {
+        if kind == MutationKind::WintunAdapter && journal.device_binding.is_some() {
+            continue;
+        }
+        if !journal
+            .steps
+            .iter()
+            .any(|step| step.kind == kind && step.state == MutationState::Applied)
+        {
+            return Ok(TunnelInspection::NeedsRecovery);
+        }
+    }
+    if !network::tunnel_configuration_present(journal).map_err(inspection_backend_error)? {
+        return Ok(TunnelInspection::NeedsRecovery);
+    }
+    if plan.kill_switch || plan.vpn_chain {
+        let Some(step) = journal
+            .steps
+            .iter()
+            .find(|step| step.kind == MutationKind::KillSwitch)
+        else {
+            return Ok(TunnelInspection::NeedsRecovery);
+        };
+        if !wfp::policy_present(&step.receipt, plan.kill_switch).map_err(wfp_backend_error)? {
+            return Ok(TunnelInspection::NeedsRecovery);
+        }
+    }
+    Ok(TunnelInspection::Reattachable)
+}
+
+fn apply_sync(
+    inner: &BackendInner,
+    receipt: MutationReceipt,
+    plan: &ValidatedTunnelPlan,
+    caller: &AuthenticatedCaller,
+) -> Result<(MutationReceipt, StepOutput), BackendError> {
+    match receipt {
+        other @ MutationReceipt::WfpMetadata { .. } => Ok((
+            wfp::apply_metadata(other).map_err(wfp_backend_error)?,
+            StepOutput::default(),
+        )),
+        MutationReceipt::WintunAdapter {
+            adapter_name: name,
+            adapter_guid,
+            interface_luid: _,
+        } => {
+            if name != adapter_name(plan) {
+                return Err(backend_error("Wintun receipt does not match the Profile"));
+            }
+            Ok((
+                create_adapter_receipt(
+                    inner,
+                    MutationReceipt::WintunAdapter {
+                        adapter_name: name,
+                        adapter_guid,
+                        interface_luid: 0,
+                    },
+                )?,
+                StepOutput::default(),
+            ))
+        }
+        MutationReceipt::PacketSession {
+            session_id,
+            ring_capacity,
+        } => apply_packet_session(inner, session_id, ring_capacity, caller),
+        other @ MutationReceipt::EndpointBypass { .. } => {
+            apply_enriched(other, network::apply_endpoint_bypass)
+        }
+        other @ MutationReceipt::InterfaceConfiguration { .. } => {
+            apply_enriched(other, |receipt| {
+                network::apply_interface_configuration(receipt, plan)
+            })
+        }
+        other @ MutationReceipt::Dns { .. } => {
+            let receipt = network::apply_dns(other, plan)
+                .map_err(|error| backend_error(error.to_string()))?;
+            Ok((receipt, StepOutput::default()))
+        }
+        other @ MutationReceipt::DefaultRoutes { .. } => {
+            apply_enriched(other, network::apply_default_routes)
+        }
+        other @ MutationReceipt::KillSwitch { .. } => {
+            let interface_luid = current_adapter_luid(inner)?;
+            if plan.vpn_chain && !plan.kill_switch {
+                let (receipt, guard) =
+                    wfp::apply_session_guard(other, plan, interface_luid, &caller.executable_path)
+                        .map_err(wfp_backend_error)?;
+                inner
+                    .resources
+                    .lock()
+                    .map_err(|_| backend_error("resource lock poisoned"))?
+                    .session_guard = Some(guard);
+                return Ok((receipt, StepOutput::default()));
+            }
+            let receipt =
+                wfp::apply_kill_switch(other, plan, interface_luid, &caller.executable_path)
+                    .map_err(|error| backend_error(error.to_string()))?;
+            Ok((receipt, StepOutput::default()))
+        }
+        MutationReceipt::SystemProxy { .. } => Err(unavailable("system proxy")),
+    }
+}
+
+fn create_adapter_receipt(
+    inner: &BackendInner,
+    receipt: MutationReceipt,
+) -> Result<MutationReceipt, BackendError> {
+    let MutationReceipt::WintunAdapter {
+        adapter_name,
+        adapter_guid,
+        ..
+    } = receipt
+    else {
+        return Err(BackendError::AdapterIdentity);
+    };
+    let mut resources = lock_resources(inner)?;
+    if resources.adapter.is_some() || resources.pump.is_some() {
+        return Err(backend_error("a Wintun device or session is already owned"));
+    }
+    let library = resources
+        .library
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| backend_error("Wintun library is unavailable"))?;
+    let adapter = library
+        .create_adapter(&adapter_name, adapter_guid)
+        .map_err(wintun_backend_error)?;
+    let interface_luid = adapter.luid();
+    resources.adapter = Some(adapter);
+    if interface_luid == 0 {
+        return Err(backend_error("Wintun returned an empty interface LUID"));
+    }
+    Ok(MutationReceipt::WintunAdapter {
+        adapter_name,
+        adapter_guid,
+        interface_luid,
+    })
+}
+
+fn resume_packet_session_sync(
+    inner: &BackendInner,
+    adapter_receipt: &MutationReceipt,
+    session_receipt: &MutationReceipt,
+    plan: &ValidatedTunnelPlan,
+    caller: &AuthenticatedCaller,
+) -> Result<crate::coordinator::PacketSessionHandles, BackendError> {
+    let (
+        MutationReceipt::WintunAdapter {
+            adapter_name: journal_adapter_name,
+            interface_luid,
+            adapter_guid,
+        },
+        MutationReceipt::PacketSession {
+            session_id,
+            ring_capacity,
+        },
+    ) = (adapter_receipt, session_receipt)
+    else {
+        return Err(backend_error(
+            "packet-session resume receipts have unexpected kinds",
+        ));
+    };
+    if (journal_adapter_name != &adapter_name(plan)
+        && journal_adapter_name != &crate::journal::ManagedDevice::name(*adapter_guid))
+        || !valid_recovery_adapter_name(journal_adapter_name)
+    {
+        return Err(backend_error(
+            "journal Wintun adapter does not match the active Profile",
+        ));
+    }
+    if *interface_luid == 0 {
+        return Err(backend_error(
+            "journal Wintun adapter has an empty interface LUID",
+        ));
+    }
+    // Recheck the GUID as well as name/LUID at the actual reattachment point;
+    // the initial service probe may have happened up to one grace period ago.
+    if !network::inspect_adapter_identity(adapter_receipt).map_err(inspection_backend_error)? {
+        return Err(BackendError::AdapterIdentity);
+    }
+
+    let mut resources = lock_resources(inner)?;
+    if resources.pump.is_some() {
+        return Err(backend_error("a Wintun packet session is already active"));
+    }
+    let adapter = match resources.adapter.as_ref().cloned() {
+        Some(adapter) => adapter,
+        None => {
+            let library = resources
+                .library
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| backend_error("Wintun library is unavailable"))?;
+            library
+                .open_adapter(journal_adapter_name)
+                .map_err(|error| backend_error(error.to_string()))?
+        }
+    };
+    if adapter.name() != journal_adapter_name || adapter.luid() != *interface_luid {
+        return Err(backend_error(
+            "reopened Wintun adapter identity does not match the recovery journal",
+        ));
+    }
+    resources.adapter = Some(adapter);
+    let handles = start_packet_session(&mut resources, *ring_capacity, caller)?;
+    // The journaled session ID is deliberately retained. It identifies the
+    // logical packet step across Agent process generations.
+    let _ = session_id;
+    Ok(handles)
+}
+
+fn apply_packet_session(
+    inner: &BackendInner,
+    session_id: Uuid,
+    ring_capacity: u32,
+    caller: &AuthenticatedCaller,
+) -> Result<(MutationReceipt, StepOutput), BackendError> {
+    let mut resources = lock_resources(inner)?;
+    let handles = start_packet_session(&mut resources, ring_capacity, caller)?;
+    Ok((
+        MutationReceipt::PacketSession {
+            session_id,
+            ring_capacity,
+        },
+        StepOutput {
+            packet_session: Some(handles),
+        },
+    ))
+}
+
+fn start_packet_session(
+    resources: &mut WindowsResources,
+    ring_capacity: u32,
+    caller: &AuthenticatedCaller,
+) -> Result<crate::coordinator::PacketSessionHandles, BackendError> {
+    let target = caller
+        .process_handle
+        .map(|value| value as windows_sys::Win32::Foundation::HANDLE)
+        .ok_or_else(|| backend_error("authenticated Engine process handle is missing"))?;
+    // SAFETY: authentication owns this process handle for the complete request
+    // and the PID comparison closes accidental handle confusion.
+    if unsafe { GetProcessId(target) } != caller.process_id {
+        return Err(backend_error("authenticated Engine process handle changed"));
+    }
+    if resources.pump.is_some() {
+        return Err(backend_error("a Wintun packet session is already active"));
+    }
+    let adapter = resources
+        .adapter
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| backend_error("Wintun adapter is not prepared"))?;
+    let session = adapter
+        .start_session(ring_capacity)
+        .map_err(|error| backend_error(error.to_string()))?;
+    let (mapping, handles) = PacketMapping::create(ring_capacity, target)
+        .map_err(|error| backend_error(error.to_string()))?;
+    let pump = match PacketPump::start(session, mapping) {
+        Ok(pump) => pump,
+        Err(error) => {
+            close_remote_packet_handles(target, &handles);
+            return Err(backend_error(error.to_string()));
+        }
+    };
+    resources.pump = Some(pump);
+    Ok(handles)
+}
+
+fn restore_sync(
+    inner: &BackendInner,
+    receipt: &MutationReceipt,
+    adapter_identity: Option<&MutationReceipt>,
+) -> Result<(), BackendError> {
+    match receipt {
+        receipt @ MutationReceipt::WfpMetadata { .. } => {
+            wfp::restore_metadata(receipt).map_err(wfp_backend_error)
+        }
+        MutationReceipt::PacketSession { .. } => {
+            let pump = lock_resources(inner)?.pump.take();
+            if let Some(pump) = pump {
+                pump.stop()
+                    .map_err(|error| backend_error(error.to_string()))?;
+            }
+            Ok(())
+        }
+        MutationReceipt::WintunAdapter {
+            adapter_name,
+            adapter_guid,
+            ..
+        } => {
+            if !valid_recovery_adapter_name(adapter_name) {
+                return Err(backend_error("journal Wintun adapter name is invalid"));
+            }
+            let (pump, adapter) = {
+                let mut resources = lock_resources(inner)?;
+                (resources.pump.take(), resources.adapter.take())
+            };
+            if let Some(pump) = pump {
+                pump.stop()
+                    .map_err(|error| backend_error(error.to_string()))?;
+            }
+            if let Some(adapter) = adapter {
+                drop(adapter);
+            }
+            let mut removal = inner
+                .removal
+                .lock()
+                .map_err(|_| backend_error("adapter removal state lock failed"))?;
+            if removal
+                .as_ref()
+                .is_none_or(|(guid, _)| guid != adapter_guid)
+            {
+                *removal = Some((*adapter_guid, wintun::AdapterRemovalState::default()));
+            }
+            let result = wintun::remove_adapter_if_present(
+                receipt,
+                &mut removal.as_mut().expect("initialized removal state").1,
+            )
+            .map_err(wintun_backend_error);
+            if result.is_ok() {
+                *removal = None;
+            }
+            result
+        }
+        receipt @ MutationReceipt::EndpointBypass { .. } => {
+            network::restore_endpoint_bypass(receipt).map_err(network_backend_error)
+        }
+        receipt @ MutationReceipt::InterfaceConfiguration { .. } => {
+            if !restore_adapter_settings_required(receipt, adapter_identity)? {
+                return Ok(());
+            }
+            network::restore_interface_configuration(receipt).map_err(network_backend_error)
+        }
+        receipt @ MutationReceipt::Dns { .. } => {
+            if !restore_adapter_settings_required(receipt, adapter_identity)? {
+                return Ok(());
+            }
+            network::restore_dns(receipt).map_err(network_backend_error)
+        }
+        receipt @ MutationReceipt::DefaultRoutes { .. } => network::restore_default_routes(
+            receipt,
+            adapter_identity.ok_or(BackendError::AdapterIdentity)?,
+        )
+        .map_err(network_backend_error),
+        receipt @ MutationReceipt::KillSwitch { .. } => {
+            inner
+                .resources
+                .lock()
+                .map_err(|_| backend_error("resource lock poisoned"))?
+                .session_guard
+                .take();
+            wfp::restore_kill_switch(receipt).map_err(wfp_backend_error)
+        }
+        receipt @ MutationReceipt::SystemProxy { .. } => {
+            system_proxy::restore(receipt).map_err(system_proxy_backend_error)
+        }
+    }
+}
+
+fn restore_adapter_settings_required(
+    receipt: &MutationReceipt,
+    adapter: Option<&MutationReceipt>,
+) -> Result<bool, BackendError> {
+    restore_adapter_settings_with(
+        receipt,
+        adapter,
+        |adapter| network::inspect_adapter_identity(adapter).map_err(inspection_backend_error),
+        |adapter| wintun::adapter_resources_present(adapter).map_err(wintun_backend_error),
+    )
+}
+
+fn restore_adapter_settings_with(
+    receipt: &MutationReceipt,
+    adapter: Option<&MutationReceipt>,
+    inspect_interface: impl FnOnce(&MutationReceipt) -> Result<bool, BackendError>,
+    inspect_resources: impl FnOnce(&MutationReceipt) -> Result<bool, BackendError>,
+) -> Result<bool, BackendError> {
+    let adapter = adapter.ok_or(BackendError::AdapterIdentity)?;
+    validate_adapter_dependency(receipt, adapter)?;
+    if inspect_interface(adapter)? {
+        return Ok(true);
+    }
+    // Never write MTU/addresses through a retired LUID. Only exact PnP absence
+    // can supersede settings; a partial device is left for the adapter step.
+    if inspect_resources(adapter)? {
+        Err(BackendError::AdapterRemovalPending)
+    } else {
+        Ok(false)
+    }
+}
+
+fn validate_adapter_dependency(
+    receipt: &MutationReceipt,
+    adapter: &MutationReceipt,
+) -> Result<(), BackendError> {
+    let MutationReceipt::WintunAdapter {
+        adapter_guid,
+        interface_luid,
+        ..
+    } = adapter
+    else {
+        return Err(BackendError::AdapterIdentity);
+    };
+    let matches = match receipt {
+        MutationReceipt::InterfaceConfiguration {
+            interface_luid: target,
+            ..
+        } => *interface_luid != 0 && target == interface_luid,
+        MutationReceipt::Dns { interface_guid, .. } => {
+            !adapter_guid.is_nil() && interface_guid == adapter_guid
+        }
+        _ => false,
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(BackendError::AdapterIdentity)
+    }
+}
+
+fn wintun_backend_error(error: wintun::WintunError) -> BackendError {
+    match error {
+        wintun::WintunError::Removal(diagnostic) => BackendError::AdapterRemoval(diagnostic),
+        wintun::WintunError::Windows(api, error) => BackendError::Windows {
+            api,
+            code: error.raw_os_error().unwrap_or_default() as u32,
+        },
+        wintun::WintunError::AdapterRemovalIncomplete(_) => BackendError::AdapterRemovalPending,
+        _ => BackendError::AdapterIdentity,
+    }
+}
+
+fn adapter_name(plan: &ValidatedTunnelPlan) -> String {
+    let compact = plan.profile_id.simple().to_string();
+    format!("Usque-{}", &compact[..12])
+}
+
+fn valid_recovery_adapter_name(value: &str) -> bool {
+    value.len() == 18
+        && value.starts_with("Usque-")
+        && value[6..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn lock_resources(
+    inner: &BackendInner,
+) -> Result<std::sync::MutexGuard<'_, WindowsResources>, BackendError> {
+    inner
+        .resources
+        .lock()
+        .map_err(|_| backend_error("Windows resource lock was poisoned"))
+}
+
+fn current_adapter_luid(inner: &BackendInner) -> Result<u64, BackendError> {
+    let resources = lock_resources(inner)?;
+    let adapter = resources
+        .adapter
+        .as_ref()
+        .ok_or_else(|| backend_error("Wintun adapter is not prepared"))?;
+    let interface_luid = adapter.luid();
+    if interface_luid == 0 {
+        Err(backend_error("Wintun returned an empty interface LUID"))
+    } else {
+        Ok(interface_luid)
+    }
+}
+
+fn apply_enriched(
+    mut receipt: MutationReceipt,
+    apply: impl FnOnce(&mut MutationReceipt) -> Result<(), network::NetworkError>,
+) -> Result<(MutationReceipt, StepOutput), BackendError> {
+    match apply(&mut receipt) {
+        Ok(()) => Ok((receipt, StepOutput::default())),
+        Err(error) => Err(BackendError::PartialApply {
+            message: error.to_string(),
+            receipt: Box::new(receipt),
+        }),
+    }
+}
+
+fn backend_error(message: impl Into<String>) -> BackendError {
+    BackendError::Operation(message.into())
+}
+
+fn network_backend_error(error: network::NetworkError) -> BackendError {
+    match error {
+        network::NetworkError::Windows { operation, code } => BackendError::Windows {
+            api: operation,
+            code,
+        },
+        network::NetworkError::AdapterIdentity => BackendError::AdapterIdentity,
+        network::NetworkError::NoReachableEndpoint => BackendError::EndpointUnreachable,
+        network::NetworkError::NoReachableControlApi => BackendError::ControlApiUnreachable,
+        error => backend_error(error.to_string()),
+    }
+}
+
+fn inspection_backend_error(error: network::NetworkError) -> BackendError {
+    match error {
+        network::NetworkError::Windows { operation, code } => BackendError::Windows {
+            api: operation,
+            code,
+        },
+        network::NetworkError::AdapterIdentity => BackendError::AdapterIdentity,
+        _ => backend_error("network resource inspection could not be verified"),
+    }
+}
+
+fn wfp_backend_error(error: wfp::WfpError) -> BackendError {
+    match error {
+        wfp::WfpError::Windows { operation, code } => BackendError::Windows {
+            api: operation,
+            code,
+        },
+        _ => backend_error("WFP resource could not be verified or restored"),
+    }
+}
+
+fn system_proxy_backend_error(error: system_proxy::SystemProxyError) -> BackendError {
+    match error {
+        system_proxy::SystemProxyError::Windows { operation, code } => BackendError::Windows {
+            api: operation,
+            code,
+        },
+        _ => backend_error(error.to_string()),
+    }
+}
+
+fn unavailable(feature: &'static str) -> BackendError {
+    BackendError::Unavailable(feature.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn adapter_settings_never_write_through_a_retired_luid_or_unverified_device() {
+        let guid = Uuid::new_v4();
+        let adapter = MutationReceipt::WintunAdapter {
+            adapter_name: "Usque-0123456789ab".to_owned(),
+            adapter_guid: guid,
+            interface_luid: 7,
+        };
+        for receipt in [
+            MutationReceipt::InterfaceConfiguration {
+                interface_luid: 7,
+                previous_ipv4_mtu: Some(1500),
+                previous_ipv6_mtu: None,
+                created_addresses: Vec::new(),
+            },
+            MutationReceipt::Dns {
+                interface_guid: guid,
+                previous_automatic: true,
+                previous_servers: Vec::new(),
+            },
+        ] {
+            assert!(
+                !restore_adapter_settings_with(
+                    &receipt,
+                    Some(&adapter),
+                    |_| Ok(false),
+                    |_| Ok(false)
+                )
+                .unwrap()
+            );
+            assert!(
+                restore_adapter_settings_with(
+                    &receipt,
+                    Some(&adapter),
+                    |_| Ok(true),
+                    |_| panic!("live exact interface")
+                )
+                .unwrap()
+            );
+            assert!(matches!(
+                restore_adapter_settings_with(
+                    &receipt,
+                    Some(&adapter),
+                    |_| Ok(false),
+                    |_| Ok(true)
+                ),
+                Err(BackendError::AdapterRemovalPending)
+            ));
+            assert!(matches!(
+                restore_adapter_settings_with(
+                    &receipt,
+                    Some(&adapter),
+                    |_| Ok(false),
+                    |_| Err(BackendError::Windows {
+                        api: "probe",
+                        code: 5
+                    })
+                ),
+                Err(BackendError::Windows { code: 5, .. })
+            ));
+            assert!(
+                restore_adapter_settings_with(
+                    &receipt,
+                    None,
+                    |_| panic!("missing identity"),
+                    |_| panic!("missing identity")
+                )
+                .is_err()
+            );
+        }
+        let wrong = MutationReceipt::InterfaceConfiguration {
+            interface_luid: 8,
+            previous_ipv4_mtu: Some(1500),
+            previous_ipv6_mtu: None,
+            created_addresses: Vec::new(),
+        };
+        assert!(
+            restore_adapter_settings_with(
+                &wrong,
+                Some(&adapter),
+                |_| panic!("wrong identity"),
+                |_| panic!("wrong identity")
+            )
+            .is_err()
+        );
+    }
+
+    fn official_dll() -> PathBuf {
+        let architecture = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "amd64"
+        };
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../third_party/wintun-0.14.1/wintun/bin")
+            .join(architecture)
+            .join("wintun.dll")
+            .canonicalize()
+            .expect("official Wintun")
+    }
+
+    #[test]
+    #[ignore = "requires an isolated Windows VM: loading Wintun can schedule native orphan cleanup"]
+    fn opening_backend_only_verifies_and_loads_the_dependency() {
+        let backend = WindowsBackend::open(&official_dll()).expect("backend");
+        let capabilities = backend.capabilities();
+        assert!(capabilities.wintun);
+        assert!(capabilities.shared_packet_ring);
+        assert!(capabilities.interface_addresses);
+        assert!(capabilities.interface_dns);
+        assert!(capabilities.wfp_kill_switch);
+        assert!(capabilities.guarded_recovery);
+        assert!(capabilities.automatic_recovery);
+    }
+
+    #[test]
+    fn system_proxy_win32_failures_remain_structured_for_recovery() {
+        assert!(matches!(
+            system_proxy_backend_error(system_proxy::SystemProxyError::Windows {
+                operation: "RegFlushKey",
+                code: 170,
+            }),
+            BackendError::Windows {
+                api: "RegFlushKey",
+                code: 170,
+            }
+        ));
+        assert!(matches!(
+            system_proxy_backend_error(system_proxy::SystemProxyError::OwnerChanged),
+            BackendError::Operation(_)
+        ));
+    }
+}

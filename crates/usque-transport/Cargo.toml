@@ -1,0 +1,57 @@
+[package]
+name = "usque-transport"
+description = "MASQUE transports and user-space proxy data plane for Usque"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = []
+fault-injection = []
+wireguard = ["dep:boringtun"]
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+boring.workspace = true
+boringtun = { workspace = true, optional = true }
+bytes.workspace = true
+h2.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+libc.workspace = true
+p256.workspace = true
+quiche.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+socket2.workspace = true
+smoltcp.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-boring.workspace = true
+tokio-rustls.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+ts_netstack_smoltcp.workspace = true
+usque-core = { path = "../usque-core" }
+usque-openvpn = { path = "../usque-openvpn" }
+usque-geo = { path = "../usque-geo" }
+usque-protocol = { path = "../usque-protocol" }
+uuid.workspace = true
+webpki-roots.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+proptest.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

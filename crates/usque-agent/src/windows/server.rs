@@ -1,0 +1,4090 @@
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque, hash_map::DefaultHasher},
+    future::Future,
+    hash::{Hash, Hasher},
+    io, mem,
+    net::SocketAddr,
+    os::windows::io::AsRawHandle,
+    ptr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+
+use bytes::BytesMut;
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::windows::named_pipe::{NamedPipeServer, ServerOptions},
+    sync::{Mutex, Notify},
+};
+use tracing::{info, warn};
+use usque_ipc::{
+    agent_v1::{
+        self, AgentCapabilities, AgentRequest, AgentResponse, AgentState, agent_request,
+        agent_response,
+    },
+    decode_frame, encode_frame, split_frame,
+};
+use uuid::Uuid;
+use windows_sys::Win32::{
+    Foundation::{HANDLE, LocalFree},
+    Security::{
+        Authorization::{ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1},
+        PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES,
+    },
+};
+
+use crate::{
+    AGENT_PROTOCOL_VERSION, AuthenticatedCaller,
+    coordinator::{
+        AgentCoordinator, BackendError, CoordinatorError, ORPHANED_TUNNEL_RECOVERY_GRACE,
+        PrivilegedBackend, RecoveryDisposition, SystemProxySettings, TunnelInspection,
+    },
+    journal::{
+        MutationKind, MutationReceipt, MutationState, RecoveryJournal, RecoveryPhase, RouteReceipt,
+    },
+    plan::ValidatedTunnelPlan,
+    windows::{
+        auth::{AuthenticationError, CallerPolicy, authenticate_named_pipe},
+        network,
+        service_config::{
+            NoopServiceStartModeController, ServiceConfigError, ServiceStartMode,
+            ServiceStartModeController, desired_start_mode,
+        },
+        wfp,
+    },
+};
+
+pub const AGENT_PIPE_NAME: &str = r"\\.\pipe\io.github.georgexie2333.usque.agent.v1";
+const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024;
+const READ_CHUNK_BYTES: usize = 16 * 1024;
+const MAX_REQUEST_ID_BYTES: usize = 128;
+const MAX_REPLAY_ENTRIES: usize = 256;
+const MAX_DYNAMIC_DIRECT_TARGETS: usize = 1024;
+pub const AGENT_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const DEMAND_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(2),
+];
+pub const AUTOMATIC_RECOVERY_ATTEMPT_LIMIT: u32 = 3;
+const AUTOMATIC_RECOVERY_DELAYS: [Duration; AUTOMATIC_RECOVERY_ATTEMPT_LIMIT as usize] = [
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
+const DEVICE_RETIREMENT_PERSIST_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+pub struct AgentService<Backend> {
+    coordinator: Arc<AgentCoordinator<Backend>>,
+    capabilities: AgentCapabilities,
+    replay: Mutex<ReplayCache>,
+    start_mode: Arc<dyn ServiceStartModeController>,
+    mutation_gate: Mutex<()>,
+    activity: Arc<ActivityTracker>,
+    direct_egress: Mutex<DirectEgressRegistry>,
+    physical_generation: Mutex<PhysicalGenerationState>,
+    automatic_recovery: Mutex<AutomaticRecoveryRuntime>,
+    automatic_recovery_notify: Notify,
+    stopping: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutomaticRecoveryStage {
+    Inactive,
+    Waiting,
+    Running,
+    Exhausted,
+    Blocked,
+}
+
+#[derive(Clone)]
+struct AutomaticRecoveryTerminal {
+    code: &'static str,
+    message: String,
+    retryable: bool,
+}
+
+#[derive(Clone)]
+struct AutomaticRecoveryRuntime {
+    operation_id: Option<Uuid>,
+    stage: AutomaticRecoveryStage,
+    attempts_completed: u32,
+    terminal: Option<AutomaticRecoveryTerminal>,
+    journal_snapshot: Option<RecoveryJournal>,
+    revision: u64,
+}
+
+impl Default for AutomaticRecoveryRuntime {
+    fn default() -> Self {
+        Self {
+            operation_id: None,
+            stage: AutomaticRecoveryStage::Inactive,
+            attempts_completed: 0,
+            terminal: None,
+            journal_snapshot: None,
+            revision: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DirectEgressKey {
+    operation_id: Uuid,
+    remote: SocketAddr,
+    protocol: u8,
+    interface_luid: u64,
+    network_generation: u64,
+    purpose: EgressPurpose,
+}
+
+const MAX_AUTOMATIC_ENDPOINT_LEASES: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum EgressPurpose {
+    Generic,
+    AutomaticMasque,
+}
+
+impl EgressPurpose {
+    fn from_proto(value: i32) -> Result<Self, ServiceError> {
+        match value {
+            0 => Ok(Self::Generic),
+            1 => Ok(Self::AutomaticMasque),
+            _ => Err(ServiceError::DirectEgressTarget),
+        }
+    }
+}
+
+struct DirectEgressEntry {
+    references: usize,
+    _permit: Option<wfp::DynamicPermit>,
+}
+
+#[derive(Default)]
+struct DirectEgressRegistry {
+    entries: HashMap<DirectEgressKey, DirectEgressEntry>,
+}
+
+impl DirectEgressRegistry {
+    fn has_capacity(&self, key: DirectEgressKey) -> bool {
+        self.entries.contains_key(&key)
+            || self.entries.len() < MAX_DYNAMIC_DIRECT_TARGETS
+                && (key.purpose != EgressPurpose::AutomaticMasque
+                    || self
+                        .entries
+                        .keys()
+                        .filter(|entry| entry.purpose == EgressPurpose::AutomaticMasque)
+                        .count()
+                        < MAX_AUTOMATIC_ENDPOINT_LEASES)
+    }
+    fn invalidate_before(&mut self, generation: u64) {
+        // Snapshot invalidation can run after a concurrent acquisition for
+        // this or a newer generation. Never revoke that newer authorization.
+        self.entries
+            .retain(|key, _| key.network_generation >= generation);
+    }
+
+    fn release(&mut self, key: DirectEgressKey) {
+        let remove = self.entries.get_mut(&key).is_some_and(|entry| {
+            entry.references = entry.references.saturating_sub(1);
+            entry.references == 0
+        });
+        if remove {
+            self.entries.remove(&key);
+        }
+    }
+}
+
+#[derive(Default)]
+struct PhysicalGenerationState {
+    fingerprint: Option<u64>,
+    generation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MutationPolicy {
+    Forward,
+    Cleanup,
+}
+
+#[derive(Default)]
+struct ActivityTracker {
+    connections: AtomicUsize,
+    background: AtomicUsize,
+    generation: AtomicU64,
+    notify: Notify,
+}
+
+impl ActivityTracker {
+    fn begin(self: &Arc<Self>, kind: ActivityKind) -> ActivityGuard {
+        match kind {
+            ActivityKind::Connection => self.connections.fetch_add(1, Ordering::AcqRel),
+            ActivityKind::Background => self.background.fetch_add(1, Ordering::AcqRel),
+        };
+        self.changed();
+        ActivityGuard {
+            tracker: Arc::clone(self),
+            kind,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.connections.load(Ordering::Acquire) == 0
+            && self.background.load(Ordering::Acquire) == 0
+    }
+
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.notify.notify_waiters();
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ActivityKind {
+    Connection,
+    Background,
+}
+
+struct ActivityGuard {
+    tracker: Arc<ActivityTracker>,
+    kind: ActivityKind,
+}
+
+impl Drop for ActivityGuard {
+    fn drop(&mut self) {
+        match self.kind {
+            ActivityKind::Connection => self.tracker.connections.fetch_sub(1, Ordering::AcqRel),
+            ActivityKind::Background => self.tracker.background.fetch_sub(1, Ordering::AcqRel),
+        };
+        self.tracker.changed();
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AgentLifecycleError {
+    #[error("the Agent is shutting down; no new operation may start")]
+    ShuttingDown,
+    #[error("{0}")]
+    Coordinator(#[from] CoordinatorError),
+    #[error("the Agent could not arm crash recovery before changing Windows state: {0}")]
+    StartMode(#[from] ServiceConfigError),
+}
+
+impl<Backend> AgentService<Backend>
+where
+    Backend: PrivilegedBackend + 'static,
+{
+    pub fn new(
+        coordinator: Arc<AgentCoordinator<Backend>>,
+        capabilities: AgentCapabilities,
+    ) -> Self {
+        Self::with_start_mode_controller(
+            coordinator,
+            capabilities,
+            Arc::new(NoopServiceStartModeController),
+        )
+    }
+
+    pub fn with_start_mode_controller(
+        coordinator: Arc<AgentCoordinator<Backend>>,
+        capabilities: AgentCapabilities,
+        start_mode: Arc<dyn ServiceStartModeController>,
+    ) -> Self {
+        Self {
+            coordinator,
+            capabilities,
+            replay: Mutex::new(ReplayCache::default()),
+            start_mode,
+            mutation_gate: Mutex::new(()),
+            activity: Arc::new(ActivityTracker::default()),
+            direct_egress: Mutex::new(DirectEgressRegistry::default()),
+            physical_generation: Mutex::new(PhysicalGenerationState::default()),
+            automatic_recovery: Mutex::new(AutomaticRecoveryRuntime::default()),
+            automatic_recovery_notify: Notify::new(),
+            stopping: AtomicBool::new(false),
+        }
+    }
+
+    pub async fn state(&self) -> RecoveryJournal {
+        self.coordinator.state().await
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.stopping.store(true, Ordering::Release);
+        self.automatic_recovery_notify.notify_waiters();
+    }
+
+    async fn automatic_recovery_status(&self) -> agent_v1::AutomaticRecoveryStatus {
+        let runtime = self.automatic_recovery.lock().await;
+        agent_v1::AutomaticRecoveryStatus {
+            phase: match runtime.stage {
+                AutomaticRecoveryStage::Inactive => {
+                    agent_v1::AutomaticRecoveryPhase::Inactive as i32
+                }
+                AutomaticRecoveryStage::Waiting => agent_v1::AutomaticRecoveryPhase::Waiting as i32,
+                AutomaticRecoveryStage::Running => agent_v1::AutomaticRecoveryPhase::Running as i32,
+                AutomaticRecoveryStage::Exhausted => {
+                    agent_v1::AutomaticRecoveryPhase::Exhausted as i32
+                }
+                AutomaticRecoveryStage::Blocked => agent_v1::AutomaticRecoveryPhase::Blocked as i32,
+            },
+            attempts_completed: runtime.attempts_completed,
+            attempt_limit: AUTOMATIC_RECOVERY_ATTEMPT_LIMIT,
+            terminal_error: runtime
+                .terminal
+                .as_ref()
+                .map(|terminal| agent_v1::AgentError {
+                    code: terminal.code.to_owned(),
+                    message: terminal.message.chars().take(512).collect(),
+                    retryable: terminal.retryable,
+                }),
+        }
+    }
+
+    async fn proto_state(&self, journal: &RecoveryJournal) -> AgentState {
+        let mut state = state_to_proto(
+            journal,
+            self.coordinator.packet_session_attached(),
+            self.automatic_recovery_status().await,
+        );
+        state.device = Some(self.coordinator.device_status(journal));
+        state.replacement = self
+            .coordinator
+            .replacement_status(journal)
+            .await
+            .map(Box::new);
+        state
+    }
+
+    async fn proto_platform_state(&self, journal: &RecoveryJournal) -> agent_v1::PlatformState {
+        let mut state = platform_state_to_proto(
+            journal,
+            self.coordinator.packet_session_attached(),
+            self.coordinator.tunnel_lease_attached(),
+            self.automatic_recovery_status().await,
+        );
+        state.device = Some(self.coordinator.device_status(journal));
+        state
+    }
+
+    async fn current_proto_state(&self) -> AgentState {
+        let journal = match self.coordinator.try_state() {
+            Some(journal) => journal,
+            None => match self
+                .automatic_recovery
+                .lock()
+                .await
+                .journal_snapshot
+                .clone()
+            {
+                Some(journal) => journal,
+                None => self.coordinator.state().await,
+            },
+        };
+        self.proto_state(&journal).await
+    }
+
+    async fn current_proto_platform_state(&self) -> agent_v1::PlatformState {
+        let journal = match self.coordinator.try_state() {
+            Some(journal) => journal,
+            None => match self
+                .automatic_recovery
+                .lock()
+                .await
+                .journal_snapshot
+                .clone()
+            {
+                Some(journal) => journal,
+                None => self.coordinator.state().await,
+            },
+        };
+        let mut state = self.proto_platform_state(&journal).await;
+        if let Some(error) = state
+            .automatic_recovery
+            .as_mut()
+            .and_then(|status| status.terminal_error.as_mut())
+        {
+            error.message.clear();
+        }
+        state.recovery_diagnostics = Some(Box::new(
+            self.coordinator.inspect_recovery_diagnostics().await,
+        ));
+        state
+    }
+
+    async fn reconcile_automatic_recovery_state(&self) {
+        if !self.capabilities.automatic_recovery {
+            return;
+        }
+        let journal = self.coordinator.state().await;
+        let eligible_operation = (journal.phase == RecoveryPhase::RecoveryRequired
+            && !journal.replacement_pending())
+        .then_some(journal.operation_id)
+        .flatten();
+        let mut runtime = self.automatic_recovery.lock().await;
+        let changed = match eligible_operation {
+            Some(operation_id) if runtime.operation_id != Some(operation_id) => {
+                *runtime = AutomaticRecoveryRuntime {
+                    operation_id: Some(operation_id),
+                    stage: AutomaticRecoveryStage::Waiting,
+                    attempts_completed: 0,
+                    terminal: None,
+                    journal_snapshot: Some(journal.clone()),
+                    revision: runtime.revision.wrapping_add(1),
+                };
+                true
+            }
+            Some(operation_id)
+                if runtime.operation_id == Some(operation_id)
+                    && runtime.stage == AutomaticRecoveryStage::Inactive =>
+            {
+                runtime.stage = AutomaticRecoveryStage::Waiting;
+                runtime.attempts_completed = 0;
+                runtime.terminal = None;
+                runtime.journal_snapshot = Some(journal.clone());
+                runtime.revision = runtime.revision.wrapping_add(1);
+                true
+            }
+            None if runtime.stage != AutomaticRecoveryStage::Inactive
+                || runtime.operation_id.is_some() =>
+            {
+                let revision = runtime.revision.wrapping_add(1);
+                *runtime = AutomaticRecoveryRuntime {
+                    revision,
+                    ..AutomaticRecoveryRuntime::default()
+                };
+                true
+            }
+            _ => false,
+        };
+        drop(runtime);
+        if changed {
+            self.automatic_recovery_notify.notify_waiters();
+            self.activity.changed();
+        }
+    }
+
+    /// Runs the service-owned bounded recovery loop. The caller must keep this
+    /// future alive until it returns after `begin_shutdown`; dropping it while
+    /// a native recovery worker is running would release the mutation gate too
+    /// early even though `spawn_blocking` cannot be cancelled.
+    pub async fn run_automatic_recovery(self: Arc<Self>) {
+        self.run_automatic_recovery_with_delays(AUTOMATIC_RECOVERY_DELAYS)
+            .await;
+    }
+
+    async fn run_automatic_recovery_with_delays(
+        self: Arc<Self>,
+        delays: [Duration; AUTOMATIC_RECOVERY_ATTEMPT_LIMIT as usize],
+    ) {
+        if !self.capabilities.automatic_recovery && !self.capabilities.reusable_tun_device {
+            return;
+        }
+        self.reconcile_automatic_recovery_state().await;
+        loop {
+            if self.stopping.load(Ordering::Acquire) {
+                return;
+            }
+
+            let notified = self.automatic_recovery_notify.notified();
+            tokio::pin!(notified);
+            let _ = notified.as_mut().enable();
+            let next = {
+                let runtime = self.automatic_recovery.lock().await;
+                (runtime.stage == AutomaticRecoveryStage::Waiting
+                    && runtime.attempts_completed < AUTOMATIC_RECOVERY_ATTEMPT_LIMIT)
+                    .then(|| {
+                        (
+                            runtime
+                                .operation_id
+                                .expect("waiting recovery has operation"),
+                            runtime.attempts_completed,
+                            runtime.revision,
+                            delays[runtime.attempts_completed as usize],
+                        )
+                    })
+            };
+            let Some((operation_id, attempts_completed, revision, delay)) = next else {
+                if !self.coordinator.device_retirement_retry_pending() {
+                    notified.await;
+                    continue;
+                }
+                tokio::select! {
+                    () = &mut notified => continue,
+                    () = tokio::time::sleep(DEVICE_RETIREMENT_PERSIST_RETRY_DELAY) => {}
+                }
+                let _activity = self.activity.begin(ActivityKind::Background);
+                // Only retry the failed device journal write. The coordinator
+                // remembers any native result, including an unfinished worker.
+                // This neither consumes nor refreshes the connection budget.
+                if let Err(error) = self
+                    .mutate(MutationPolicy::Cleanup, |coordinator| async move {
+                        coordinator.retry_device_retirement_persistence().await
+                    })
+                    .await
+                    && !self.coordinator.device_retirement_retry_pending()
+                {
+                    warn!(%error, "device retirement persistence retry stopped");
+                }
+                continue;
+            };
+
+            tokio::select! {
+                biased;
+                () = &mut notified => continue,
+                () = tokio::time::sleep(delay) => {}
+            }
+            if self.stopping.load(Ordering::Acquire) {
+                return;
+            }
+
+            {
+                let mut runtime = self.automatic_recovery.lock().await;
+                if runtime.operation_id != Some(operation_id)
+                    || runtime.stage != AutomaticRecoveryStage::Waiting
+                    || runtime.attempts_completed != attempts_completed
+                    || runtime.revision != revision
+                {
+                    continue;
+                }
+                runtime.stage = AutomaticRecoveryStage::Running;
+            }
+            self.automatic_recovery_notify.notify_waiters();
+
+            let _activity = self.activity.begin(ActivityKind::Background);
+            let result = self.automatic_recovery_attempt(operation_id).await;
+            self.finish_automatic_recovery_attempt(operation_id, result)
+                .await;
+        }
+    }
+
+    async fn automatic_recovery_attempt(
+        &self,
+        operation_id: Uuid,
+    ) -> Result<(), AgentLifecycleError> {
+        let _gate = self.mutation_gate.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(AgentLifecycleError::ShuttingDown);
+        }
+        let state = self.coordinator.state().await;
+        {
+            let mut runtime = self.automatic_recovery.lock().await;
+            if runtime.operation_id == Some(operation_id)
+                && runtime.stage == AutomaticRecoveryStage::Running
+            {
+                runtime.journal_snapshot = Some(state.clone());
+            }
+        }
+        if state.phase != RecoveryPhase::Clean
+            && let Err(error) = self
+                .start_mode
+                .ensure_start_mode(ServiceStartMode::Auto)
+                .await
+        {
+            warn!(%error, phase = ?state.phase, "could not retain automatic Agent startup before background recovery");
+        }
+        let result = self
+            .coordinator
+            .recover_automatic(operation_id, state.generation, self.clear_direct_egress())
+            .await
+            .map(|_| ())
+            .map_err(AgentLifecycleError::Coordinator);
+        self.reconcile_start_mode_locked().await;
+        result
+    }
+
+    async fn finish_automatic_recovery_attempt(
+        &self,
+        operation_id: Uuid,
+        result: Result<(), AgentLifecycleError>,
+    ) {
+        let current = self.coordinator.state().await;
+        let mut runtime = self.automatic_recovery.lock().await;
+        if runtime.operation_id != Some(operation_id)
+            || runtime.stage != AutomaticRecoveryStage::Running
+        {
+            return;
+        }
+        runtime.attempts_completed = runtime.attempts_completed.saturating_add(1);
+        runtime.revision = runtime.revision.wrapping_add(1);
+        runtime.journal_snapshot = Some(current.clone());
+
+        if result.is_ok() && current.phase == RecoveryPhase::Clean {
+            let attempts = runtime.attempts_completed;
+            let revision = runtime.revision;
+            *runtime = AutomaticRecoveryRuntime {
+                revision,
+                ..AutomaticRecoveryRuntime::default()
+            };
+            info!(attempts, "automatic Agent recovery completed");
+        } else if current.operation_id != Some(operation_id)
+            || current.phase != RecoveryPhase::RecoveryRequired
+        {
+            runtime.stage = AutomaticRecoveryStage::Blocked;
+            runtime.terminal = Some(AutomaticRecoveryTerminal {
+                code: "AGENT_AUTOMATIC_RECOVERY_BLOCKED",
+                message: "automatic recovery stopped because the journal transaction changed"
+                    .to_owned(),
+                retryable: false,
+            });
+        } else {
+            let assessment = match result {
+                Err(AgentLifecycleError::Coordinator(error)) => Some((
+                    error.recovery_disposition(),
+                    error.sanitized_recovery_summary(),
+                )),
+                _ => None,
+            };
+            match assessment {
+                Some((RecoveryDisposition::Retryable, summary))
+                    if runtime.attempts_completed < AUTOMATIC_RECOVERY_ATTEMPT_LIMIT =>
+                {
+                    warn!(
+                        attempt = runtime.attempts_completed,
+                        attempts = AUTOMATIC_RECOVERY_ATTEMPT_LIMIT,
+                        error = %summary,
+                        "automatic Agent recovery remains incomplete; scheduling another attempt"
+                    );
+                    runtime.stage = AutomaticRecoveryStage::Waiting;
+                    runtime.terminal = None;
+                }
+                Some((RecoveryDisposition::Retryable, summary)) => {
+                    let attempts = runtime.attempts_completed;
+                    runtime.stage = AutomaticRecoveryStage::Exhausted;
+                    runtime.terminal = Some(AutomaticRecoveryTerminal {
+                        code: "AGENT_AUTOMATIC_RECOVERY_EXHAUSTED",
+                        message: format!(
+                            "automatic recovery exhausted after {attempts} attempts: {summary}"
+                        ),
+                        retryable: true,
+                    });
+                }
+                Some((RecoveryDisposition::Blocked, summary)) => {
+                    runtime.stage = AutomaticRecoveryStage::Blocked;
+                    runtime.terminal = Some(AutomaticRecoveryTerminal {
+                        code: "AGENT_AUTOMATIC_RECOVERY_BLOCKED",
+                        message: format!("automatic recovery was blocked: {summary}"),
+                        retryable: false,
+                    });
+                }
+                None => {
+                    runtime.stage = AutomaticRecoveryStage::Blocked;
+                    runtime.terminal = Some(AutomaticRecoveryTerminal {
+                        code: "AGENT_AUTOMATIC_RECOVERY_BLOCKED",
+                        message: "automatic recovery was blocked by a state or service failure"
+                            .to_owned(),
+                        retryable: false,
+                    });
+                }
+            }
+        }
+        let stage = runtime.stage;
+        let attempts = runtime.attempts_completed;
+        drop(runtime);
+        self.automatic_recovery_notify.notify_waiters();
+        self.activity.changed();
+        if matches!(
+            stage,
+            AutomaticRecoveryStage::Exhausted | AutomaticRecoveryStage::Blocked
+        ) {
+            warn!(attempts, ?stage, "automatic Agent recovery stopped");
+        }
+    }
+
+    async fn restart_automatic_recovery(
+        &self,
+        operation_id: Uuid,
+        expected_generation: u64,
+        caller: &AuthenticatedCaller,
+    ) -> Result<RecoveryJournal, ServiceError> {
+        if !self.capabilities.automatic_recovery {
+            return Err(ServiceError::AutomaticRecoveryUnsupported);
+        }
+        {
+            let runtime = self.automatic_recovery.lock().await;
+            if runtime.stage == AutomaticRecoveryStage::Running
+                && runtime.operation_id == Some(operation_id)
+            {
+                let journal = runtime
+                    .journal_snapshot
+                    .clone()
+                    .ok_or(ServiceError::Lifecycle(AgentLifecycleError::Coordinator(
+                        CoordinatorError::RecoveryConflict,
+                    )))?;
+                self.coordinator
+                    .validate_automatic_recovery_restart_snapshot(
+                        &journal,
+                        operation_id,
+                        expected_generation,
+                        caller,
+                    )
+                    .map_err(|error| {
+                        ServiceError::Lifecycle(AgentLifecycleError::Coordinator(error))
+                    })?;
+                return Ok(journal);
+            }
+        }
+        let _gate = self.mutation_gate.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(ServiceError::Lifecycle(AgentLifecycleError::ShuttingDown));
+        }
+        let journal = self
+            .coordinator
+            .validate_automatic_recovery_restart(operation_id, expected_generation, caller)
+            .await
+            .map_err(|error| ServiceError::Lifecycle(AgentLifecycleError::Coordinator(error)))?;
+        let exhausted = {
+            let runtime = self.automatic_recovery.lock().await;
+            runtime.stage == AutomaticRecoveryStage::Exhausted
+                && runtime.operation_id == Some(operation_id)
+        };
+        if exhausted
+            && let Some(clean) = self
+                .coordinator
+                .reconcile_absent_adapter_on_retry(operation_id, expected_generation, caller)
+                .await
+                .map_err(|error| ServiceError::Lifecycle(AgentLifecycleError::Coordinator(error)))?
+        {
+            *self.automatic_recovery.lock().await = AutomaticRecoveryRuntime::default();
+            self.reconcile_start_mode_locked().await;
+            self.automatic_recovery_notify.notify_waiters();
+            self.activity.changed();
+            return Ok(clean);
+        }
+        let mut runtime = self.automatic_recovery.lock().await;
+        let changed = match runtime.stage {
+            AutomaticRecoveryStage::Blocked if runtime.operation_id == Some(operation_id) => {
+                return Err(ServiceError::AutomaticRecoveryBlocked);
+            }
+            AutomaticRecoveryStage::Waiting | AutomaticRecoveryStage::Running
+                if runtime.operation_id == Some(operation_id) =>
+            {
+                false
+            }
+            AutomaticRecoveryStage::Exhausted if runtime.operation_id == Some(operation_id) => {
+                let revision = runtime.revision.wrapping_add(1);
+                *runtime = AutomaticRecoveryRuntime {
+                    operation_id: Some(operation_id),
+                    stage: AutomaticRecoveryStage::Waiting,
+                    attempts_completed: 0,
+                    terminal: None,
+                    journal_snapshot: Some(journal.clone()),
+                    revision,
+                };
+                true
+            }
+            _ => {
+                return Err(ServiceError::Lifecycle(AgentLifecycleError::Coordinator(
+                    CoordinatorError::RecoveryConflict,
+                )));
+            }
+        };
+        drop(runtime);
+        if changed {
+            self.automatic_recovery_notify.notify_waiters();
+            self.activity.changed();
+        }
+        Ok(journal)
+    }
+
+    /// Owned by the service, never by a client pipe. A timeout must not drop
+    /// this future and unlock a still-running native recovery worker.
+    pub async fn recover_for_shutdown(&self) -> Result<(), AgentLifecycleError> {
+        self.begin_shutdown();
+        let _gate = self.mutation_gate.lock().await;
+        let result = self
+            .coordinator
+            .recover_for_process_exit(self.clear_direct_egress())
+            .await;
+        self.reconcile_start_mode_locked().await;
+        result.map(|_| ()).map_err(AgentLifecycleError::Coordinator)
+    }
+
+    pub async fn retire_startup_device(&self) -> Result<(), AgentLifecycleError> {
+        self.mutate(MutationPolicy::Cleanup, |coordinator| async move {
+            coordinator.retire_device().await.map(|_| ())
+        })
+        .await
+    }
+
+    pub async fn inspect_startup_tunnel(&self) -> Result<TunnelInspection, AgentLifecycleError> {
+        self.mutate(MutationPolicy::Cleanup, |coordinator| async move {
+            coordinator.inspect_startup_tunnel().await
+        })
+        .await
+    }
+
+    async fn physical_network_info(
+        &self,
+        operation_id: Uuid,
+        caller: &AuthenticatedCaller,
+    ) -> Result<agent_v1::PhysicalNetworkInfo, ServiceError> {
+        let journal = self.state().await;
+        let plan = validate_direct_context(&journal, operation_id, caller, false)?;
+        let (tunnel_luid, owned_bypasses) = physical_route_context(&journal)?;
+        // Serialize observation with generation assignment. Native reads do
+        // not await, so an older observation cannot overtake a newer one.
+        let mut state = self.physical_generation.lock().await;
+        let mut selected = BTreeMap::<u64, network::PhysicalInterfaceInfo>::new();
+        for endpoint in &plan.endpoint_candidates {
+            let interface = match network::current_physical_interface(
+                *endpoint,
+                tunnel_luid,
+                &owned_bypasses,
+            ) {
+                Ok(interface) => interface,
+                Err(network::NetworkError::NoReachableEndpoint) => continue,
+                Err(error) => return Err(ServiceError::PhysicalNetwork(error.to_string())),
+            };
+            if let Some(existing) = selected.get_mut(&interface.interface_luid) {
+                if existing.interface_index != interface.interface_index
+                    || existing.dns_servers != interface.dns_servers
+                {
+                    return Err(ServiceError::StaleGeneration);
+                }
+                let mut fingerprint = DefaultHasher::new();
+                existing.route_fingerprint.hash(&mut fingerprint);
+                interface.route_fingerprint.hash(&mut fingerprint);
+                existing.route_fingerprint = fingerprint.finish();
+                existing.address_family_mask |= interface.address_family_mask;
+            } else {
+                selected.insert(interface.interface_luid, interface);
+            }
+        }
+        let interfaces = selected.into_values().collect::<Vec<_>>();
+        if interfaces.is_empty() {
+            return Err(ServiceError::PhysicalNetworkOffline);
+        }
+        let fingerprint = physical_network_fingerprint(&interfaces);
+        let changed = state.fingerprint.is_some_and(|value| value != fingerprint);
+        if state.fingerprint != Some(fingerprint) {
+            state.fingerprint = Some(fingerprint);
+            state.generation = state
+                .generation
+                .saturating_add(1)
+                .max(journal.generation)
+                .max(1);
+        }
+        let generation = state.generation;
+        drop(state);
+        if changed {
+            self.direct_egress
+                .lock()
+                .await
+                .invalidate_before(generation);
+        }
+        Ok(agent_v1::PhysicalNetworkInfo {
+            interfaces: interfaces
+                .into_iter()
+                .map(|interface| agent_v1::PhysicalInterface {
+                    interface_luid: interface.interface_luid,
+                    interface_index: interface.interface_index,
+                    dns_servers: interface
+                        .dns_servers
+                        .into_iter()
+                        .map(|address| address.to_string())
+                        .collect(),
+                    address_family_mask: u32::from(interface.address_family_mask),
+                })
+                .collect(),
+            generation,
+        })
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "exact egress authorization binds target, protocol, purpose, generation and authenticated owner"
+    )]
+    async fn acquire_direct_egress(
+        &self,
+        operation_id: Uuid,
+        remote: SocketAddr,
+        protocol: u8,
+        expected_generation: u64,
+        purpose: EgressPurpose,
+        caller: &AuthenticatedCaller,
+    ) -> Result<(agent_v1::DirectEgressLease, DirectEgressKey), ServiceError> {
+        let _gate = self.mutation_gate.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(ServiceError::Lifecycle(AgentLifecycleError::ShuttingDown));
+        }
+        if remote.port() == 0
+            || remote.ip().is_unspecified()
+            || remote.ip().is_multicast()
+            || !matches!(protocol, 6 | 17)
+        {
+            return Err(ServiceError::DirectEgressTarget);
+        }
+        let journal = self.state().await;
+        let plan = validate_direct_context(&journal, operation_id, caller, true)?;
+        if journal.replacement_pending()
+            && purpose != EgressPurpose::AutomaticMasque
+            && !wfp::is_bootstrap_endpoint(plan, remote, protocol)
+        {
+            return Err(ServiceError::DirectEgressNotReady);
+        }
+        if purpose == EgressPurpose::AutomaticMasque {
+            validate_automatic_endpoint_egress(&journal, remote, protocol, expected_generation)?;
+        }
+        let physical = self.physical_network_info(operation_id, caller).await?;
+        validate_expected_generation(expected_generation, physical.generation)?;
+        let family_mask = if remote.is_ipv4() { 1 } else { 2 };
+        let interface = physical
+            .interfaces
+            .iter()
+            .find(|interface| interface.address_family_mask & family_mask != 0)
+            .ok_or_else(|| {
+                ServiceError::PhysicalNetwork(format!(
+                    "no verified physical interface supports {}",
+                    if remote.is_ipv6() { "IPv6" } else { "IPv4" }
+                ))
+            })?;
+        let interface_luid = interface.interface_luid;
+        let key = DirectEgressKey {
+            operation_id,
+            remote,
+            protocol,
+            interface_luid,
+            network_generation: physical.generation,
+            purpose,
+        };
+        let mut registry = self.direct_egress.lock().await;
+        validate_expected_generation(
+            physical.generation,
+            self.physical_generation.lock().await.generation,
+        )?;
+        if let Some(existing) = registry.entries.get_mut(&key) {
+            existing.references = existing
+                .references
+                .checked_add(1)
+                .ok_or(ServiceError::DirectEgressLimit)?;
+        } else {
+            if !registry.has_capacity(key) {
+                return Err(ServiceError::DirectEgressLimit);
+            }
+            let permit = acquire_egress_permit_for_purpose(
+                plan,
+                journal.phase,
+                remote,
+                protocol,
+                purpose,
+                || {
+                    (if journal.replacement_pending() {
+                        wfp::acquire_replacement_control_permit(
+                            remote,
+                            protocol,
+                            interface_luid,
+                            &caller.executable_path,
+                        )
+                    } else {
+                        wfp::acquire_dynamic_permit(
+                            remote,
+                            protocol,
+                            interface_luid,
+                            &caller.executable_path,
+                        )
+                    })
+                    .map_err(ServiceError::DirectEgress)
+                },
+            )?;
+            registry.entries.insert(
+                key,
+                DirectEgressEntry {
+                    references: 1,
+                    _permit: permit,
+                },
+            );
+        }
+        if self.physical_generation.lock().await.generation != physical.generation {
+            registry.release(key);
+            return Err(ServiceError::StaleGeneration);
+        }
+        Ok((
+            agent_v1::DirectEgressLease {
+                interface_luid,
+                interface_index: interface.interface_index,
+                remote_endpoint: remote.to_string(),
+                protocol: u32::from(protocol),
+                network_generation: physical.generation,
+            },
+            key,
+        ))
+    }
+
+    async fn release_direct_egress(&self, key: DirectEgressKey) {
+        self.direct_egress.lock().await.release(key);
+    }
+
+    async fn clear_direct_egress(&self) {
+        self.direct_egress.lock().await.entries.clear();
+    }
+
+    pub async fn reconcile_removed_adapter_dependencies(
+        &self,
+    ) -> Result<bool, AgentLifecycleError> {
+        self.mutate(MutationPolicy::Cleanup, |coordinator| async move {
+            coordinator.reconcile_removed_adapter_dependencies().await
+        })
+        .await
+    }
+
+    pub async fn recover_stale(&self) -> Result<(), AgentLifecycleError> {
+        self.mutate(MutationPolicy::Cleanup, |coordinator| async move {
+            coordinator
+                .recover_stale_with_egress(self.clear_direct_egress())
+                .await
+        })
+        .await
+    }
+
+    pub async fn recover_orphaned_tunnel(
+        &self,
+        operation_id: Uuid,
+        lease_epoch: u64,
+    ) -> Result<bool, AgentLifecycleError> {
+        let _activity = self.activity.begin(ActivityKind::Background);
+        self.mutate(MutationPolicy::Cleanup, move |coordinator| async move {
+            coordinator
+                .recover_orphaned_tunnel(operation_id, lease_epoch)
+                .await
+        })
+        .await
+    }
+
+    pub async fn synchronize_start_mode(&self) {
+        let _gate = self.mutation_gate.lock().await;
+        self.reconcile_start_mode_locked().await;
+    }
+
+    async fn mutate<T, Action, ActionFuture>(
+        &self,
+        policy: MutationPolicy,
+        action: Action,
+    ) -> Result<T, AgentLifecycleError>
+    where
+        T: Send,
+        Action: FnOnce(Arc<AgentCoordinator<Backend>>) -> ActionFuture + Send,
+        ActionFuture: Future<Output = Result<T, CoordinatorError>> + Send,
+    {
+        let _gate = self.mutation_gate.lock().await;
+        if self.stopping.load(Ordering::Acquire) {
+            return Err(AgentLifecycleError::ShuttingDown);
+        }
+        match policy {
+            MutationPolicy::Forward => {
+                if let Err(error) = self
+                    .start_mode
+                    .ensure_start_mode(ServiceStartMode::Auto)
+                    .await
+                {
+                    self.reconcile_start_mode_locked().await;
+                    return Err(AgentLifecycleError::StartMode(error));
+                }
+            }
+            MutationPolicy::Cleanup => {
+                let state = self.coordinator.state().await;
+                if state.phase != RecoveryPhase::Clean
+                    && let Err(error) = self
+                        .start_mode
+                        .ensure_start_mode(ServiceStartMode::Auto)
+                        .await
+                {
+                    warn!(%error, phase = ?state.phase, "could not arm automatic startup before cleanup; continuing safety recovery");
+                }
+            }
+        }
+        let result = action(Arc::clone(&self.coordinator))
+            .await
+            .map_err(AgentLifecycleError::Coordinator);
+        self.reconcile_start_mode_locked().await;
+        self.reconcile_automatic_recovery_state().await;
+        if self.coordinator.device_retirement_retry_pending() {
+            self.automatic_recovery_notify.notify_waiters();
+        }
+        result
+    }
+
+    async fn reconcile_start_mode_locked(&self) {
+        let state = self.coordinator.state().await;
+        let desired = desired_start_mode(state.phase);
+        let mut error = match self.start_mode.ensure_start_mode(desired).await {
+            Ok(()) => return,
+            Err(error) => error,
+        };
+        if desired == ServiceStartMode::Demand {
+            for delay in DEMAND_RETRY_DELAYS {
+                tokio::time::sleep(delay).await;
+                match self.start_mode.ensure_start_mode(desired).await {
+                    Ok(()) => {
+                        info!(phase = ?state.phase, "restored demand-start Agent configuration after retry");
+                        return;
+                    }
+                    Err(next) => error = next,
+                }
+            }
+        }
+        warn!(%error, phase = ?state.phase, ?desired, "could not reconcile Agent service start type with the recovery journal");
+    }
+
+    fn connection_started(&self) -> ActivityGuard {
+        self.activity.begin(ActivityKind::Connection)
+    }
+
+    async fn handle(&self, request: AgentRequest, caller: &AuthenticatedCaller) -> AgentResponse {
+        if self.stopping.load(Ordering::Acquire) {
+            return error_response(
+                request.request_id,
+                ServiceError::Lifecycle(AgentLifecycleError::ShuttingDown),
+            );
+        }
+        if let Err(error) = validate_request_envelope(&request) {
+            return error_response(request.request_id, error);
+        }
+        let replay_key = ReplayKey {
+            sid: caller.user_sid.clone(),
+            process_id: caller.process_id,
+            request_id: request.request_id.clone(),
+        };
+        let cacheable = !matches!(
+            request.payload.as_ref(),
+            Some(
+                agent_request::Payload::AcquireDirectEgress(_)
+                    | agent_request::Payload::AcquireDeviceLease(_)
+                    | agent_request::Payload::ReleaseDeviceLease(_)
+            )
+        );
+        if cacheable {
+            let replay = self.replay.lock().await;
+            if let Some(cached) = replay.entries.get(&replay_key) {
+                return if cached.request == request {
+                    cached.response.clone()
+                } else {
+                    error_response(request.request_id, ServiceError::RequestIdReused)
+                };
+            }
+        }
+
+        let request_for_cache = request.clone();
+        let response = match self.dispatch(request, caller).await {
+            Ok(response) => response,
+            Err((request_id, error)) => error_response(request_id, error),
+        };
+        if cacheable {
+            self.replay.lock().await.insert(
+                replay_key,
+                CachedResponse {
+                    request: request_for_cache,
+                    response: response.clone(),
+                },
+            );
+        }
+        response
+    }
+
+    async fn dispatch(
+        &self,
+        request: AgentRequest,
+        caller: &AuthenticatedCaller,
+    ) -> Result<AgentResponse, (String, ServiceError)> {
+        let request_id = request.request_id;
+        let payload = request
+            .payload
+            .ok_or_else(|| (request_id.clone(), ServiceError::MissingPayload))?;
+        let payload = match payload {
+            agent_request::Payload::GetCapabilities(_) => {
+                agent_response::Payload::Capabilities(self.capabilities.clone())
+            }
+            agent_request::Payload::GetState(_) => {
+                agent_response::Payload::State(self.current_proto_state().await)
+            }
+            agent_request::Payload::InspectPlatformState(_) => {
+                let state = tokio::time::timeout(
+                    Duration::from_millis(1900),
+                    self.current_proto_platform_state(),
+                )
+                .await
+                .unwrap_or_else(|_| agent_v1::PlatformState {
+                    service_state: "running".to_owned(),
+                    recovery_diagnostics: Some(Box::new(agent_v1::RecoveryDiagnostics {
+                        current: Some(agent_v1::RecoveryObservation {
+                            sampled_at_unix_ms: crate::recovery_diagnostics::unix_ms(),
+                            status: agent_v1::RecoverySampleStatus::Timeout as i32,
+                            ..Default::default()
+                        }),
+                        history_status: agent_v1::RecoveryHistoryStatus::Unavailable as i32,
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                });
+                agent_response::Payload::PlatformState(state)
+            }
+            agent_request::Payload::GetPhysicalNetworkInfo(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                agent_response::Payload::PhysicalNetworkInfo(
+                    self.physical_network_info(operation_id, caller)
+                        .await
+                        .map_err(|error| (request_id.clone(), error))?,
+                )
+            }
+            agent_request::Payload::AcquireDirectEgress(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let remote = request
+                    .remote_endpoint
+                    .trim()
+                    .parse::<SocketAddr>()
+                    .map_err(|_| (request_id.clone(), ServiceError::DirectEgressTarget))?;
+                let protocol = u8::try_from(request.protocol)
+                    .map_err(|_| (request_id.clone(), ServiceError::DirectEgressTarget))?;
+                let (lease, _) = self
+                    .acquire_direct_egress(
+                        operation_id,
+                        remote,
+                        protocol,
+                        request.expected_generation,
+                        EgressPurpose::from_proto(request.purpose)
+                            .map_err(|error| (request_id.clone(), error))?,
+                        caller,
+                    )
+                    .await
+                    .map_err(|error| (request_id.clone(), error))?;
+                agent_response::Payload::DirectEgressLease(lease)
+            }
+            agent_request::Payload::ReplaceTunnel(request) => {
+                let source_operation_id = parse_operation_id(&request.source_operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let key = crate::coordinator::DeviceLeaseKey {
+                    id: parse_operation_id(&request.device_lease_id)
+                        .map_err(|error| (request_id.clone(), error))?,
+                    generation: request.device_lease_generation,
+                };
+                let plan = request
+                    .plan
+                    .ok_or_else(|| (request_id.clone(), ServiceError::MissingTunnelPlan))?;
+                let plan = ValidatedTunnelPlan::try_from(plan)
+                    .map_err(|error| (request_id.clone(), ServiceError::Plan(error.to_string())))?;
+                let owner = caller.clone();
+                let state = self
+                    .mutate(MutationPolicy::Forward, |coordinator| async move {
+                        coordinator
+                            .replace_tunnel(
+                                source_operation_id,
+                                request.expected_journal_generation,
+                                operation_id,
+                                plan,
+                                owner,
+                                key,
+                                self.clear_direct_egress(),
+                            )
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+            agent_request::Payload::AbortReplacement(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let owner = caller.clone();
+                let state = self
+                    .mutate(MutationPolicy::Cleanup, |coordinator| async move {
+                        coordinator
+                            .abort_replacement(
+                                operation_id,
+                                request.expected_journal_generation,
+                                &owner,
+                                self.clear_direct_egress(),
+                            )
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+            agent_request::Payload::PrepareTunnel(request) => {
+                let key = crate::coordinator::DeviceLeaseKey {
+                    id: parse_operation_id(&request.device_lease_id).map_err(|_| {
+                        (
+                            request_id.clone(),
+                            ServiceError::Lifecycle(AgentLifecycleError::Coordinator(
+                                CoordinatorError::DeviceLeaseRequired,
+                            )),
+                        )
+                    })?,
+                    generation: request.device_lease_generation,
+                };
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let plan = request
+                    .plan
+                    .ok_or_else(|| (request_id.clone(), ServiceError::MissingTunnelPlan))?;
+                let plan = ValidatedTunnelPlan::try_from(plan)
+                    .map_err(|error| (request_id.clone(), ServiceError::Plan(error.to_string())))?;
+                let caller = caller.clone();
+                let state = self
+                    .mutate(MutationPolicy::Forward, move |coordinator| async move {
+                        coordinator
+                            .prepare_managed(
+                                operation_id,
+                                plan,
+                                caller,
+                                key,
+                                request.expected_journal_generation,
+                            )
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                self.clear_direct_egress().await;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+            agent_request::Payload::AcquireDeviceLease(_) => {
+                let owner = caller.clone();
+                let key = self
+                    .mutate(MutationPolicy::Cleanup, move |coordinator| async move {
+                        coordinator.acquire_device_lease(&owner).await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::DeviceLease(agent_v1::DeviceLease {
+                    lease_id: key.id.to_string(),
+                    lease_generation: key.generation,
+                    journal_generation: self.state().await.generation,
+                })
+            }
+            agent_request::Payload::ReleaseDeviceLease(request) => {
+                let key = crate::coordinator::DeviceLeaseKey {
+                    id: parse_operation_id(&request.lease_id)
+                        .map_err(|error| (request_id.clone(), error))?,
+                    generation: request.lease_generation,
+                };
+                let owner = caller.clone();
+                self.mutate(MutationPolicy::Cleanup, |coordinator| async move {
+                    coordinator
+                        .release_device_lease_with_egress(key, &owner, self.clear_direct_egress())
+                        .await
+                })
+                .await
+                .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::State(self.proto_state(&self.state().await).await)
+            }
+            agent_request::Payload::CommitTunnel(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let caller = caller.clone();
+                let state = self
+                    .mutate(MutationPolicy::Forward, move |coordinator| async move {
+                        coordinator.commit(operation_id, &caller).await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+            agent_request::Payload::BeginChainTransition(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let caller = caller.clone();
+                let state = self
+                    .mutate(MutationPolicy::Forward, move |coordinator| async move {
+                        coordinator
+                            .begin_chain_transition(operation_id, &caller)
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+            agent_request::Payload::FinalizeTunnel(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let plan = request
+                    .plan
+                    .ok_or_else(|| (request_id.clone(), ServiceError::MissingTunnelPlan))?;
+                let plan = ValidatedTunnelPlan::try_from(plan)
+                    .map_err(|error| (request_id.clone(), ServiceError::Plan(error.to_string())))?;
+                let caller = caller.clone();
+                let state = self
+                    .mutate(MutationPolicy::Forward, move |coordinator| async move {
+                        coordinator
+                            .finalize_tunnel(operation_id, plan, &caller)
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+            agent_request::Payload::RollbackTunnel(request) => {
+                validate_reason_code(&request.reason_code)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let caller = caller.clone();
+                let state = self
+                    .mutate(MutationPolicy::Cleanup, |coordinator| async move {
+                        coordinator
+                            .rollback_with_egress(operation_id, &caller, self.clear_direct_egress())
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+            agent_request::Payload::Recover(_) => {
+                self.recover_stale()
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                self.clear_direct_egress().await;
+                agent_response::Payload::State(self.proto_state(&self.state().await).await)
+            }
+            agent_request::Payload::RecoverOrphaned(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let caller = caller.clone();
+                let state = self
+                    .mutate(MutationPolicy::Cleanup, |coordinator| async move {
+                        coordinator
+                            .recover_orphaned(
+                                operation_id,
+                                request.expected_journal_generation,
+                                &caller,
+                                self.clear_direct_egress(),
+                            )
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+            agent_request::Payload::RestartAutomaticRecovery(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let state = self
+                    .restart_automatic_recovery(
+                        operation_id,
+                        request.expected_journal_generation,
+                        caller,
+                    )
+                    .await
+                    .map_err(|error| (request_id.clone(), error))?;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+            agent_request::Payload::OpenPacketSession(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let capacity = request.ring_capacity;
+                let caller = caller.clone();
+                let handles = self
+                    .mutate(MutationPolicy::Forward, move |coordinator| async move {
+                        coordinator
+                            .open_packet_session(operation_id, capacity, &caller)
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::PacketSession(agent_v1::PacketSessionHandles {
+                    mapping_handle: handles.mapping_handle,
+                    engine_to_agent_event_handle: handles.engine_to_agent_event_handle,
+                    agent_to_engine_event_handle: handles.agent_to_engine_event_handle,
+                    shutdown_event_handle: handles.shutdown_event_handle,
+                    ring_capacity: handles.ring_capacity,
+                    layout_version: handles.layout_version,
+                })
+            }
+            agent_request::Payload::ClosePacketSession(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let caller = caller.clone();
+                let state = self
+                    .mutate(MutationPolicy::Cleanup, move |coordinator| async move {
+                        coordinator
+                            .close_packet_session(operation_id, &caller)
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+            agent_request::Payload::ResumeTunnel(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let profile_id = parse_profile_id(&request.profile_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let caller = caller.clone();
+                let handles = self
+                    .mutate(MutationPolicy::Forward, move |coordinator| async move {
+                        coordinator
+                            .resume_tunnel(operation_id, profile_id, &caller)
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::PacketSession(agent_v1::PacketSessionHandles {
+                    mapping_handle: handles.mapping_handle,
+                    engine_to_agent_event_handle: handles.engine_to_agent_event_handle,
+                    agent_to_engine_event_handle: handles.agent_to_engine_event_handle,
+                    shutdown_event_handle: handles.shutdown_event_handle,
+                    ring_capacity: handles.ring_capacity,
+                    layout_version: handles.layout_version,
+                })
+            }
+            agent_request::Payload::AcquireTunnelLease(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let caller = caller.clone();
+                let state = self
+                    .mutate(MutationPolicy::Forward, move |coordinator| async move {
+                        coordinator
+                            .acquire_tunnel_lease(operation_id, &caller)
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+            agent_request::Payload::ApplySystemProxy(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let settings = SystemProxySettings {
+                    proxy_uri: request.proxy_uri,
+                    bypass_hosts: request.bypass_hosts,
+                };
+                let caller = caller.clone();
+                let state = self
+                    .mutate(MutationPolicy::Forward, move |coordinator| async move {
+                        coordinator
+                            .apply_system_proxy(operation_id, settings, caller)
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+            agent_request::Payload::RestoreSystemProxy(request) => {
+                let operation_id = parse_operation_id(&request.operation_id)
+                    .map_err(|error| (request_id.clone(), error))?;
+                let caller = caller.clone();
+                let state = self
+                    .mutate(MutationPolicy::Cleanup, move |coordinator| async move {
+                        coordinator
+                            .restore_system_proxy(operation_id, &caller)
+                            .await
+                    })
+                    .await
+                    .map_err(|error| (request_id.clone(), ServiceError::Lifecycle(error)))?;
+                agent_response::Payload::State(self.proto_state(&state).await)
+            }
+        };
+        Ok(AgentResponse {
+            request_id,
+            error: None,
+            payload: Some(payload),
+        })
+    }
+
+    async fn release_system_proxy_lease(&self, operation_id: Uuid, caller: &AuthenticatedCaller) {
+        let caller = caller.clone();
+        if let Err(error) = self
+            .mutate(MutationPolicy::Cleanup, move |coordinator| async move {
+                coordinator
+                    .restore_system_proxy(operation_id, &caller)
+                    .await
+            })
+            .await
+        {
+            warn!(
+                %operation_id,
+                %error,
+                "failed to restore system proxy after Engine lease disconnected"
+            );
+        }
+    }
+
+    async fn release_startup_tunnel_lease(&self, operation_id: Uuid, caller: &AuthenticatedCaller) {
+        let caller = caller.clone();
+        let lease_epoch = match self
+            .mutate(MutationPolicy::Cleanup, move |coordinator| async move {
+                coordinator
+                    .release_startup_tunnel_lease(operation_id, &caller)
+                    .await
+            })
+            .await
+        {
+            Ok(Some(lease_epoch)) => lease_epoch,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(%operation_id, %error, "failed to release the Engine startup lease");
+                return;
+            }
+        };
+        tokio::time::sleep(ORPHANED_TUNNEL_RECOVERY_GRACE).await;
+        match self
+            .recover_orphaned_startup_tunnel(operation_id, lease_epoch)
+            .await
+        {
+            Ok(true) => warn!(
+                %operation_id,
+                grace_seconds = ORPHANED_TUNNEL_RECOVERY_GRACE.as_secs(),
+                "recovered an incomplete tunnel whose Engine startup lease disappeared"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(
+                %operation_id,
+                %error,
+                "failed to recover an incomplete tunnel after its startup lease disappeared"
+            ),
+        }
+    }
+
+    async fn recover_orphaned_startup_tunnel(
+        &self,
+        operation_id: Uuid,
+        lease_epoch: u64,
+    ) -> Result<bool, AgentLifecycleError> {
+        let _activity = self.activity.begin(ActivityKind::Background);
+        self.mutate(MutationPolicy::Cleanup, move |coordinator| async move {
+            coordinator
+                .recover_orphaned_startup_tunnel(operation_id, lease_epoch)
+                .await
+        })
+        .await
+    }
+
+    async fn release_tunnel_lease(&self, operation_id: Uuid, caller: &AuthenticatedCaller) {
+        let caller = caller.clone();
+        let lease_epoch = match self
+            .mutate(MutationPolicy::Cleanup, move |coordinator| async move {
+                coordinator
+                    .release_tunnel_lease(operation_id, &caller)
+                    .await
+            })
+            .await
+        {
+            Ok(Some(lease_epoch)) => lease_epoch,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(
+                    %operation_id,
+                    %error,
+                    "failed to detach packet session after Engine tunnel lease disconnected"
+                );
+                if let Err(recovery_error) = self.recover_stale().await {
+                    warn!(
+                        %operation_id,
+                        %recovery_error,
+                        "emergency recovery after tunnel lease detach failure also failed"
+                    );
+                }
+                return;
+            }
+        };
+        tokio::time::sleep(ORPHANED_TUNNEL_RECOVERY_GRACE).await;
+        match self
+            .recover_orphaned_tunnel(operation_id, lease_epoch)
+            .await
+        {
+            Ok(true) => warn!(
+                %operation_id,
+                grace_seconds = ORPHANED_TUNNEL_RECOVERY_GRACE.as_secs(),
+                "recovered an active tunnel whose Engine lease was not reattached"
+            ),
+            Ok(false) => {}
+            Err(error) => warn!(
+                %operation_id,
+                %error,
+                "failed to recover an orphaned active tunnel after the reattach grace period"
+            ),
+        }
+    }
+}
+
+pub async fn serve<Backend>(
+    service: Arc<AgentService<Backend>>,
+    policy: Arc<CallerPolicy>,
+    pipe_name: String,
+) -> Result<ServeExit, ServerError>
+where
+    Backend: PrivilegedBackend + 'static,
+{
+    serve_until(service, policy, pipe_name, std::future::pending()).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServeExit {
+    Shutdown(ShutdownReason),
+    Idle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShutdownReason {
+    ServiceStop,
+    SystemShutdown,
+}
+
+/// Verifies that the fixed Agent pipe name, security descriptor, and first
+/// server instance can be created, then immediately releases the handle.
+/// This is safe for installer diagnostics because it accepts no client and
+/// performs no privileged network operation.
+pub fn validate_pipe_creation(pipe_name: &str) -> Result<(), ServerError> {
+    validate_pipe_name(pipe_name)?;
+    drop(create_agent_pipe(pipe_name, true)?);
+    Ok(())
+}
+
+pub async fn serve_until<Backend, Shutdown>(
+    service: Arc<AgentService<Backend>>,
+    policy: Arc<CallerPolicy>,
+    pipe_name: String,
+    shutdown: Shutdown,
+) -> Result<ServeExit, ServerError>
+where
+    Backend: PrivilegedBackend + 'static,
+    Shutdown: Future<Output = ()>,
+{
+    serve_until_ready(
+        service,
+        policy,
+        pipe_name,
+        async {
+            shutdown.await;
+            ShutdownReason::ServiceStop
+        },
+        || Ok(()),
+    )
+    .await
+}
+
+pub async fn serve_until_ready<Backend, Shutdown, Ready>(
+    service: Arc<AgentService<Backend>>,
+    policy: Arc<CallerPolicy>,
+    pipe_name: String,
+    shutdown: Shutdown,
+    ready: Ready,
+) -> Result<ServeExit, ServerError>
+where
+    Backend: PrivilegedBackend + 'static,
+    Shutdown: Future<Output = ShutdownReason>,
+    Ready: FnOnce() -> io::Result<()>,
+{
+    validate_pipe_name(&pipe_name)?;
+    tokio::pin!(shutdown);
+    let mut next = create_agent_pipe(&pipe_name, true)?;
+    service.reconcile_automatic_recovery_state().await;
+    ready()?;
+    let supervisor = tokio::spawn(Arc::clone(&service).run_automatic_recovery());
+    let idle = wait_for_idle_exit(Arc::clone(&service));
+    tokio::pin!(idle);
+    let result = loop {
+        tokio::select! {
+            biased;
+            reason = &mut shutdown => {
+                service.begin_shutdown();
+                break Ok(ServeExit::Shutdown(reason));
+            },
+            result = next.connect() => {
+                if let Err(error) = result {
+                    break Err(ServerError::Io(error));
+                }
+            },
+            () = &mut idle => {
+                service.begin_shutdown();
+                break Ok(ServeExit::Idle);
+            },
+        }
+        let connected = next;
+        next = match create_agent_pipe(&pipe_name, false) {
+            Ok(next) => next,
+            Err(error) => break Err(ServerError::Io(error)),
+        };
+        let activity = service.connection_started();
+        let service = Arc::clone(&service);
+        let policy = Arc::clone(&policy);
+        tokio::spawn(async move {
+            if let Err(error) =
+                handle_connected_pipe_with_activity(connected, service, policy, activity).await
+            {
+                warn!(%error, "authenticated Agent client disconnected");
+            }
+        });
+    };
+    service.begin_shutdown();
+    if let Err(error) = supervisor.await {
+        return Err(ServerError::AutomaticRecoveryTask(error.to_string()));
+    }
+    result
+}
+
+async fn wait_for_idle_exit<Backend>(service: Arc<AgentService<Backend>>)
+where
+    Backend: PrivilegedBackend + 'static,
+{
+    wait_for_idle_exit_after(service, AGENT_IDLE_TIMEOUT).await;
+}
+
+async fn wait_for_idle_exit_after<Backend>(
+    service: Arc<AgentService<Backend>>,
+    idle_timeout: Duration,
+) where
+    Backend: PrivilegedBackend + 'static,
+{
+    loop {
+        let notified = service.activity.notify.notified();
+        tokio::pin!(notified);
+        // Register before sampling the counters so a connection that finishes
+        // between the sample and the await cannot leave this waiter asleep.
+        let _ = notified.as_mut().enable();
+        let generation = service.activity.generation.load(Ordering::Acquire);
+        if !service.activity.is_empty() || !service.coordinator.may_exit_idle().await {
+            notified.await;
+            continue;
+        }
+
+        let remaining = if service.coordinator.device_retirement_finished() {
+            Duration::ZERO
+        } else {
+            idle_timeout
+        };
+        tokio::select! {
+            () = tokio::time::sleep(remaining) => {
+                if service.activity.generation.load(Ordering::Acquire) == generation
+                    && service.activity.is_empty()
+                    && service.coordinator.may_exit_idle().await
+                {
+                    return;
+                }
+            }
+            () = &mut notified => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TunnelConnectionLease {
+    Startup(Uuid),
+    Active(Uuid),
+}
+
+#[cfg(test)]
+async fn handle_connected_pipe<Backend>(
+    pipe: NamedPipeServer,
+    service: Arc<AgentService<Backend>>,
+    policy: Arc<CallerPolicy>,
+) -> Result<(), ServerError>
+where
+    Backend: PrivilegedBackend + 'static,
+{
+    let activity = service.connection_started();
+    handle_connected_pipe_with_activity(pipe, service, policy, activity).await
+}
+
+async fn handle_connected_pipe_with_activity<Backend>(
+    mut pipe: NamedPipeServer,
+    service: Arc<AgentService<Backend>>,
+    policy: Arc<CallerPolicy>,
+    _activity: ActivityGuard,
+) -> Result<(), ServerError>
+where
+    Backend: PrivilegedBackend + 'static,
+{
+    let raw_pipe = pipe.as_raw_handle() as usize;
+    let authenticated =
+        tokio::task::spawn_blocking(move || authenticate_named_pipe(raw_pipe as HANDLE, &policy))
+            .await
+            .map_err(|error| ServerError::AuthenticationTask(error.to_string()))??;
+    let caller = authenticated.caller().clone();
+    let mut buffer = BytesMut::new();
+    let mut chunk = [0_u8; READ_CHUNK_BYTES];
+    let mut system_proxy_lease = None;
+    let mut tunnel_lease = None;
+    let mut direct_egress_lease = None;
+    let mut device_lease = None;
+
+    let result = async {
+        loop {
+            let read = pipe.read(&mut chunk).await?;
+            if read == 0 {
+                break if buffer.is_empty() {
+                    Ok(())
+                } else {
+                    Err(ServerError::TruncatedFrame)
+                };
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            if buffer.len() >= 4 {
+                let declared = u32::from_be_bytes(buffer[..4].try_into().expect("header")) as usize;
+                if declared > MAX_AGENT_FRAME_BYTES {
+                    break Err(ServerError::FrameTooLarge(declared));
+                }
+            }
+            while let Some(frame) = split_frame(&mut buffer)? {
+                if frame.len() > MAX_AGENT_FRAME_BYTES + 4 {
+                    return Err(ServerError::FrameTooLarge(frame.len() - 4));
+                }
+                let request: AgentRequest = decode_frame(frame)?;
+                let acquiring_device = matches!(
+                    request.payload.as_ref(),
+                    Some(agent_request::Payload::AcquireDeviceLease(_))
+                );
+                let releasing_device = match request.payload.as_ref() {
+                    Some(agent_request::Payload::ReleaseDeviceLease(request)) => {
+                        Uuid::parse_str(&request.lease_id).ok().map(|id| {
+                            crate::coordinator::DeviceLeaseKey {
+                                id,
+                                generation: request.lease_generation,
+                            }
+                        })
+                    }
+                    _ => None,
+                };
+                let direct_operation_id = match request.payload.as_ref() {
+                    Some(agent_request::Payload::AcquireDirectEgress(request)) => {
+                        Uuid::parse_str(request.operation_id.trim()).ok()
+                    }
+                    _ => None,
+                };
+                let direct_purpose = match request.payload.as_ref() {
+                    Some(agent_request::Payload::AcquireDirectEgress(request)) => {
+                        EgressPurpose::from_proto(request.purpose).ok()
+                    }
+                    _ => None,
+                };
+                let lease_action = match request.payload.as_ref() {
+                    Some(agent_request::Payload::ApplySystemProxy(request)) => {
+                        Uuid::parse_str(request.operation_id.trim()).ok().map(Some)
+                    }
+                    Some(agent_request::Payload::RestoreSystemProxy(request)) => {
+                        Uuid::parse_str(request.operation_id.trim())
+                            .ok()
+                            .map(|_| None)
+                    }
+                    _ => None,
+                };
+                let tunnel_lease_action = match request.payload.as_ref() {
+                    Some(agent_request::Payload::ReplaceTunnel(request)) => {
+                        Uuid::parse_str(request.operation_id.trim())
+                            .ok()
+                            .map(TunnelConnectionLease::Startup)
+                    }
+                    Some(agent_request::Payload::PrepareTunnel(request)) => {
+                        Uuid::parse_str(request.operation_id.trim())
+                            .ok()
+                            .map(TunnelConnectionLease::Startup)
+                    }
+                    Some(agent_request::Payload::BeginChainTransition(request))
+                        if request.retain_startup_lease =>
+                    {
+                        Uuid::parse_str(request.operation_id.trim())
+                            .ok()
+                            .map(TunnelConnectionLease::Startup)
+                    }
+                    Some(agent_request::Payload::AcquireTunnelLease(request)) => {
+                        Uuid::parse_str(request.operation_id.trim())
+                            .ok()
+                            .map(TunnelConnectionLease::Active)
+                    }
+                    _ => None,
+                };
+                let response = if acquiring_device && device_lease.is_some() {
+                    error_response(
+                        request.request_id,
+                        ServiceError::Lifecycle(AgentLifecycleError::Coordinator(
+                            CoordinatorError::DeviceLeaseRequired,
+                        )),
+                    )
+                } else if direct_egress_lease.is_some() && direct_operation_id.is_some() {
+                    error_response(
+                        request.request_id,
+                        ServiceError::DirectEgressLeaseAlreadyAcquired,
+                    )
+                } else {
+                    service.handle(request, &caller).await
+                };
+                if response.error.is_none() {
+                    if let Some(agent_response::Payload::DeviceLease(lease)) =
+                        response.payload.as_ref()
+                    {
+                        device_lease = Some(crate::coordinator::DeviceLeaseKey {
+                            id: Uuid::parse_str(&lease.lease_id).expect("Agent lease ID"),
+                            generation: lease.lease_generation,
+                        });
+                    } else if releasing_device.is_some() && releasing_device == device_lease {
+                        device_lease = None;
+                    }
+                }
+                if response.error.is_none()
+                    && let Some(next_lease) = lease_action
+                {
+                    system_proxy_lease = next_lease;
+                }
+                if response.error.is_none()
+                    && let Some(next_lease) = tunnel_lease_action
+                {
+                    tunnel_lease = Some(next_lease);
+                }
+                if response.error.is_none()
+                    && let (
+                        Some(operation_id),
+                        Some(agent_response::Payload::DirectEgressLease(lease)),
+                    ) = (direct_operation_id, response.payload.as_ref())
+                    && let (Ok(remote), Ok(protocol)) = (
+                        lease.remote_endpoint.parse::<SocketAddr>(),
+                        u8::try_from(lease.protocol),
+                    )
+                {
+                    direct_egress_lease = Some(DirectEgressKey {
+                        operation_id,
+                        remote,
+                        protocol,
+                        interface_luid: lease.interface_luid,
+                        network_generation: lease.network_generation,
+                        purpose: direct_purpose
+                            .expect("successful direct request has a validated purpose"),
+                    });
+                }
+                let encoded = encode_frame(&response)?;
+                if encoded.len() > MAX_AGENT_FRAME_BYTES + 4 {
+                    return Err(ServerError::FrameTooLarge(encoded.len() - 4));
+                }
+                pipe.write_all(&encoded).await?;
+            }
+        }
+    }
+    .await;
+    if let Some(operation_id) = system_proxy_lease {
+        service
+            .release_system_proxy_lease(operation_id, &caller)
+            .await;
+    }
+    match tunnel_lease {
+        Some(TunnelConnectionLease::Startup(operation_id)) => {
+            service
+                .release_startup_tunnel_lease(operation_id, &caller)
+                .await;
+        }
+        Some(TunnelConnectionLease::Active(operation_id)) => {
+            service.release_tunnel_lease(operation_id, &caller).await;
+        }
+        None => {}
+    }
+    if let Some(key) = direct_egress_lease {
+        service.release_direct_egress(key).await;
+    }
+    if let Some(key) = device_lease
+        && service.coordinator.detach_device_lease(key, &caller)
+    {
+        let guard = service.activity.begin(ActivityKind::Background);
+        let watchdog = Arc::clone(&service);
+        tokio::spawn(async move {
+            let _guard = guard;
+            tokio::time::sleep(ORPHANED_TUNNEL_RECOVERY_GRACE).await;
+            let cleanup = Arc::clone(&watchdog);
+            if let Err(error) = watchdog
+                .mutate(MutationPolicy::Cleanup, |coordinator| async move {
+                    coordinator
+                        .retire_orphaned_device_with_egress(key, cleanup.clear_direct_egress())
+                        .await
+                })
+                .await
+            {
+                warn!(%error, "orphaned device cleanup incomplete");
+            }
+        });
+    }
+    result
+}
+
+#[cfg(test)]
+fn acquire_egress_permit<Permit>(
+    plan: &ValidatedTunnelPlan,
+    phase: RecoveryPhase,
+    remote: SocketAddr,
+    protocol: u8,
+    install: impl FnOnce() -> Result<Permit, ServiceError>,
+) -> Result<Option<Permit>, ServiceError> {
+    acquire_egress_permit_for_purpose(
+        plan,
+        phase,
+        remote,
+        protocol,
+        EgressPurpose::Generic,
+        install,
+    )
+}
+
+fn validate_automatic_endpoint_egress(
+    journal: &RecoveryJournal,
+    remote: SocketAddr,
+    protocol: u8,
+    expected_generation: u64,
+) -> Result<(), ServiceError> {
+    let policy = journal
+        .plan
+        .as_ref()
+        .and_then(|plan| plan.automatic_endpoint_policy)
+        .ok_or(ServiceError::DirectEgressTarget)?;
+    let transport = match protocol {
+        6 => usque_core::Transport::Http2,
+        17 => usque_core::Transport::Http3,
+        _ => return Err(ServiceError::DirectEgressTarget),
+    };
+    if expected_generation == 0 || !policy.permits(remote, transport) {
+        return Err(ServiceError::DirectEgressTarget);
+    }
+    if !journal
+        .steps
+        .iter()
+        .any(|step| step.kind == MutationKind::WfpMetadata && step.state == MutationState::Applied)
+    {
+        return Err(ServiceError::DirectEgressNotReady);
+    }
+    Ok(())
+}
+
+fn acquire_egress_permit_for_purpose<Permit>(
+    plan: &ValidatedTunnelPlan,
+    phase: RecoveryPhase,
+    remote: SocketAddr,
+    protocol: u8,
+    purpose: EgressPurpose,
+    install: impl FnOnce() -> Result<Permit, ServiceError>,
+) -> Result<Option<Permit>, ServiceError> {
+    if !matches!(phase, RecoveryPhase::Prepared | RecoveryPhase::Active) {
+        return Err(ServiceError::DirectEgressState);
+    }
+    if purpose == EgressPurpose::AutomaticMasque {
+        let transport = match protocol {
+            6 => usque_core::Transport::Http2,
+            17 => usque_core::Transport::Http3,
+            _ => return Err(ServiceError::DirectEgressTarget),
+        };
+        if !plan
+            .automatic_endpoint_policy
+            .is_some_and(|policy| policy.permits(remote, transport))
+        {
+            return Err(ServiceError::DirectEgressTarget);
+        }
+        return install().map(Some);
+    }
+    // Prepared has no WFP provider/sublayer yet. Only the exact bootstrap
+    // endpoints may cross commit without a dynamic permit: commit installs
+    // persistent Engine-scoped permits from this same allowlist. Physical
+    // interface binding, generation checks and pipe ownership still apply.
+    if wfp::is_bootstrap_endpoint(plan, remote, protocol) {
+        return Ok(None);
+    }
+    if phase == RecoveryPhase::Prepared {
+        return Err(ServiceError::DirectEgressNotReady);
+    }
+    if plan.kill_switch {
+        install().map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+fn validate_direct_context<'a>(
+    journal: &'a RecoveryJournal,
+    operation_id: Uuid,
+    caller: &AuthenticatedCaller,
+    require_process_owner: bool,
+) -> Result<&'a ValidatedTunnelPlan, ServiceError> {
+    if !matches!(
+        journal.phase,
+        RecoveryPhase::Prepared | RecoveryPhase::Active
+    ) {
+        return Err(ServiceError::DirectEgressState);
+    }
+    if journal.operation_id != Some(operation_id)
+        || journal.owner_sid.as_deref() != Some(caller.user_sid.as_str())
+        || require_process_owner && journal.owner_process_id != Some(caller.process_id)
+    {
+        return Err(ServiceError::DirectEgressOwner);
+    }
+    journal.plan.as_ref().ok_or(ServiceError::DirectEgressState)
+}
+
+fn physical_route_context(
+    journal: &RecoveryJournal,
+) -> Result<(u64, Vec<RouteReceipt>), ServiceError> {
+    let tunnel_luid = journal
+        .adapter_receipt()
+        .and_then(|receipt| match receipt {
+            MutationReceipt::WintunAdapter { interface_luid, .. } if *interface_luid != 0 => {
+                Some(*interface_luid)
+            }
+            _ => None,
+        })
+        .ok_or(ServiceError::DirectEgressState)?;
+    let bypasses = journal
+        .steps
+        .iter()
+        .filter_map(|step| match &step.receipt {
+            MutationReceipt::EndpointBypass { created } => Some(created),
+            _ => None,
+        })
+        .flatten()
+        .filter(|route| route.owned)
+        .cloned()
+        .collect();
+    Ok((tunnel_luid, bypasses))
+}
+
+fn validate_expected_generation(expected: u64, actual: u64) -> Result<(), ServiceError> {
+    if actual == 0 || expected != 0 && expected != actual {
+        Err(ServiceError::StaleGeneration)
+    } else {
+        Ok(())
+    }
+}
+
+fn physical_network_fingerprint(interfaces: &[network::PhysicalInterfaceInfo]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    for interface in interfaces {
+        interface.interface_luid.hash(&mut hasher);
+        interface.interface_index.hash(&mut hasher);
+        interface.dns_servers.hash(&mut hasher);
+        interface.address_family_mask.hash(&mut hasher);
+        interface.route_fingerprint.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+fn create_agent_pipe(pipe_name: &str, first_instance: bool) -> io::Result<NamedPipeServer> {
+    let descriptor = SecurityDescriptor::agent(pipe_name != AGENT_PIPE_NAME)?;
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: 0,
+    };
+    let mut options = ServerOptions::new();
+    options
+        .first_pipe_instance(first_instance)
+        .reject_remote_clients(true);
+    // SAFETY: attributes and its descriptor remain alive for the complete
+    // CreateNamedPipeW call; Windows copies the descriptor before returning.
+    unsafe {
+        options.create_with_security_attributes_raw(
+            pipe_name,
+            (&mut attributes as *mut SECURITY_ATTRIBUTES).cast(),
+        )
+    }
+}
+
+fn validate_pipe_name(value: &str) -> Result<(), ServerError> {
+    if value == AGENT_PIPE_NAME
+        || cfg!(debug_assertions)
+            && value.starts_with(&format!("{AGENT_PIPE_NAME}.test-"))
+            && value.len() > AGENT_PIPE_NAME.len() + 6
+            && value[AGENT_PIPE_NAME.len() + 6..]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        Ok(())
+    } else {
+        Err(ServerError::InvalidPipeName)
+    }
+}
+
+fn validate_request_envelope(request: &AgentRequest) -> Result<(), ServiceError> {
+    if request.protocol_version != AGENT_PROTOCOL_VERSION {
+        return Err(ServiceError::ProtocolVersion(request.protocol_version));
+    }
+    if request.request_id.is_empty()
+        || request.request_id.len() > MAX_REQUEST_ID_BYTES
+        || !request
+            .request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(ServiceError::RequestId);
+    }
+    Ok(())
+}
+
+fn parse_operation_id(value: &str) -> Result<Uuid, ServiceError> {
+    Uuid::parse_str(value.trim()).map_err(|_| ServiceError::OperationId)
+}
+
+fn parse_profile_id(value: &str) -> Result<Uuid, ServiceError> {
+    Uuid::parse_str(value.trim()).map_err(|_| ServiceError::ProfileId)
+}
+
+fn validate_reason_code(value: &str) -> Result<(), ServiceError> {
+    if value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(ServiceError::ReasonCode);
+    }
+    Ok(())
+}
+
+fn state_to_proto(
+    journal: &RecoveryJournal,
+    packet_session_attached: bool,
+    automatic_recovery: agent_v1::AutomaticRecoveryStatus,
+) -> AgentState {
+    let applied = |kind| {
+        journal
+            .steps
+            .iter()
+            .any(|step| step.kind == kind && step.state == crate::journal::MutationState::Applied)
+    };
+    let mut warnings = Vec::new();
+    if journal.phase == RecoveryPhase::RecoveryRequired {
+        warnings.push("RECOVERY_REQUIRED".to_owned());
+    }
+    if journal.phase == RecoveryPhase::Active
+        && applied(crate::journal::MutationKind::PacketSession)
+        && !packet_session_attached
+    {
+        warnings.push("PACKET_SESSION_REATTACH_REQUIRED".to_owned());
+    }
+    AgentState {
+        device: None,
+        replacement: None,
+        plan: journal.plan.as_ref().map(|plan| Box::new(plan.to_proto())),
+        phase: match journal.phase {
+            RecoveryPhase::Clean => agent_v1::AgentPhase::Clean as i32,
+            RecoveryPhase::Preparing => agent_v1::AgentPhase::Preparing as i32,
+            RecoveryPhase::Prepared => agent_v1::AgentPhase::Prepared as i32,
+            RecoveryPhase::Active => agent_v1::AgentPhase::Active as i32,
+            // Legacy journals may still deserialize as Paused after captive-portal
+            // removal; surface them as recovery-required until recover_stale runs.
+            RecoveryPhase::Paused => agent_v1::AgentPhase::RecoveryRequired as i32,
+            RecoveryPhase::Recovering => agent_v1::AgentPhase::Recovering as i32,
+            RecoveryPhase::RecoveryRequired => agent_v1::AgentPhase::RecoveryRequired as i32,
+        },
+        operation_id: journal
+            .operation_id
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        profile_id: journal
+            .plan
+            .as_ref()
+            .map(|plan| plan.profile_id.to_string())
+            .unwrap_or_default(),
+        kill_switch_active: journal.plan.as_ref().is_some_and(|plan| plan.kill_switch)
+            && applied(crate::journal::MutationKind::KillSwitch),
+        system_proxy_active: applied(crate::journal::MutationKind::SystemProxy),
+        packet_session_active: packet_session_attached,
+        journal_generation: journal.generation,
+        warnings,
+        automatic_recovery: Some(automatic_recovery),
+    }
+}
+
+fn platform_state_to_proto(
+    journal: &RecoveryJournal,
+    packet_session_attached: bool,
+    tunnel_lease_attached: bool,
+    automatic_recovery: agent_v1::AutomaticRecoveryStatus,
+) -> agent_v1::PlatformState {
+    let expected = |kind| {
+        journal
+            .steps
+            .iter()
+            .any(|step| step.kind == kind && step.state != crate::journal::MutationState::Restored)
+    };
+    let expected_route_count = journal
+        .steps
+        .iter()
+        .filter(|step| step.state != crate::journal::MutationState::Restored)
+        .map(|step| match &step.receipt {
+            MutationReceipt::EndpointBypass { created }
+            | MutationReceipt::DefaultRoutes { created, .. } => {
+                created.iter().filter(|route| route.owned).count()
+            }
+            _ => 0,
+        })
+        .sum::<usize>();
+    let pending_cleanup = matches!(
+        journal.phase,
+        RecoveryPhase::Recovering | RecoveryPhase::RecoveryRequired | RecoveryPhase::Paused
+    ) || journal
+        .steps
+        .iter()
+        .any(|step| step.state == crate::journal::MutationState::Intended);
+    agent_v1::PlatformState {
+        device: None,
+        service_state: "running".to_owned(),
+        recovery_diagnostics: None,
+        agent_phase: phase_to_proto(journal.phase),
+        active_tunnel_lease: tunnel_lease_attached,
+        packet_session_active: packet_session_attached,
+        wintun_adapter_state: if journal.device.is_some()
+            || expected(crate::journal::MutationKind::WintunAdapter)
+        {
+            "expected"
+        } else {
+            "not_expected"
+        }
+        .to_owned(),
+        expected_route_count: u32::try_from(expected_route_count).unwrap_or(u32::MAX),
+        // The current backend does not yet have a cross-version-safe route
+        // enumerator. Unknown is explicit so diagnostics cannot claim a leak
+        // check passed based only on the recovery journal.
+        actual_route_count_known: false,
+        actual_route_count: 0,
+        expected_dns_state: if expected(crate::journal::MutationKind::Dns) {
+            "configured"
+        } else {
+            "not_expected"
+        }
+        .to_owned(),
+        actual_dns_state: "unknown".to_owned(),
+        expected_wfp_state: if expected(crate::journal::MutationKind::KillSwitch) {
+            "active"
+        } else {
+            "not_expected"
+        }
+        .to_owned(),
+        actual_wfp_state: "unknown".to_owned(),
+        system_proxy_lease: expected(crate::journal::MutationKind::SystemProxy),
+        recovery_journal_state: match journal.phase {
+            RecoveryPhase::Clean => "clean",
+            RecoveryPhase::Preparing => "preparing",
+            RecoveryPhase::Prepared => "prepared",
+            RecoveryPhase::Active => "active",
+            RecoveryPhase::Paused => "legacy_paused",
+            RecoveryPhase::Recovering => "recovering",
+            RecoveryPhase::RecoveryRequired => "recovery_required",
+        }
+        .to_owned(),
+        pending_cleanup: pending_cleanup
+            || journal.device.as_ref().is_some_and(|device| {
+                !matches!(
+                    device.state,
+                    crate::journal::DeviceState::Idle | crate::journal::DeviceState::InUse
+                )
+            }),
+        journal_generation: journal.generation,
+        automatic_recovery: Some(automatic_recovery),
+    }
+}
+
+fn phase_to_proto(phase: RecoveryPhase) -> i32 {
+    match phase {
+        RecoveryPhase::Clean => agent_v1::AgentPhase::Clean as i32,
+        RecoveryPhase::Preparing => agent_v1::AgentPhase::Preparing as i32,
+        RecoveryPhase::Prepared => agent_v1::AgentPhase::Prepared as i32,
+        RecoveryPhase::Active => agent_v1::AgentPhase::Active as i32,
+        RecoveryPhase::Paused => agent_v1::AgentPhase::RecoveryRequired as i32,
+        RecoveryPhase::Recovering => agent_v1::AgentPhase::Recovering as i32,
+        RecoveryPhase::RecoveryRequired => agent_v1::AgentPhase::RecoveryRequired as i32,
+    }
+}
+
+fn error_response(request_id: String, error: ServiceError) -> AgentResponse {
+    let (code, retryable) = error.code();
+    let message = error.to_string().chars().take(512).collect();
+    AgentResponse {
+        request_id,
+        error: Some(agent_v1::AgentError {
+            code: code.to_owned(),
+            message,
+            retryable,
+        }),
+        payload: None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReplayKey {
+    sid: String,
+    process_id: u32,
+    request_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct CachedResponse {
+    request: AgentRequest,
+    response: AgentResponse,
+}
+
+#[derive(Debug, Default)]
+struct ReplayCache {
+    entries: HashMap<ReplayKey, CachedResponse>,
+    order: VecDeque<ReplayKey>,
+}
+
+impl ReplayCache {
+    fn insert(&mut self, key: ReplayKey, response: CachedResponse) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, response);
+        while self.order.len() > MAX_REPLAY_ENTRIES {
+            if let Some(expired) = self.order.pop_front() {
+                self.entries.remove(&expired);
+            }
+        }
+    }
+}
+
+struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+impl SecurityDescriptor {
+    fn agent(debug_test_pipe: bool) -> io::Result<Self> {
+        // LocalSystem and Administrators receive full control. Authenticated
+        // Users may connect/read/write, after which PID/SID/path/signature
+        // authentication is mandatory before any frame is accepted.
+        //
+        // The Codex Windows test sandbox uses a restricted token whose access
+        // check requires an Everyone ACE. That exception is limited to the
+        // debug-only, randomly suffixed test pipe names accepted above.
+        let sddl = if cfg!(debug_assertions) && debug_test_pipe {
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;WD)"
+        } else {
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;AU)"
+        };
+        let wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+        // SAFETY: wide is null-terminated and descriptor is writable.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(descriptor))
+    }
+}
+
+impl Drop for SecurityDescriptor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: SDDL conversion allocates this descriptor with LocalAlloc.
+            unsafe {
+                LocalFree(self.0);
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ServiceError {
+    #[error("the physical network generation changed during socket preparation")]
+    StaleGeneration,
+    #[error("Agent protocol version {0} is unsupported")]
+    ProtocolVersion(u32),
+    #[error("request_id is missing or malformed")]
+    RequestId,
+    #[error("request_id was reused for a different request")]
+    RequestIdReused,
+    #[error("Agent request payload is missing")]
+    MissingPayload,
+    #[error("operation_id is not a UUID")]
+    OperationId,
+    #[error("profile_id is not a UUID")]
+    ProfileId,
+    #[error("rollback reason_code is malformed")]
+    ReasonCode,
+    #[error("prepare request is missing its tunnel plan")]
+    MissingTunnelPlan,
+    #[error("tunnel plan is invalid: {0}")]
+    Plan(String),
+    #[error("physical network metadata is unavailable: {0}")]
+    PhysicalNetwork(String),
+    #[error("the prepared tunnel has no verified physical interface")]
+    PhysicalNetworkOffline,
+    #[error("direct egress is available only for the prepared or active tunnel")]
+    DirectEgressState,
+    #[error("direct egress operation owner does not match the authenticated Engine")]
+    DirectEgressOwner,
+    #[error("direct egress target must be a numeric unicast TCP/UDP endpoint")]
+    DirectEgressTarget,
+    #[error("only planned tunnel and control endpoints may acquire egress before tunnel commit")]
+    DirectEgressNotReady,
+    #[error("this pipe already owns a direct-egress lease")]
+    DirectEgressLeaseAlreadyAcquired,
+    #[error("the dynamic direct-egress target limit was reached")]
+    DirectEgressLimit,
+    #[error("could not install dynamic direct-egress policy: {0}")]
+    DirectEgress(wfp::WfpError),
+    #[error("automatic recovery is blocked and cannot be restarted safely")]
+    AutomaticRecoveryBlocked,
+    #[error("automatic recovery is not supported by this Agent")]
+    AutomaticRecoveryUnsupported,
+    #[error("{0}")]
+    Lifecycle(AgentLifecycleError),
+}
+
+impl ServiceError {
+    fn code(&self) -> (&'static str, bool) {
+        match self {
+            Self::StaleGeneration => ("AGENT_STALE_GENERATION", true),
+            Self::ProtocolVersion(_) => ("AGENT_PROTOCOL_MISMATCH", false),
+            Self::RequestId
+            | Self::MissingPayload
+            | Self::OperationId
+            | Self::ProfileId
+            | Self::ReasonCode => ("AGENT_INVALID_REQUEST", false),
+            Self::RequestIdReused => ("AGENT_REQUEST_ID_REUSED", false),
+            Self::MissingTunnelPlan | Self::Plan(_) => ("AGENT_INVALID_PLAN", false),
+            Self::DirectEgressOwner => ("AGENT_OWNER_MISMATCH", false),
+            Self::DirectEgressTarget | Self::DirectEgressLeaseAlreadyAcquired => {
+                ("AGENT_INVALID_DIRECT_EGRESS", false)
+            }
+            Self::DirectEgressState => ("AGENT_DIRECT_EGRESS_UNAVAILABLE", true),
+            Self::DirectEgressNotReady => ("AGENT_DIRECT_EGRESS_NOT_READY", true),
+            Self::DirectEgressLimit => ("AGENT_DIRECT_EGRESS_LIMIT", true),
+            Self::PhysicalNetwork(_) => ("AGENT_PHYSICAL_NETWORK_UNAVAILABLE", true),
+            Self::PhysicalNetworkOffline => ("AGENT_PHYSICAL_NETWORK_OFFLINE", true),
+            Self::DirectEgress(wfp::WfpError::Windows { code, .. })
+                if *code == windows_sys::Win32::Foundation::FWP_E_PROVIDER_NOT_FOUND as u32 =>
+            {
+                ("AGENT_WFP_PROVIDER_NOT_FOUND", true)
+            }
+            Self::DirectEgress(wfp::WfpError::Windows { code, .. })
+                if *code == windows_sys::Win32::Foundation::FWP_E_SUBLAYER_NOT_FOUND as u32 =>
+            {
+                ("AGENT_WFP_SUBLAYER_NOT_FOUND", true)
+            }
+            Self::DirectEgress(_) => ("AGENT_DIRECT_EGRESS_FAILED", true),
+            Self::AutomaticRecoveryBlocked => ("AGENT_AUTOMATIC_RECOVERY_BLOCKED", false),
+            Self::AutomaticRecoveryUnsupported => ("AGENT_AUTOMATIC_RECOVERY_UNSUPPORTED", false),
+            Self::Lifecycle(AgentLifecycleError::StartMode(_)) => {
+                ("SERVICE_START_MODE_UNAVAILABLE", false)
+            }
+            Self::Lifecycle(AgentLifecycleError::ShuttingDown) => ("AGENT_SHUTTING_DOWN", false),
+            Self::Lifecycle(AgentLifecycleError::Coordinator(
+                CoordinatorError::RecoveryConflict,
+            )) => ("AGENT_RECOVERY_CONFLICT", false),
+            Self::Lifecycle(AgentLifecycleError::Coordinator(CoordinatorError::RecoveryBusy)) => {
+                ("AGENT_RECOVERY_BUSY", false)
+            }
+            Self::Lifecycle(AgentLifecycleError::Coordinator(
+                CoordinatorError::RecoveryFailures(report),
+            )) => ("AGENT_RECOVERY_FAILED", report.retryable()),
+            Self::Lifecycle(AgentLifecycleError::Coordinator(CoordinatorError::OwnerMismatch)) => {
+                ("AGENT_OWNER_MISMATCH", false)
+            }
+            Self::Lifecycle(AgentLifecycleError::Coordinator(
+                CoordinatorError::DeviceLeaseRequired,
+            )) => ("AGENT_DEVICE_LEASE_REQUIRED", false),
+            Self::Lifecycle(AgentLifecycleError::Coordinator(
+                CoordinatorError::DeviceRecoveryRequired,
+            )) => ("AGENT_DEVICE_RECOVERY_REQUIRED", false),
+            Self::Lifecycle(AgentLifecycleError::Coordinator(
+                CoordinatorError::ReplacementPending,
+            )) => ("AGENT_REPLACEMENT_PENDING", true),
+            Self::Lifecycle(AgentLifecycleError::Coordinator(
+                CoordinatorError::ReplacementGuardUnavailable,
+            )) => ("AGENT_REPLACEMENT_GUARD_UNAVAILABLE", true),
+            Self::Lifecycle(AgentLifecycleError::Coordinator(CoordinatorError::Backend(
+                BackendError::EndpointUnreachable,
+            ))) => ("AGENT_ENDPOINT_UNREACHABLE", true),
+            Self::Lifecycle(AgentLifecycleError::Coordinator(CoordinatorError::Backend(
+                BackendError::ControlApiUnreachable,
+            ))) => ("AGENT_CONTROL_API_UNREACHABLE", true),
+            Self::Lifecycle(AgentLifecycleError::Coordinator(
+                CoordinatorError::RecoveryRequired(_) | CoordinatorError::ApplyAndRecovery { .. },
+            )) => ("AGENT_RECOVERY_REQUIRED", false),
+            Self::Lifecycle(AgentLifecycleError::Coordinator(_)) => {
+                ("AGENT_OPERATION_FAILED", true)
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServerError {
+    #[error("Agent pipe name is invalid")]
+    InvalidPipeName,
+    #[error("Agent pipe I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("Agent caller authentication failed: {0}")]
+    Authentication(#[from] AuthenticationError),
+    #[error("Agent authentication task failed: {0}")]
+    AuthenticationTask(String),
+    #[error("Agent automatic-recovery task failed: {0}")]
+    AutomaticRecoveryTask(String),
+    #[error("Agent protobuf frame failed: {0}")]
+    Frame(#[from] usque_ipc::FrameError),
+    #[error("Agent frame exceeds 64 KiB: {0}")]
+    FrameTooLarge(usize),
+    #[error("Agent client closed a truncated frame")]
+    TruncatedFrame,
+}
+
+#[cfg(test)]
+mod tests {
+    mod device_tests;
+    use std::{
+        io,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    use async_trait::async_trait;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::windows::named_pipe::ClientOptions,
+    };
+    use usque_ipc::{
+        agent_v1::{ApplySystemProxyRequest, GetCapabilitiesRequest, agent_request},
+        decode_frame, encode_frame,
+    };
+
+    use crate::{
+        coordinator::{BackendError, StepOutput, StepParameter},
+        journal::{JournalStore, MutationKind, MutationReceipt},
+    };
+
+    use super::*;
+
+    fn egress_plan() -> ValidatedTunnelPlan {
+        ValidatedTunnelPlan::try_from(agent_v1::TunnelPlan {
+            profile_id: Uuid::new_v4().to_string(),
+            endpoint: "192.0.2.1:443".to_owned(),
+            endpoint_candidates: vec!["192.0.2.1:443".to_owned(), "[2001:db8::1]:443".to_owned()],
+            control_api_candidates: vec!["198.51.100.1:443".to_owned()],
+            mtu: 1280,
+            dns_servers: vec!["1.1.1.1".to_owned()],
+            kill_switch: true,
+            assigned_ipv4: "172.16.0.2/32".to_owned(),
+            assigned_ipv6: "2001:db8:1::2/128".to_owned(),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn automatic_egress_is_exact_ready_and_distinct_from_generic() {
+        let mut plan = egress_plan();
+        plan.automatic_endpoint_policy = Some(usque_core::AutomaticEndpointPolicy {
+            pool: usque_core::EndpointPool::WarpPlus,
+            port: 443,
+            ipv4: true,
+            ipv6: true,
+            tcp: true,
+            udp: true,
+        });
+        plan.endpoint = "162.159.199.2:443".parse().unwrap();
+        plan.endpoint_candidates = vec![plan.endpoint];
+        assert!(
+            acquire_egress_permit::<()>(
+                &plan,
+                RecoveryPhase::Prepared,
+                plan.endpoint,
+                17,
+                || panic!("automatic seed is not generic bootstrap")
+            )
+            .is_err()
+        );
+        for phase in [RecoveryPhase::Prepared, RecoveryPhase::Active] {
+            for kill_switch in [false, true] {
+                plan.kill_switch = kill_switch;
+                assert_eq!(
+                    acquire_egress_permit_for_purpose(
+                        &plan,
+                        phase,
+                        "162.159.199.2:443".parse().unwrap(),
+                        17,
+                        EgressPurpose::AutomaticMasque,
+                        || Ok(42)
+                    )
+                    .unwrap(),
+                    Some(42)
+                );
+                assert!(
+                    acquire_egress_permit_for_purpose::<()>(
+                        &plan,
+                        phase,
+                        "162.159.198.2:443".parse().unwrap(),
+                        17,
+                        EgressPurpose::AutomaticMasque,
+                        || panic!("disallowed pool cannot install")
+                    )
+                    .is_err()
+                );
+                assert!(
+                    acquire_egress_permit_for_purpose::<()>(
+                        &plan,
+                        phase,
+                        "162.159.199.99:443".parse().unwrap(),
+                        17,
+                        EgressPurpose::AutomaticMasque,
+                        || panic!("H3 requires a seed")
+                    )
+                    .is_err()
+                );
+            }
+        }
+        assert!(EgressPurpose::from_proto(2).is_err());
+        let mut journal = RecoveryJournal::clean(1);
+        journal.phase = RecoveryPhase::Prepared;
+        journal.plan = Some(plan);
+        let target = "[2606:4700:104:ffff:1234:5678:9abc:def0]:443"
+            .parse()
+            .unwrap();
+        assert!(validate_automatic_endpoint_egress(&journal, target, 6, 1).is_err());
+        journal.steps.push(crate::journal::MutationRecord {
+            kind: MutationKind::WfpMetadata,
+            state: MutationState::Applied,
+            receipt: wfp::plan_metadata(),
+        });
+        assert!(validate_automatic_endpoint_egress(&journal, target, 6, 1).is_ok());
+        assert!(validate_automatic_endpoint_egress(&journal, target, 6, 0).is_err());
+        assert!(validate_automatic_endpoint_egress(&journal, target, 17, 1).is_err());
+    }
+
+    #[test]
+    fn automatic_registry_cap_and_purpose_release_are_independent() {
+        let mut registry = DirectEgressRegistry::default();
+        let base = DirectEgressKey {
+            operation_id: Uuid::nil(),
+            remote: "162.159.199.0:443".parse().unwrap(),
+            protocol: 6,
+            interface_luid: 9,
+            network_generation: 1,
+            purpose: EgressPurpose::AutomaticMasque,
+        };
+        for last in 0..MAX_AUTOMATIC_ENDPOINT_LEASES {
+            let key = DirectEgressKey {
+                remote: SocketAddr::from(([162, 159, 199, u8::try_from(last).unwrap()], 443)),
+                ..base
+            };
+            assert!(registry.has_capacity(key));
+            registry.entries.insert(
+                key,
+                DirectEgressEntry {
+                    references: 1,
+                    _permit: None,
+                },
+            );
+        }
+        let extra = DirectEgressKey {
+            remote: "162.159.199.99:443".parse().unwrap(),
+            ..base
+        };
+        assert!(!registry.has_capacity(extra));
+        assert!(registry.has_capacity(base));
+        let generic = DirectEgressKey {
+            purpose: EgressPurpose::Generic,
+            ..base
+        };
+        assert!(registry.has_capacity(generic));
+        registry.entries.insert(
+            generic,
+            DirectEgressEntry {
+                references: 1,
+                _permit: None,
+            },
+        );
+        registry.release(base);
+        assert!(registry.entries.contains_key(&generic));
+        assert!(registry.has_capacity(extra));
+        registry.invalidate_before(2);
+        assert!(registry.entries.is_empty());
+    }
+
+    #[test]
+    fn bootstrap_egress_never_requires_wfp_objects_before_or_after_commit() {
+        let plan = egress_plan();
+        for phase in [RecoveryPhase::Prepared, RecoveryPhase::Active] {
+            for (remote, protocol) in [
+                ("192.0.2.1:443", 17),
+                ("192.0.2.1:443", 6),
+                ("[2001:db8::1]:443", 17),
+                ("[2001:db8::1]:443", 6),
+                ("198.51.100.1:443", 6),
+            ] {
+                let permit = acquire_egress_permit::<()>(
+                    &plan,
+                    phase,
+                    remote.parse().unwrap(),
+                    protocol,
+                    || panic!("bootstrap must not open a dynamic WFP session"),
+                )
+                .unwrap();
+                assert!(
+                    permit.is_none(),
+                    "a held bootstrap lease must survive commit"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_egress_rejects_non_bootstrap_targets_even_without_kill_switch() {
+        let mut plan = egress_plan();
+        for kill_switch in [true, false] {
+            plan.kill_switch = kill_switch;
+            for (remote, protocol) in [
+                ("192.0.2.1:8443", 6),
+                ("192.0.2.2:443", 17),
+                ("198.51.100.1:443", 17),
+                ("[2001:db8::2]:443", 17),
+                ("1.1.1.1:53", 17),
+            ] {
+                let error = acquire_egress_permit::<()>(
+                    &plan,
+                    RecoveryPhase::Prepared,
+                    remote.parse().unwrap(),
+                    protocol,
+                    || panic!("uncommitted user traffic must not install a permit"),
+                )
+                .unwrap_err();
+                assert_eq!(error.code(), ("AGENT_DIRECT_EGRESS_NOT_READY", true));
+            }
+        }
+    }
+
+    #[test]
+    fn active_direct_egress_requires_successful_dynamic_policy() {
+        let mut plan = egress_plan();
+        let remote = "203.0.113.9:443".parse().unwrap();
+        let calls = AtomicUsize::new(0);
+        let permit = acquire_egress_permit(&plan, RecoveryPhase::Active, remote, 6, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Ok(42)
+        })
+        .unwrap();
+        assert_eq!(permit, Some(42));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let error = acquire_egress_permit::<()>(&plan, RecoveryPhase::Active, remote, 6, || {
+            Err(ServiceError::DirectEgress(wfp::WfpError::EmptyEngineHandle))
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), ("AGENT_DIRECT_EGRESS_FAILED", true));
+
+        plan.kill_switch = false;
+        assert!(
+            acquire_egress_permit::<()>(&plan, RecoveryPhase::Active, remote, 6, || {
+                panic!("disabled Kill Switch must not mutate WFP")
+            })
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn closed_or_recovering_transactions_cannot_authorize_bootstrap_egress() {
+        let plan = egress_plan();
+        for phase in [
+            RecoveryPhase::Clean,
+            RecoveryPhase::Preparing,
+            RecoveryPhase::Paused,
+            RecoveryPhase::Recovering,
+            RecoveryPhase::RecoveryRequired,
+        ] {
+            let error = acquire_egress_permit::<()>(&plan, phase, plan.endpoint, 17, || {
+                panic!("invalid phases must not install a permit")
+            })
+            .unwrap_err();
+            assert_eq!(error.code(), ("AGENT_DIRECT_EGRESS_UNAVAILABLE", true));
+        }
+    }
+
+    #[test]
+    fn egress_errors_distinguish_physical_network_and_missing_wfp_dependencies() {
+        for (native, code) in [
+            (
+                windows_sys::Win32::Foundation::FWP_E_PROVIDER_NOT_FOUND,
+                "AGENT_WFP_PROVIDER_NOT_FOUND",
+            ),
+            (
+                windows_sys::Win32::Foundation::FWP_E_SUBLAYER_NOT_FOUND,
+                "AGENT_WFP_SUBLAYER_NOT_FOUND",
+            ),
+        ] {
+            let error = ServiceError::DirectEgress(wfp::WfpError::Windows {
+                operation: "FwpmFilterAdd0",
+                code: native as u32,
+            });
+            let response = error_response("test".to_owned(), error);
+            let error = response.error.unwrap();
+            assert_eq!(error.code, code);
+            assert!(error.retryable);
+        }
+        assert_eq!(
+            ServiceError::PhysicalNetwork("private network fixture".to_owned()).code(),
+            ("AGENT_PHYSICAL_NETWORK_UNAVAILABLE", true)
+        );
+        assert_eq!(
+            ServiceError::PhysicalNetworkOffline.code(),
+            ("AGENT_PHYSICAL_NETWORK_OFFLINE", true)
+        );
+    }
+
+    #[test]
+    fn automatic_recovery_budget_and_backoff_are_bounded() {
+        assert_eq!(AUTOMATIC_RECOVERY_ATTEMPT_LIMIT, 3);
+        assert_eq!(
+            AUTOMATIC_RECOVERY_DELAYS,
+            [
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+                Duration::from_secs(30),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn automatic_recovery_attempts_follow_the_one_five_thirty_second_backoff() {
+        async fn wait_for_calls(backend: &ScriptedRecoveryBackend, expected: usize) {
+            for _ in 0..100 {
+                if backend.restore_calls.load(Ordering::Acquire) == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("automatic recovery did not reach restore call {expected}");
+        }
+
+        let backend = Arc::new(ScriptedRecoveryBackend::transient(usize::MAX));
+        let (_directory, _coordinator, service, _caller, _operation_id) =
+            recovery_required_service(Arc::clone(&backend)).await;
+        assert_eq!(backend.restore_calls.load(Ordering::Acquire), 1);
+        let worker = tokio::spawn(Arc::clone(&service).run_automatic_recovery());
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert_eq!(backend.restore_calls.load(Ordering::Acquire), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_for_calls(&backend, 2).await;
+
+        tokio::time::advance(Duration::from_millis(4_999)).await;
+        assert_eq!(backend.restore_calls.load(Ordering::Acquire), 2);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_for_calls(&backend, 3).await;
+
+        tokio::time::advance(Duration::from_millis(29_999)).await;
+        assert_eq!(backend.restore_calls.load(Ordering::Acquire), 3);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_for_calls(&backend, 4).await;
+        wait_for_automatic_stage(&service, AutomaticRecoveryStage::Exhausted).await;
+
+        service.begin_shutdown();
+        worker.await.unwrap();
+    }
+
+    #[test]
+    fn old_generation_lease_release_cannot_remove_a_new_same_target_permit() {
+        let old = DirectEgressKey {
+            operation_id: Uuid::nil(),
+            remote: "203.0.113.9:443".parse().unwrap(),
+            protocol: 17,
+            interface_luid: 9,
+            network_generation: 1,
+            purpose: EgressPurpose::Generic,
+        };
+        let new = DirectEgressKey {
+            network_generation: 2,
+            ..old
+        };
+        let mut registry = DirectEgressRegistry::default();
+        registry.entries.insert(
+            old,
+            DirectEgressEntry {
+                references: 1,
+                _permit: None,
+            },
+        );
+        registry.entries.insert(
+            new,
+            DirectEgressEntry {
+                references: 2,
+                _permit: None,
+            },
+        );
+        registry.invalidate_before(2);
+        // A delayed generation-one snapshot cleanup cannot remove generation
+        // two, including a permit inserted before cleanup obtained its lock.
+        registry.invalidate_before(1);
+        assert!(!registry.entries.contains_key(&old));
+        registry.release(old);
+        assert_eq!(registry.entries.get(&new).unwrap().references, 2);
+        registry.release(new);
+        assert_eq!(registry.entries.get(&new).unwrap().references, 1);
+        registry.release(new);
+        assert!(registry.entries.is_empty());
+    }
+
+    #[test]
+    fn exact_egress_generation_mismatch_is_a_stable_retryable_error() {
+        assert!(validate_expected_generation(0, 7).is_ok());
+        assert!(validate_expected_generation(7, 7).is_ok());
+        assert_eq!(
+            validate_expected_generation(7, 8).unwrap_err().code(),
+            ("AGENT_STALE_GENERATION", true)
+        );
+        assert!(validate_expected_generation(0, 0).is_err());
+    }
+
+    #[tokio::test]
+    async fn startup_pipe_validation_releases_the_first_instance() {
+        let pipe_name = format!("{AGENT_PIPE_NAME}.test-{}", Uuid::new_v4());
+        validate_pipe_creation(&pipe_name).expect("first validation");
+        validate_pipe_creation(&pipe_name).expect("released validation pipe");
+    }
+
+    struct RejectingBackend;
+
+    struct ProxyBackend;
+
+    struct ScriptedRecoveryBackend {
+        transient_failures_remaining: AtomicUsize,
+        blocked: AtomicBool,
+        restore_calls: AtomicUsize,
+    }
+
+    impl ScriptedRecoveryBackend {
+        fn transient(failures: usize) -> Self {
+            Self {
+                transient_failures_remaining: AtomicUsize::new(failures),
+                blocked: AtomicBool::new(false),
+                restore_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn blocked() -> Self {
+            Self {
+                transient_failures_remaining: AtomicUsize::new(0),
+                blocked: AtomicBool::new(true),
+                restore_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockingProxyBackend {
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[derive(Default)]
+    struct BlockingAutomaticBackend {
+        restore_calls: AtomicUsize,
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl PrivilegedBackend for BlockingProxyBackend {
+        async fn plan_step(
+            &self,
+            kind: MutationKind,
+            plan: &ValidatedTunnelPlan,
+            caller: &AuthenticatedCaller,
+            parameter: StepParameter,
+        ) -> Result<MutationReceipt, BackendError> {
+            ProxyBackend.plan_step(kind, plan, caller, parameter).await
+        }
+
+        async fn apply_step(
+            &self,
+            receipt: MutationReceipt,
+            plan: &ValidatedTunnelPlan,
+            caller: &AuthenticatedCaller,
+        ) -> Result<(MutationReceipt, StepOutput), BackendError> {
+            ProxyBackend.apply_step(receipt, plan, caller).await
+        }
+
+        async fn restore_step(&self, _receipt: &MutationReceipt) -> Result<(), BackendError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+
+        async fn plan_system_proxy(
+            &self,
+            operation_id: Uuid,
+            caller: &AuthenticatedCaller,
+            settings: &SystemProxySettings,
+        ) -> Result<MutationReceipt, BackendError> {
+            ProxyBackend
+                .plan_system_proxy(operation_id, caller, settings)
+                .await
+        }
+
+        async fn apply_system_proxy(
+            &self,
+            receipt: MutationReceipt,
+        ) -> Result<MutationReceipt, BackendError> {
+            ProxyBackend.apply_system_proxy(receipt).await
+        }
+    }
+
+    #[async_trait]
+    impl PrivilegedBackend for BlockingAutomaticBackend {
+        async fn plan_step(
+            &self,
+            kind: MutationKind,
+            plan: &ValidatedTunnelPlan,
+            caller: &AuthenticatedCaller,
+            parameter: StepParameter,
+        ) -> Result<MutationReceipt, BackendError> {
+            ProxyBackend.plan_step(kind, plan, caller, parameter).await
+        }
+
+        async fn apply_step(
+            &self,
+            receipt: MutationReceipt,
+            plan: &ValidatedTunnelPlan,
+            caller: &AuthenticatedCaller,
+        ) -> Result<(MutationReceipt, StepOutput), BackendError> {
+            ProxyBackend.apply_step(receipt, plan, caller).await
+        }
+
+        async fn restore_step(&self, _receipt: &MutationReceipt) -> Result<(), BackendError> {
+            if self.restore_calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                return Err(BackendError::AdapterRemovalPending);
+            }
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+
+        async fn plan_system_proxy(
+            &self,
+            operation_id: Uuid,
+            caller: &AuthenticatedCaller,
+            settings: &SystemProxySettings,
+        ) -> Result<MutationReceipt, BackendError> {
+            ProxyBackend
+                .plan_system_proxy(operation_id, caller, settings)
+                .await
+        }
+
+        async fn apply_system_proxy(
+            &self,
+            receipt: MutationReceipt,
+        ) -> Result<MutationReceipt, BackendError> {
+            ProxyBackend.apply_system_proxy(receipt).await
+        }
+    }
+
+    #[async_trait]
+    impl PrivilegedBackend for ScriptedRecoveryBackend {
+        async fn create_device(
+            &self,
+            mut receipt: MutationReceipt,
+        ) -> Result<MutationReceipt, BackendError> {
+            let MutationReceipt::WintunAdapter { interface_luid, .. } = &mut receipt else {
+                return Err(BackendError::AdapterIdentity);
+            };
+            *interface_luid = 7;
+            Ok(receipt)
+        }
+
+        async fn plan_step(
+            &self,
+            kind: MutationKind,
+            plan: &ValidatedTunnelPlan,
+            caller: &AuthenticatedCaller,
+            parameter: StepParameter,
+        ) -> Result<MutationReceipt, BackendError> {
+            ProxyBackend.plan_step(kind, plan, caller, parameter).await
+        }
+
+        async fn apply_step(
+            &self,
+            receipt: MutationReceipt,
+            plan: &ValidatedTunnelPlan,
+            caller: &AuthenticatedCaller,
+        ) -> Result<(MutationReceipt, StepOutput), BackendError> {
+            ProxyBackend.apply_step(receipt, plan, caller).await
+        }
+
+        async fn restore_step(&self, _receipt: &MutationReceipt) -> Result<(), BackendError> {
+            self.restore_calls.fetch_add(1, Ordering::AcqRel);
+            if self.blocked.load(Ordering::Acquire) {
+                return Err(BackendError::AdapterIdentity);
+            }
+            let transient = self
+                .transient_failures_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+            if transient {
+                Err(BackendError::AdapterRemovalPending)
+            } else {
+                Ok(())
+            }
+        }
+
+        async fn plan_system_proxy(
+            &self,
+            operation_id: Uuid,
+            caller: &AuthenticatedCaller,
+            settings: &SystemProxySettings,
+        ) -> Result<MutationReceipt, BackendError> {
+            ProxyBackend
+                .plan_system_proxy(operation_id, caller, settings)
+                .await
+        }
+
+        async fn apply_system_proxy(
+            &self,
+            receipt: MutationReceipt,
+        ) -> Result<MutationReceipt, BackendError> {
+            ProxyBackend.apply_system_proxy(receipt).await
+        }
+    }
+
+    fn automatic_recovery_capabilities() -> AgentCapabilities {
+        AgentCapabilities {
+            protocol_version: AGENT_PROTOCOL_VERSION,
+            guarded_recovery: true,
+            automatic_recovery: true,
+            ..Default::default()
+        }
+    }
+
+    fn test_caller() -> AuthenticatedCaller {
+        AuthenticatedCaller {
+            process_id: 42,
+            user_sid: "S-1-5-21-1000".to_owned(),
+            executable_path: std::path::PathBuf::from(r"C:\Program Files\Usque\usque-engine.exe"),
+            process_handle: None,
+        }
+    }
+
+    async fn recovery_required_service(
+        backend: Arc<ScriptedRecoveryBackend>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<AgentCoordinator<ScriptedRecoveryBackend>>,
+        Arc<AgentService<ScriptedRecoveryBackend>>,
+        AuthenticatedCaller,
+        Uuid,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let coordinator = Arc::new(
+            AgentCoordinator::open(
+                JournalStore::new(directory.path().join("recovery.json")),
+                backend,
+            )
+            .unwrap(),
+        );
+        let caller = test_caller();
+        let operation_id = Uuid::new_v4();
+        coordinator
+            .apply_system_proxy(
+                operation_id,
+                SystemProxySettings {
+                    proxy_uri: "http://127.0.0.1:8080".to_owned(),
+                    bypass_hosts: vec!["<local>".to_owned()],
+                },
+                caller.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            coordinator.recover_stale().await,
+            Err(CoordinatorError::RecoveryFailures(_))
+        ));
+        let service = Arc::new(AgentService::new(
+            Arc::clone(&coordinator),
+            automatic_recovery_capabilities(),
+        ));
+        service.reconcile_automatic_recovery_state().await;
+        assert_eq!(
+            service.automatic_recovery.lock().await.stage,
+            AutomaticRecoveryStage::Waiting
+        );
+        (directory, coordinator, service, caller, operation_id)
+    }
+
+    async fn wait_for_automatic_stage<Backend>(
+        service: &AgentService<Backend>,
+        expected: AutomaticRecoveryStage,
+    ) where
+        Backend: PrivilegedBackend,
+    {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if service.automatic_recovery.lock().await.stage == expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("automatic recovery stage timeout");
+    }
+
+    #[tokio::test]
+    async fn automatic_recovery_retries_transient_failures_until_clean() {
+        let backend = Arc::new(ScriptedRecoveryBackend::transient(2));
+        let (_directory, coordinator, service, _caller, _operation_id) =
+            recovery_required_service(Arc::clone(&backend)).await;
+        let worker = tokio::spawn(Arc::clone(&service).run_automatic_recovery_with_delays([
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ]));
+
+        wait_for_automatic_stage(&service, AutomaticRecoveryStage::Inactive).await;
+        assert_eq!(coordinator.state().await.phase, RecoveryPhase::Clean);
+        assert_eq!(backend.restore_calls.load(Ordering::Acquire), 3);
+        service.begin_shutdown();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exhausted_recovery_requires_an_exact_manual_reset() {
+        let backend = Arc::new(ScriptedRecoveryBackend::transient(4));
+        let (_directory, coordinator, service, caller, operation_id) =
+            recovery_required_service(Arc::clone(&backend)).await;
+        let waiting_revision = service.automatic_recovery.lock().await.revision;
+        let waiting_state = coordinator.state().await;
+        service
+            .restart_automatic_recovery(operation_id, waiting_state.generation, &caller)
+            .await
+            .unwrap();
+        {
+            let runtime = service.automatic_recovery.lock().await;
+            assert_eq!(runtime.stage, AutomaticRecoveryStage::Waiting);
+            assert_eq!(runtime.attempts_completed, 0);
+            assert_eq!(runtime.revision, waiting_revision);
+        }
+        let worker = tokio::spawn(Arc::clone(&service).run_automatic_recovery_with_delays([
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ]));
+
+        wait_for_automatic_stage(&service, AutomaticRecoveryStage::Exhausted).await;
+        let state = coordinator.state().await;
+        assert_eq!(backend.restore_calls.load(Ordering::Acquire), 4);
+        assert!(matches!(
+            service
+                .restart_automatic_recovery(operation_id, state.generation + 1, &caller)
+                .await,
+            Err(ServiceError::Lifecycle(AgentLifecycleError::Coordinator(
+                CoordinatorError::RecoveryConflict
+            )))
+        ));
+        let other_user = AuthenticatedCaller {
+            user_sid: "S-1-5-21-2000".to_owned(),
+            ..caller.clone()
+        };
+        assert!(matches!(
+            service
+                .restart_automatic_recovery(operation_id, state.generation, &other_user)
+                .await,
+            Err(ServiceError::Lifecycle(AgentLifecycleError::Coordinator(
+                CoordinatorError::OwnerMismatch
+            )))
+        ));
+        backend
+            .transient_failures_remaining
+            .store(0, Ordering::Release);
+        service
+            .restart_automatic_recovery(operation_id, state.generation, &caller)
+            .await
+            .unwrap();
+        wait_for_automatic_stage(&service, AutomaticRecoveryStage::Inactive).await;
+        assert_eq!(coordinator.state().await.phase, RecoveryPhase::Clean);
+        assert_eq!(backend.restore_calls.load(Ordering::Acquire), 5);
+        service.begin_shutdown();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn permanent_recovery_failure_blocks_without_consuming_the_budget() {
+        let backend = Arc::new(ScriptedRecoveryBackend::blocked());
+        let (_directory, _coordinator, service, caller, operation_id) =
+            recovery_required_service(Arc::clone(&backend)).await;
+        let worker = tokio::spawn(Arc::clone(&service).run_automatic_recovery_with_delays([
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ]));
+
+        wait_for_automatic_stage(&service, AutomaticRecoveryStage::Blocked).await;
+        let calls = backend.restore_calls.load(Ordering::Acquire);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(backend.restore_calls.load(Ordering::Acquire), calls);
+        let state = service.state().await;
+        assert!(matches!(
+            service
+                .restart_automatic_recovery(operation_id, state.generation, &caller)
+                .await,
+            Err(ServiceError::AutomaticRecoveryBlocked)
+        ));
+        let status = service.automatic_recovery_status().await;
+        assert_eq!(status.attempts_completed, 1);
+        assert_eq!(
+            status.terminal_error.unwrap().code,
+            "AGENT_AUTOMATIC_RECOVERY_BLOCKED"
+        );
+        let platform = service.current_proto_platform_state().await;
+        assert_eq!(
+            platform
+                .automatic_recovery
+                .unwrap()
+                .terminal_error
+                .unwrap()
+                .code,
+            "AGENT_AUTOMATIC_RECOVERY_BLOCKED"
+        );
+        service.begin_shutdown();
+        worker.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_agent_process_resets_only_the_in_memory_retry_budget() {
+        let backend = Arc::new(ScriptedRecoveryBackend::transient(usize::MAX));
+        let (directory, _coordinator, service, _caller, _operation_id) =
+            recovery_required_service(Arc::clone(&backend)).await;
+        let worker = tokio::spawn(Arc::clone(&service).run_automatic_recovery_with_delays([
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ]));
+        wait_for_automatic_stage(&service, AutomaticRecoveryStage::Exhausted).await;
+        service.begin_shutdown();
+        worker.await.unwrap();
+
+        let restarted_coordinator = Arc::new(
+            AgentCoordinator::open(
+                JournalStore::new(directory.path().join("recovery.json")),
+                backend,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            restarted_coordinator.state().await.phase,
+            RecoveryPhase::RecoveryRequired
+        );
+        let restarted = AgentService::new(restarted_coordinator, automatic_recovery_capabilities());
+        restarted.reconcile_automatic_recovery_state().await;
+        let runtime = restarted.automatic_recovery.lock().await;
+        assert_eq!(runtime.stage, AutomaticRecoveryStage::Waiting);
+        assert_eq!(runtime.attempts_completed, 0);
+    }
+
+    #[tokio::test]
+    async fn service_stop_waits_for_an_in_flight_automatic_recovery_worker() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = Arc::new(BlockingAutomaticBackend::default());
+        let coordinator = Arc::new(
+            AgentCoordinator::open(
+                JournalStore::new(directory.path().join("recovery.json")),
+                Arc::clone(&backend),
+            )
+            .unwrap(),
+        );
+        let caller = test_caller();
+        let operation_id = Uuid::new_v4();
+        coordinator
+            .apply_system_proxy(
+                operation_id,
+                SystemProxySettings {
+                    proxy_uri: "http://127.0.0.1:8080".to_owned(),
+                    bypass_hosts: vec!["<local>".to_owned()],
+                },
+                caller.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            coordinator.recover_stale().await,
+            Err(CoordinatorError::RecoveryFailures(_))
+        ));
+        let service = Arc::new(AgentService::new(
+            Arc::clone(&coordinator),
+            automatic_recovery_capabilities(),
+        ));
+        service.reconcile_automatic_recovery_state().await;
+        let mut worker = tokio::spawn(Arc::clone(&service).run_automatic_recovery_with_delays([
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        ]));
+        backend.entered.notified().await;
+
+        let state = tokio::time::timeout(Duration::from_millis(20), service.current_proto_state())
+            .await
+            .expect("running recovery state must not wait for the native worker");
+        assert_eq!(
+            state.automatic_recovery.as_ref().unwrap().phase,
+            agent_v1::AutomaticRecoveryPhase::Running as i32
+        );
+        assert_eq!(state.phase, agent_v1::AgentPhase::RecoveryRequired as i32);
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            service.restart_automatic_recovery(operation_id, state.journal_generation, &caller),
+        )
+        .await
+        .expect("Retry during native recovery must be responsive")
+        .expect("Retry during native recovery is idempotent");
+        assert_eq!(
+            service.automatic_recovery.lock().await.stage,
+            AutomaticRecoveryStage::Running
+        );
+
+        service.begin_shutdown();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(5), &mut worker)
+                .await
+                .is_err()
+        );
+        assert!(service.mutation_gate.try_lock().is_err());
+        backend.release.notify_one();
+        worker.await.unwrap();
+        assert_eq!(coordinator.state().await.phase, RecoveryPhase::Clean);
+    }
+
+    #[tokio::test]
+    async fn shutdown_timeout_keeps_recovery_owned_and_rejects_new_requests() {
+        let directory = tempfile::tempdir().unwrap();
+        let backend = Arc::new(BlockingProxyBackend::default());
+        let coordinator = Arc::new(
+            AgentCoordinator::open(
+                JournalStore::new(directory.path().join("recovery.json")),
+                Arc::clone(&backend),
+            )
+            .unwrap(),
+        );
+        let caller = AuthenticatedCaller {
+            process_id: 42,
+            user_sid: "S-1-5-21-1000".to_owned(),
+            executable_path: std::path::PathBuf::from(r"C:\Program Files\Usque\usque-engine.exe"),
+            process_handle: None,
+        };
+        coordinator
+            .apply_system_proxy(
+                Uuid::new_v4(),
+                SystemProxySettings {
+                    proxy_uri: "http://127.0.0.1:8080".to_owned(),
+                    bypass_hosts: vec!["<local>".to_owned()],
+                },
+                caller.clone(),
+            )
+            .await
+            .unwrap();
+        let service = Arc::new(AgentService::new(
+            Arc::clone(&coordinator),
+            AgentCapabilities::default(),
+        ));
+        let worker = Arc::clone(&service);
+        let mut task = tokio::spawn(async move { worker.recover_for_shutdown().await });
+        backend.entered.notified().await;
+        assert!(
+            tokio::time::timeout(Duration::ZERO, &mut task)
+                .await
+                .is_err()
+        );
+        assert!(service.mutation_gate.try_lock().is_err());
+        let response = service
+            .handle(
+                AgentRequest {
+                    request_id: "after-shutdown".to_owned(),
+                    protocol_version: AGENT_PROTOCOL_VERSION,
+                    payload: Some(agent_request::Payload::Recover(agent_v1::RecoverRequest {})),
+                },
+                &caller,
+            )
+            .await;
+        assert_eq!(response.error.unwrap().code, "AGENT_SHUTTING_DOWN");
+        backend.release.notify_one();
+        task.await.unwrap().unwrap();
+        assert_eq!(coordinator.state().await.phase, RecoveryPhase::Clean);
+        let result: Result<(), AgentLifecycleError> = service
+            .mutate(MutationPolicy::Forward, |_| async {
+                panic!("forward mutation ran after shutdown")
+            })
+            .await;
+        assert!(matches!(result, Err(AgentLifecycleError::ShuttingDown)));
+    }
+
+    struct FailingStartModeController;
+
+    #[async_trait]
+    impl ServiceStartModeController for FailingStartModeController {
+        async fn ensure_start_mode(
+            &self,
+            _mode: ServiceStartMode,
+        ) -> Result<(), ServiceConfigError> {
+            Err(ServiceConfigError::Change(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "test start-mode denial",
+            )))
+        }
+    }
+
+    #[async_trait]
+    impl PrivilegedBackend for RejectingBackend {
+        async fn plan_step(
+            &self,
+            _kind: MutationKind,
+            _plan: &ValidatedTunnelPlan,
+            _caller: &AuthenticatedCaller,
+            _parameter: StepParameter,
+        ) -> Result<MutationReceipt, BackendError> {
+            Err(BackendError::Unavailable("test backend".to_owned()))
+        }
+
+        async fn apply_step(
+            &self,
+            _receipt: MutationReceipt,
+            _plan: &ValidatedTunnelPlan,
+            _caller: &AuthenticatedCaller,
+        ) -> Result<(MutationReceipt, StepOutput), BackendError> {
+            Err(BackendError::Unavailable("test backend".to_owned()))
+        }
+
+        async fn restore_step(&self, _receipt: &MutationReceipt) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl PrivilegedBackend for ProxyBackend {
+        async fn plan_step(
+            &self,
+            _kind: MutationKind,
+            _plan: &ValidatedTunnelPlan,
+            _caller: &AuthenticatedCaller,
+            _parameter: StepParameter,
+        ) -> Result<MutationReceipt, BackendError> {
+            Err(BackendError::Unavailable("test tunnel backend".to_owned()))
+        }
+
+        async fn apply_step(
+            &self,
+            _receipt: MutationReceipt,
+            _plan: &ValidatedTunnelPlan,
+            _caller: &AuthenticatedCaller,
+        ) -> Result<(MutationReceipt, StepOutput), BackendError> {
+            Err(BackendError::Unavailable("test tunnel backend".to_owned()))
+        }
+
+        async fn restore_step(&self, _receipt: &MutationReceipt) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        async fn plan_system_proxy(
+            &self,
+            operation_id: Uuid,
+            caller: &AuthenticatedCaller,
+            settings: &SystemProxySettings,
+        ) -> Result<MutationReceipt, BackendError> {
+            Ok(MutationReceipt::SystemProxy {
+                user_sid: caller.user_sid.clone(),
+                operation_id,
+                previous_proxy_enable: Some(0),
+                previous_proxy: None,
+                previous_bypass: None,
+                previous_auto_config_url: None,
+                previous_auto_detect: Some(1),
+                applied_proxy: settings.proxy_uri.clone(),
+                applied_bypass: settings.bypass_hosts.join(";"),
+            })
+        }
+
+        async fn apply_system_proxy(
+            &self,
+            receipt: MutationReceipt,
+        ) -> Result<MutationReceipt, BackendError> {
+            Ok(receipt)
+        }
+    }
+
+    #[tokio::test]
+    async fn current_process_round_trips_over_an_authenticated_pipe() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let coordinator = Arc::new(
+            AgentCoordinator::open(
+                JournalStore::new(directory.path().join("recovery.json")),
+                Arc::new(RejectingBackend),
+            )
+            .expect("coordinator"),
+        );
+        let service = Arc::new(AgentService::new(
+            coordinator,
+            AgentCapabilities {
+                deferred_network_configuration: true,
+                reusable_tun_device: true,
+                automatic_endpoint_leases: false,
+                protected_tunnel_replacement: false,
+                wintun: false,
+                wfp_kill_switch: false,
+                interface_addresses: false,
+                interface_dns: false,
+                system_proxy: false,
+                shared_packet_ring: false,
+                operating_system: "windows".to_owned(),
+                architecture: std::env::consts::ARCH.to_owned(),
+                protocol_version: AGENT_PROTOCOL_VERSION,
+                dynamic_direct_egress: false,
+                physical_dns_snapshot: false,
+                exact_generation_egress: false,
+                guarded_recovery: false,
+                automatic_recovery: false,
+            },
+        ));
+        let pipe_name = format!("{AGENT_PIPE_NAME}.test-{}", Uuid::new_v4());
+        let server_pipe = create_agent_pipe(&pipe_name, true).expect("server");
+        let executable = std::env::current_exe().expect("test path");
+        let policy =
+            Arc::new(CallerPolicy::new(vec![executable], None, true).expect("debug policy"));
+        let server = tokio::spawn(async move {
+            server_pipe.connect().await.expect("accept");
+            handle_connected_pipe(server_pipe, service, policy)
+                .await
+                .expect("serve client");
+        });
+
+        let mut attempts = 0_u32;
+        let mut client = loop {
+            match ClientOptions::new().open(&pipe_name) {
+                Ok(client) => break client,
+                Err(error) if error.raw_os_error() == Some(2) => {
+                    attempts += 1;
+                    assert!(attempts < 100, "Agent pipe never appeared");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("open pipe: {error}"),
+            }
+        };
+        let request = AgentRequest {
+            request_id: "caps-1".to_owned(),
+            protocol_version: AGENT_PROTOCOL_VERSION,
+            payload: Some(agent_request::Payload::GetCapabilities(
+                GetCapabilitiesRequest {},
+            )),
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.write_all(&encode_frame(&request).expect("encode")),
+        )
+        .await
+        .expect("write timeout")
+        .expect("write");
+        let mut header = [0_u8; 4];
+        if tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut header))
+            .await
+            .is_err()
+        {
+            let server_finished = server.is_finished();
+            server.abort();
+            panic!("response header timed out; server_finished={server_finished}");
+        }
+        let mut payload = vec![0_u8; u32::from_be_bytes(header) as usize];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut payload))
+            .await
+            .expect("payload timeout")
+            .expect("payload");
+        let mut frame = BytesMut::from(header.as_slice());
+        frame.extend_from_slice(&payload);
+        let response: AgentResponse = decode_frame(frame.freeze()).expect("decode");
+        assert!(response.error.is_none());
+        assert!(matches!(
+            response.payload,
+            Some(agent_response::Payload::Capabilities(AgentCapabilities {
+                protocol_version: AGENT_PROTOCOL_VERSION,
+                ..
+            }))
+        ));
+        client.shutdown().await.expect("shutdown");
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("server shutdown timeout")
+            .expect("join");
+    }
+
+    #[tokio::test]
+    async fn forward_mutation_never_runs_when_auto_start_cannot_be_armed() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let coordinator = Arc::new(
+            AgentCoordinator::open(
+                JournalStore::new(directory.path().join("recovery.json")),
+                Arc::new(RejectingBackend),
+            )
+            .expect("coordinator"),
+        );
+        let service = AgentService::with_start_mode_controller(
+            Arc::clone(&coordinator),
+            AgentCapabilities::default(),
+            Arc::new(FailingStartModeController),
+        );
+        let reached = Arc::new(AtomicBool::new(false));
+        let action_reached = Arc::clone(&reached);
+        let result = service
+            .mutate(MutationPolicy::Forward, move |_coordinator| async move {
+                action_reached.store(true, Ordering::Release);
+                Ok(())
+            })
+            .await;
+
+        assert!(matches!(result, Err(AgentLifecycleError::StartMode(_))));
+        assert!(!reached.load(Ordering::Acquire));
+        assert_eq!(coordinator.state().await.phase, RecoveryPhase::Clean);
+    }
+
+    #[tokio::test]
+    async fn demand_start_failure_does_not_turn_successful_cleanup_into_an_error() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let coordinator = Arc::new(
+            AgentCoordinator::open(
+                JournalStore::new(directory.path().join("recovery.json")),
+                Arc::new(RejectingBackend),
+            )
+            .expect("coordinator"),
+        );
+        let service = AgentService::with_start_mode_controller(
+            coordinator,
+            AgentCapabilities::default(),
+            Arc::new(FailingStartModeController),
+        );
+        let reached = Arc::new(AtomicBool::new(false));
+        let action_reached = Arc::clone(&reached);
+        service
+            .mutate(MutationPolicy::Cleanup, move |_coordinator| async move {
+                action_reached.store(true, Ordering::Release);
+                Ok(())
+            })
+            .await
+            .expect("cleanup result");
+        assert!(reached.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn clean_service_waits_for_connections_before_idle_exit() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let coordinator = Arc::new(
+            AgentCoordinator::open(
+                JournalStore::new(directory.path().join("recovery.json")),
+                Arc::new(RejectingBackend),
+            )
+            .expect("coordinator"),
+        );
+        let service = Arc::new(AgentService::new(coordinator, AgentCapabilities::default()));
+        let connection = service.connection_started();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(40),
+                wait_for_idle_exit_after(Arc::clone(&service), Duration::from_millis(20)),
+            )
+            .await
+            .is_err()
+        );
+        drop(connection);
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            wait_for_idle_exit_after(service, Duration::from_millis(20)),
+        )
+        .await
+        .expect("idle exit");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_system_proxy_lease_restores_the_transaction() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let coordinator = Arc::new(
+            AgentCoordinator::open(
+                JournalStore::new(directory.path().join("recovery.json")),
+                Arc::new(ProxyBackend),
+            )
+            .expect("coordinator"),
+        );
+        let service = Arc::new(AgentService::new(
+            Arc::clone(&coordinator),
+            AgentCapabilities {
+                system_proxy: true,
+                protocol_version: AGENT_PROTOCOL_VERSION,
+                ..AgentCapabilities::default()
+            },
+        ));
+        let pipe_name = format!("{AGENT_PIPE_NAME}.test-{}", Uuid::new_v4());
+        let server_pipe = create_agent_pipe(&pipe_name, true).expect("server");
+        let executable = std::env::current_exe().expect("test path");
+        let policy =
+            Arc::new(CallerPolicy::new(vec![executable], None, true).expect("debug policy"));
+        let server = tokio::spawn(async move {
+            server_pipe.connect().await.expect("accept");
+            handle_connected_pipe(server_pipe, service, policy)
+                .await
+                .expect("serve client");
+        });
+
+        let mut client = ClientOptions::new().open(&pipe_name).expect("client");
+        let operation_id = Uuid::new_v4();
+        let request = AgentRequest {
+            request_id: "proxy-lease".to_owned(),
+            protocol_version: AGENT_PROTOCOL_VERSION,
+            payload: Some(agent_request::Payload::ApplySystemProxy(
+                ApplySystemProxyRequest {
+                    operation_id: operation_id.to_string(),
+                    proxy_uri: "http://127.0.0.1:8080".to_owned(),
+                    bypass_hosts: vec!["<local>".to_owned()],
+                },
+            )),
+        };
+        client
+            .write_all(&encode_frame(&request).expect("encode"))
+            .await
+            .expect("write");
+        let mut header = [0_u8; 4];
+        client.read_exact(&mut header).await.expect("header");
+        let mut payload = vec![0_u8; u32::from_be_bytes(header) as usize];
+        client.read_exact(&mut payload).await.expect("payload");
+        let mut frame = BytesMut::from(header.as_slice());
+        frame.extend_from_slice(&payload);
+        let response: AgentResponse = decode_frame(frame.freeze()).expect("response");
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(
+            coordinator.state().await.operation_id,
+            Some(operation_id),
+            "lease must remain active while the pipe is open"
+        );
+
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("lease cleanup timeout")
+            .expect("server task");
+        assert_eq!(coordinator.state().await.phase, RecoveryPhase::Clean);
+    }
+
+    #[test]
+    fn replay_cache_rejects_request_id_aliasing() {
+        let key = ReplayKey {
+            sid: "S-1-5-21-1".to_owned(),
+            process_id: 1,
+            request_id: "same".to_owned(),
+        };
+        let request = AgentRequest {
+            request_id: "same".to_owned(),
+            protocol_version: AGENT_PROTOCOL_VERSION,
+            payload: Some(agent_request::Payload::GetCapabilities(
+                GetCapabilitiesRequest {},
+            )),
+        };
+        let response = AgentResponse {
+            request_id: "same".to_owned(),
+            error: None,
+            payload: Some(agent_response::Payload::Empty(agent_v1::Empty {})),
+        };
+        let mut cache = ReplayCache::default();
+        cache.insert(
+            key.clone(),
+            CachedResponse {
+                request: request.clone(),
+                response,
+            },
+        );
+        assert_eq!(cache.entries.get(&key).expect("cached").request, request);
+    }
+}

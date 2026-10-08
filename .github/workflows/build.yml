@@ -1,0 +1,206 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CMAKE_GENERATOR: Ninja
+  FLUTTER_COMMIT: 84fc5cbb223bc12f83d65b647ff8a56caf779ffd
+  FLUTTER_VERSION: 3.44.7
+
+jobs:
+  android:
+    name: Android ARMv8, x64, ARMv7, and universal compile
+    if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout untrusted source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify vendored native sources and notices
+        run: python tool/check_openvpn_sources.py
+
+      - name: Install Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Flutter from pinned commit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/flutter"
+          git -C "$RUNNER_TEMP/flutter" init
+          git -C "$RUNNER_TEMP/flutter" remote add origin https://github.com/flutter/flutter.git
+          git -C "$RUNNER_TEMP/flutter" fetch --depth 1 origin \
+            "refs/tags/$FLUTTER_VERSION:refs/tags/$FLUTTER_VERSION"
+          git -C "$RUNNER_TEMP/flutter" checkout --detach "refs/tags/$FLUTTER_VERSION"
+          test "$(git -C "$RUNNER_TEMP/flutter" rev-parse HEAD)" = "$FLUTTER_COMMIT"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Install pinned Rust and Android toolchains
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.97.1 --profile minimal --component clippy
+          rustup default 1.97.1
+          rustup target add \
+            aarch64-linux-android
+          android_sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$android_sdk"
+          sdkmanager="$android_sdk/cmdline-tools/latest/bin/sdkmanager"
+          test -x "$sdkmanager"
+          "$sdkmanager" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;29.0.14206865" \
+            "cmake;3.22.1"
+
+      - name: Clippy Android Rust
+        shell: pwsh
+        run: ./tool/build_android_rust.ps1 -AbiFilter arm64-v8a -CargoAction clippy
+
+      - name: Resolve locked Flutter packages
+        working-directory: apps/usque_gui
+        run: flutter --suppress-analytics pub get --enforce-lockfile
+
+      - name: Create ephemeral build-only signing identity
+        env:
+          STORE_PASSWORD: usque-build-only-password
+        run: |
+          set -euo pipefail
+          keytool -genkeypair \
+            -keystore "$RUNNER_TEMP/usque-build-only.jks" \
+            -storepass "$STORE_PASSWORD" \
+            -keypass "$STORE_PASSWORD" \
+            -alias usque-build-only \
+            -keyalg RSA \
+            -keysize 3072 \
+            -validity 1 \
+            -dname "CN=Untrusted Usque CI Build, O=Usque Development, C=XX"
+
+      - name: Build split and universal Release APKs without release secrets
+        working-directory: apps/usque_gui
+        env:
+          USQUE_ANDROID_ABI: arm64-v8a
+          USQUE_ANDROID_KEYSTORE: ${{ runner.temp }}/usque-build-only.jks
+          USQUE_ANDROID_STORE_PASSWORD: usque-build-only-password
+          USQUE_ANDROID_KEY_ALIAS: usque-build-only
+          USQUE_ANDROID_KEY_PASSWORD: usque-build-only-password
+        run: |
+          flutter --suppress-analytics build apk \
+            --release \
+            --split-per-abi \
+            --target-platform android-arm64 \
+            --split-debug-info="$RUNNER_TEMP/flutter-symbols-android/split" \
+            --no-pub
+
+      - name: Verify all APK architectures and release hygiene
+        run: |
+          set -euo pipefail
+          android_sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          test -n "$android_sdk"
+          apksigner="$android_sdk/build-tools/36.0.0/apksigner"
+          test -x "$apksigner"
+          source_dir=apps/usque_gui/build/app/outputs/flutter-apk
+          declare -A expected_abis=(
+            [app-arm64-v8a-release.apk]="arm64-v8a"
+          )
+          count=0
+          for name in "${!expected_abis[@]}"; do
+            apk="$source_dir/$name"
+            test -s "$apk"
+            read -r -a package_abis <<< "${expected_abis[$name]}"
+            python tool/verify_android_apk.py --apk "$apk" \
+              --abis "${package_abis[@]}" \
+              --aapt2 "$android_sdk/build-tools/36.0.0/aapt2" \
+              --zipalign "$android_sdk/build-tools/36.0.0/zipalign"
+            entries="$RUNNER_TEMP/$name.entries"
+            unzip -Z1 "$apk" > "$entries"
+            actual_abis="$(
+              sed -nE 's#^lib/([^/]+)/.*#\1#p' "$entries" |
+                sort -u |
+                paste -sd ' ' -
+            )"
+            test "$actual_abis" = "${expected_abis[$name]}" || {
+              echo "Unexpected ABI set in $name: $actual_abis" >&2
+              exit 1
+            }
+            for abi in ${expected_abis[$name]}; do
+              grep -q "^lib/$abi/libusque_android\.so$" "$entries"
+            done
+            if grep -Eq 'kernel_blob\.bin|libVkLayer_khronos_validation\.so' "$entries"; then
+              echo "$name contains a forbidden debug artifact." >&2
+              exit 1
+            fi
+            while IFS= read -r library; do
+              extracted="$RUNNER_TEMP/$(tr '/.' '__' <<<"$library")"
+              unzip -p "$apk" "$library" > "$extracted"
+              sections="$extracted.sections"
+              readelf --sections "$extracted" > "$sections"
+              if grep -q '\.debug_info' "$sections"; then
+                echo "$library in $name contains debug information." >&2
+                exit 1
+              fi
+            done < <(grep '/libusque_android\.so$' "$entries")
+            "$apksigner" verify --verbose --print-certs "$apk"
+            count=$((count + 1))
+          done
+          test "$count" -eq 1
+          echo "ANDROID_BUILD_OK=$source_dir"
+
+      - name: Archive matching Android Flutter symbols separately
+        working-directory: apps/usque_gui
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version: //p' pubspec.yaml | tr -d '\r')"
+          commit="$(git rev-parse HEAD)"
+          for abi in arm64-v8a; do
+            python ../../tool/archive_flutter_symbols.py archive \
+              --artifact "build/app/outputs/flutter-apk/app-$abi-release.apk" \
+              --symbols "$RUNNER_TEMP/flutter-symbols-android/split" \
+              --output "$RUNNER_TEMP/flutter-symbol-archives" \
+              --version "$version" --source-commit "$commit" \
+              --platform android --kind split --architecture "$abi"
+          done
+# universal build skipped
+
+      - name: Preserve matching Android Flutter symbols separately
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: usque-flutter-symbols-android
+          path: ${{ runner.temp }}/flutter-symbol-archives
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload Android Release APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: usque-release-apks
+          path: apps/usque_gui/build/app/outputs/flutter-apk/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Remove ephemeral identity and compile output
+        if: ${{ always() }}
+        run: |
+          rm -f "$RUNNER_TEMP/usque-build-only.jks"
+          rm -rf apps/usque_gui/build apps/usque_gui/android/app/src/main/jniLibs
+

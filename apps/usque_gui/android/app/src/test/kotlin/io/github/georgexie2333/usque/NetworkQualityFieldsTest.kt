@@ -1,0 +1,234 @@
+package io.github.georgexie2333.usque
+
+import org.json.JSONArray
+import org.json.JSONObject
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.util.concurrent.Executor
+import java.util.concurrent.atomic.AtomicInteger
+
+class NetworkQualityFieldsTest {
+    @Test fun transportPerformanceKeepsOnlyNumbersAndBoundedHistograms() {
+        val source =
+            JSONObject()
+                .put(
+                    "transport_performance",
+                    JSONObject()
+                        .put("h3", JSONObject().put("encode_pool_exhausted", 3).put("secret", "private"))
+                        .put("h3_batch_sizes", JSONArray(List(100) { 1 })),
+                ).put(
+                    "queues",
+                    JSONArray().put(
+                        JSONObject()
+                            .put("kind", "transportOutgoing")
+                            .put(
+                                "backpressure",
+                                JSONObject()
+                                    .put("waits", 4)
+                                    .put("total_us", 2500)
+                                    .put("buckets", JSONArray(List(100) { 1 }))
+                                    .put("payload", "private"),
+                            ),
+                    ),
+                )
+        val encoded = requireNotNull(NetworkQualityFields.encode(source))
+        assertFalse(encoded.contains("private"))
+        val safe = JSONObject(encoded)
+        val performance = safe.getJSONObject("transport_performance")
+        assertTrue(performance.isNull("h2"))
+        assertEquals(3L, performance.getJSONObject("h3").getLong("encode_pool_exhausted"))
+        assertEquals(7, performance.getJSONArray("h3_batch_sizes").length())
+        val wait = safe.getJSONArray("queues").getJSONObject(0).getJSONObject("backpressure")
+        assertEquals(2500L, wait.getLong("total_us"))
+        assertEquals(32, wait.getJSONArray("buckets").length())
+        assertTrue(
+            JSONObject(requireNotNull(NetworkQualityFields.encode(JSONObject()))).isNull("transport_performance"),
+        )
+        assertNotNullExport(source)
+    }
+
+    private fun assertNotNullExport(source: JSONObject) {
+        val exported = requireNotNull(NetworkQualityFields.diagnostic(source.toString(), false))
+        assertTrue(exported.has("transport_performance"))
+        assertFalse(exported.toString().contains("private"))
+    }
+
+    @Test fun sharedCredentialCapabilityReachesTheFlutterBridge() {
+        for (key in listOf("account_metadata_mutations", "shared_proxy_auth_application")) {
+            assertEquals(true, NetworkQualityFields.capabilities("{\"$key\":true}")[key])
+            assertEquals(false, NetworkQualityFields.capabilities("{}")[key])
+            assertEquals(false, NetworkQualityFields.capabilities("{\"$key\":\"true\"}")[key])
+        }
+    }
+
+    @Test fun automaticEndpointCapabilityReachesFlutterOnlyWithBooleanSupport() {
+        val key = "automatic_endpoints"
+        assertEquals(true, NetworkQualityFields.capabilities("{\"automatic_endpoints\":true}")[key])
+        for (source in listOf(null, "{}", "{\"automatic_endpoints\":false}", "{\"automatic_endpoints\":\"true\"}")) {
+            assertEquals(false, NetworkQualityFields.capabilities(source)[key])
+        }
+    }
+
+    @Test fun customBypassCapabilityReachesFlutterOnlyWithBooleanSupport() {
+        val key = "custom_bypass"
+        assertEquals(true, NetworkQualityFields.capabilities("{\"custom_bypass\":true}").getValue(key))
+        for (source in listOf(null, "{}", "{\"custom_bypass\":false}", "{\"custom_bypass\":\"true\"}", "invalid")) {
+            assertEquals(false, NetworkQualityFields.capabilities(source).getValue(key))
+        }
+    }
+
+    @Test fun applicationQuicCapabilityRequiresExplicitBooleanSupport() {
+        val key = "application_quic_blocking"
+        assertEquals(true, NetworkQualityFields.capabilities("{\"application_quic_blocking\":true}")[key])
+        val unsupported =
+            listOf(
+                null,
+                "{}",
+                "{\"application_quic_blocking\":false}",
+                "{\"application_quic_blocking\":\"true\"}",
+            )
+        for (source in unsupported) {
+            assertEquals(false, NetworkQualityFields.capabilities(source)[key])
+        }
+    }
+
+    @Test fun sourceSamplesAreBoundedAndPreserveUnknownVersusZero() {
+        val samples =
+            JSONArray(
+                (1..30).map { sequence ->
+                    JSONObject()
+                        .put("sequence", sequence)
+                        .put("sampled_at_unix_ms", 1000L * sequence)
+                        .put("monotonic_millis", 1000L * (sequence - 1))
+                        .put("downloaded_bytes", 0)
+                        .put("uploaded_bytes", -1)
+                        .put("rtt_ms", 42)
+                        .put("loss_basis_points", 10001)
+                        .put("endpoint", "private.example")
+                },
+            )
+        val encoded = requireNotNull(NetworkQualityFields.encode(JSONObject().put("samples", samples)))
+        assertTrue(encoded.toByteArray(Charsets.UTF_8).size <= NetworkQualityFields.MAX_JSON_BYTES)
+        assertFalse(encoded.contains("private.example"))
+        val decoded = requireNotNull(NetworkQualityFields.decode(encoded))["samples"] as List<*>
+        assertEquals(16, decoded.size)
+        val first = decoded.first() as Map<*, *>
+        assertEquals(1L, first["sequence"])
+        assertEquals(0L, first["monotonic_millis"])
+        assertEquals(0L, first["downloaded_bytes"])
+        assertNull(first["uploaded_bytes"])
+        assertNull(first["loss_basis_points"])
+        samples.getJSONObject(0).put("sequence", 0)
+        val sanitized = requireNotNull(NetworkQualityFields.encode(JSONObject().put("samples", samples)))
+        assertEquals(15, (requireNotNull(NetworkQualityFields.decode(sanitized))["samples"] as List<*>).size)
+    }
+
+    @Test fun qualityBridgeIsBoundedTypedAndOmitsUnknownPrivateFields() {
+        val source =
+            JSONObject()
+                .put(
+                    "sampled_at_unix_ms",
+                    1000,
+                ).put("connection_instance_id", "12345678-1234-4234-8234-123456789012")
+                .put("endpoint", "private.example")
+                .put("ssid", "private-ssid")
+                .put(
+                    "metrics",
+                    JSONObject()
+                        .put(
+                            "latest_rtt_milliseconds",
+                            7,
+                        ).put("latest_rtt_availability", "available")
+                        .put("packets_lost", -1)
+                        .put("server", "private.example"),
+                ).put(
+                    "queues",
+                    JSONArray((0..40).map { JSONObject().put("kind", "h3WireSend").put("current_items", 4) }),
+                ).put("migration", JSONObject().put("last_reason_code", "192.0.2.9").put("phase_code", "probing"))
+                .put(
+                    "direct_dns",
+                    JSONObject().put("mode", "doh").put("server_name", "private.example").put("phase_code", "ready"),
+                )
+        val encoded = requireNotNull(NetworkQualityFields.encode(source))
+        assertFalse(encoded.contains("private"))
+        assertFalse(encoded.contains("192.0.2.9"))
+        val decoded = requireNotNull(NetworkQualityFields.decode(encoded))
+        assertEquals(1, (decoded["queues"] as List<*>).size)
+        val metrics = decoded["metrics"] as Map<*, *>
+        assertEquals(7L, metrics["latest_rtt_milliseconds"])
+        assertEquals("available", metrics["latest_rtt_availability"])
+        assertNull(metrics["packets_lost"])
+        assertNull(NetworkQualityFields.decode("x".repeat(16 * 1024 + 1)))
+        assertTrue(NetworkQualityFields.capabilities(null).values.none { it })
+        assertTrue(NetworkQualityFields.capabilities("{\"network_quality\":true}").getValue("network_quality"))
+        assertFalse(NetworkQualityFields.capabilities("{\"network_quality\":\"true\"}").getValue("network_quality"))
+    }
+
+    @Test fun standardHasNoProbeCallsAndNoSnapshotMutation() {
+        val calls = AtomicInteger()
+        val source =
+            mapOf<String, Any?>(
+                "phase" to "connected",
+                "direct_dns_mode" to "doh",
+                "direct_dns_configuration" to "valid",
+            )
+        val before = source.toMap()
+        val doctor =
+            AndroidDiagnosticsCoordinator(executor = Executor(Runnable::run), networkProbe = {
+                id,
+                _,
+                ->
+                calls.incrementAndGet()
+                NetworkDiagnosticChecks.probe(id, null)
+            })
+        doctor.start("standard", source, true, true, true, true)
+        assertEquals(0, calls.get())
+        assertEquals(before, source)
+        val findings = doctor.current()!!["findings"] as List<*>
+        assertEquals(39, findings.size)
+        val configuration =
+            findings.filterIsInstance<Map<*, *>>().single {
+                it["check_id"] ==
+                    "dns.direct_encrypted_configuration"
+            }
+        assertEquals("passed", configuration["status"])
+        assertEquals("nq_finding_dns_custom_valid", configuration["summary_key"])
+    }
+
+    @Test fun h2UnavailableLossAndStaleNumbersNeverPass() {
+        val source =
+            mapOf<String, Any?>(
+                "transport" to "h2",
+                "network_quality" to
+                    mapOf(
+                        "connection_instance_id" to "12345678-1234-4234-8234-123456789012",
+                        "sampled_at_unix_ms" to 1000L,
+                        "metrics" to
+                            mapOf("interval_loss_availability" to "unsupported", "interval_loss_basis_points" to 0L),
+                    ),
+            )
+        assertEquals("skipped", NetworkDiagnosticChecks.evaluate("quality.packet_loss", source, 1000)["status"])
+        assertEquals("warning", NetworkDiagnosticChecks.evaluate("quality.rtt", source, 5000)["status"])
+        val invalidQuality = mapOf("connection_instance_id" to "account-id", "sampled_at_unix_ms" to 1000L)
+        val invalidContext = source + ("network_quality" to invalidQuality)
+        assertEquals("skipped", NetworkDiagnosticChecks.evaluate("quality.rtt", invalidContext, 5000)["status"])
+        assertEquals(
+            "skipped",
+            NetworkDiagnosticChecks.evaluate("transport.migration_capability", source, 1000)["status"],
+        )
+    }
+
+    @Test fun probeOutputNeverCopiesRawRemoteErrors() {
+        val result =
+            NetworkDiagnosticChecks.probe(
+                "dns.direct_encrypted_reachability",
+                "{\"code\":\"failed\",\"error\":\"private.example 192.0.2.1\"}",
+            )
+        assertEquals("failed", result["status"])
+        assertFalse(result.toString().contains("private.example"))
+        assertFalse(result.toString().contains("192.0.2.1"))
+    }
+}

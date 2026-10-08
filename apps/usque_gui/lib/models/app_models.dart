@@ -1,0 +1,2466 @@
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+
+import 'chain_exit_models.dart';
+import 'diagnostics_models.dart';
+import 'l4_performance.dart';
+import 'transport_performance.dart';
+import 'vpngate_models.dart';
+
+export 'chain_exit_models.dart';
+export 'l4_performance.dart';
+export 'transport_performance.dart';
+export 'vpngate_models.dart';
+
+enum AppSection { home, profiles, proxy, settings }
+
+enum ConnectionPhase {
+  disconnected,
+  preparing,
+  connectingH3,
+  connectingH2,
+  connected,
+  degraded,
+  reconnecting,
+  disconnecting,
+  error,
+}
+
+enum OperatingMode { vpn, socks5, httpProxy }
+
+enum DataPlaneMode {
+  connectIp('connect_ip'),
+  l4Proxy('l4_proxy');
+
+  const DataPlaneMode(this.wireName);
+  final String wireName;
+  static DataPlaneMode? fromWire(Object? value) =>
+      values.where((mode) => mode.wireName == value).firstOrNull;
+}
+
+enum TransportPolicy { automatic, http3, http2 }
+
+enum EndpointSelection { automatic, custom }
+
+enum CongestionControlAlgorithm {
+  cubic('cubic'),
+  reno('reno'),
+  bbr('BBRv2'),
+  bbr3('BBRv3');
+
+  const CongestionControlAlgorithm(this.label);
+  final String label;
+}
+
+enum IpPolicy { automatic, preferIpv4, preferIpv6, ipv4Only, ipv6Only }
+
+enum DnsMode { tunnel, localConfigured, system }
+
+enum ProxyDnsMode { remote, localConfigured, system, edgeResolved }
+
+enum DirectDnsMode { unknown, physicalSystem, doh, dot }
+
+class DirectDnsSettings {
+  const DirectDnsSettings({
+    this.mode = DirectDnsMode.physicalSystem,
+    this.serverName = '',
+    this.dohPath = '',
+    this.bootstrapIps = const <String>[],
+    this.port = 0,
+  });
+
+  final DirectDnsMode mode;
+  final String serverName;
+  final String dohPath;
+  final List<String> bootstrapIps;
+  final int port;
+
+  DirectDnsSettings copyWith({
+    DirectDnsMode? mode,
+    String? serverName,
+    String? dohPath,
+    List<String>? bootstrapIps,
+    int? port,
+  }) {
+    return DirectDnsSettings(
+      mode: mode ?? this.mode,
+      serverName: serverName ?? this.serverName,
+      dohPath: dohPath ?? this.dohPath,
+      bootstrapIps: bootstrapIps ?? this.bootstrapIps,
+      port: port ?? this.port,
+    );
+  }
+
+  factory DirectDnsSettings.fromMap(Map<String, Object?> map) {
+    final modeName = map['mode'] as String? ?? 'physicalSystem';
+    final mode = DirectDnsMode.values.firstWhere(
+      (value) => value.name == modeName,
+      orElse: () => DirectDnsMode.unknown,
+    );
+    return DirectDnsSettings(
+      mode: mode,
+      serverName: _stringOr(map, 'server_name', ''),
+      dohPath: _stringOr(map, 'doh_path', ''),
+      bootstrapIps: List<String>.unmodifiable(
+        map.containsKey('bootstrap_ips')
+            ? _stringList(map, 'bootstrap_ips')
+            : const <String>[],
+      ),
+      port: (map['port'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  Map<String, Object?> toMap() => <String, Object?>{
+    'mode': mode.name,
+    'server_name': serverName,
+    'doh_path': dohPath,
+    'bootstrap_ips': bootstrapIps,
+    'port': port,
+  };
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is DirectDnsSettings &&
+          mode == other.mode &&
+          serverName == other.serverName &&
+          dohPath == other.dohPath &&
+          listEquals(bootstrapIps, other.bootstrapIps) &&
+          port == other.port;
+
+  @override
+  int get hashCode => Object.hash(
+    mode,
+    serverName,
+    dohPath,
+    Object.hashAll(bootstrapIps),
+    port,
+  );
+}
+
+enum IdentityProvisioningMethod { register, registerWithLicense, zeroTrust }
+
+enum IdentityProvider { consumer, zeroTrust }
+
+enum ProfileIdentityState { ready, missing, invalid }
+
+enum LicenseState { free, warpPlus, unknown, cleanupPending, notApplicable }
+
+enum FrontendKind { tunnel, socks5, http, systemProxy }
+
+enum FrontendPhase {
+  disabled,
+  preparing,
+  active,
+  degraded,
+  reconnecting,
+  error,
+}
+
+enum ThemePreference { system, light, dark }
+
+enum LocalePreference {
+  system,
+  english,
+  simplifiedChinese,
+  traditionalChineseHongKong,
+  traditionalChineseTaiwan,
+  japanese,
+  korean,
+  spanish,
+  portuguese,
+  french,
+  dutch,
+  turkish,
+  russian,
+  persian,
+  arabic,
+  german,
+  indonesian,
+  italian,
+  polish,
+  thai,
+  ukrainian,
+  vietnamese;
+
+  /// Language picker order: System first, then English names A–Z with Chinese
+  /// variants grouped under Chinese.
+  static const List<LocalePreference> pickerOrder = <LocalePreference>[
+    system,
+    arabic,
+    simplifiedChinese,
+    traditionalChineseHongKong,
+    traditionalChineseTaiwan,
+    dutch,
+    english,
+    french,
+    german,
+    indonesian,
+    italian,
+    japanese,
+    korean,
+    persian,
+    polish,
+    portuguese,
+    russian,
+    spanish,
+    thai,
+    turkish,
+    ukrainian,
+    vietnamese,
+  ];
+
+  String get languageLabelKey => switch (this) {
+    system => 'language_system',
+    english => 'language_en',
+    simplifiedChinese => 'language_zh',
+    traditionalChineseHongKong => 'language_zh_hk',
+    traditionalChineseTaiwan => 'language_zh_tw',
+    japanese => 'language_ja',
+    korean => 'language_ko',
+    spanish => 'language_es',
+    portuguese => 'language_pt',
+    french => 'language_fr',
+    dutch => 'language_nl',
+    turkish => 'language_tr',
+    russian => 'language_ru',
+    persian => 'language_fa',
+    arabic => 'language_ar',
+    german => 'language_de',
+    indonesian => 'language_id',
+    italian => 'language_it',
+    polish => 'language_pl',
+    thai => 'language_th',
+    ukrainian => 'language_uk',
+    vietnamese => 'language_vi',
+  };
+}
+
+class GeoRulesEntry {
+  const GeoRulesEntry({
+    required this.countryCode,
+    this.hasGeoip = false,
+    this.hasGeosite = false,
+    this.lastUpdatedUnixMilliseconds = 0,
+  });
+
+  final String countryCode;
+  final bool hasGeoip;
+  final bool hasGeosite;
+  final int lastUpdatedUnixMilliseconds;
+}
+
+class GeoRulesList {
+  const GeoRulesList({
+    this.entries = const <GeoRulesEntry>[],
+    this.lastSuccessfulUpdateUnixMilliseconds = 0,
+    this.hasGlobalGeosite = false,
+    this.globalGeositeUpdatedUnixMilliseconds = 0,
+  });
+
+  final List<GeoRulesEntry> entries;
+  final int lastSuccessfulUpdateUnixMilliseconds;
+  final bool hasGlobalGeosite;
+  final int globalGeositeUpdatedUnixMilliseconds;
+}
+
+enum GeoRulesUpdateStatus { upToDate, updated, failed }
+
+class GeoRulesUpdateResult {
+  const GeoRulesUpdateResult({
+    required this.countryCode,
+    required this.status,
+    this.reason = '',
+    this.artifactKind = '',
+    this.artifactScope = '',
+  });
+
+  final String countryCode;
+  final GeoRulesUpdateStatus status;
+  final String reason;
+  final String artifactKind;
+  final String artifactScope;
+}
+
+class GeoRulesProgress {
+  const GeoRulesProgress({
+    this.currentFile = '',
+    this.completed = 0,
+    this.total = 0,
+  });
+
+  final String currentFile;
+  final int completed;
+  final int total;
+}
+
+class UpdateCheckResult {
+  const UpdateCheckResult({
+    required this.available,
+    this.version,
+    this.releaseUrl,
+    this.package,
+  });
+
+  const UpdateCheckResult.current()
+    : available = false,
+      version = null,
+      releaseUrl = null,
+      package = null;
+
+  final bool available;
+  final String? version;
+  final String? releaseUrl;
+  final UpdatePackage? package;
+
+  factory UpdateCheckResult.fromMap(Map<Object?, Object?> map) {
+    final package = map['package'];
+    return UpdateCheckResult(
+      available: map['available'] as bool? ?? false,
+      version: map['version'] as String?,
+      releaseUrl: map['release_url'] as String?,
+      package: package is Map<Object?, Object?>
+          ? UpdatePackage.fromMap(package)
+          : null,
+    );
+  }
+}
+
+class UpdatePackage {
+  const UpdatePackage({
+    required this.name,
+    required this.downloadUrl,
+    required this.size,
+    required this.sha256,
+    required this.platform,
+    required this.variant,
+  });
+
+  final String name;
+  final String downloadUrl;
+  final int size;
+  final String sha256;
+  final String platform;
+  final String variant;
+
+  factory UpdatePackage.fromMap(Map<Object?, Object?> map) {
+    return UpdatePackage(
+      name: map['name'] as String? ?? '',
+      downloadUrl: map['download_url'] as String? ?? '',
+      size: map['size'] as int? ?? 0,
+      sha256: map['sha256'] as String? ?? '',
+      platform: map['platform'] as String? ?? '',
+      variant: map['variant'] as String? ?? '',
+    );
+  }
+
+  Map<String, Object> toMap() => <String, Object>{
+    'name': name,
+    'download_url': downloadUrl,
+    'size': size,
+    'sha256': sha256,
+    'platform': platform,
+    'variant': variant,
+  };
+}
+
+enum UpdateOperationPhase {
+  idle,
+  checking,
+  available,
+  downloading,
+  verifying,
+  ready,
+  installing,
+  failed,
+}
+
+class PerAppProxySettings {
+  const PerAppProxySettings({
+    this.enabled = false,
+    this.packageNames = const <String>[],
+  });
+
+  static const int maxPackages = 1024;
+  static const int maxPackageLength = 256;
+  static final RegExp packageNamePattern = RegExp(
+    r'^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*$',
+  );
+
+  final bool enabled;
+  final List<String> packageNames;
+
+  PerAppProxySettings copyWith({bool? enabled, List<String>? packageNames}) {
+    return PerAppProxySettings(
+      enabled: enabled ?? this.enabled,
+      packageNames: packageNames ?? this.packageNames,
+    );
+  }
+
+  static List<String> sanitizePackages(
+    Iterable<String> names, {
+    String? selfPackage,
+  }) {
+    final sanitized = names
+        .map((name) => name.trim())
+        .where(
+          (name) =>
+              name.isNotEmpty &&
+              name != selfPackage &&
+              name.length <= maxPackageLength &&
+              packageNamePattern.hasMatch(name),
+        )
+        .toSet()
+        .toList();
+    sanitized.sort();
+    return List<String>.unmodifiable(sanitized);
+  }
+
+  String? validationError({String? selfPackage}) {
+    if (packageNames.length > maxPackages) {
+      return 'INVALID_ARGUMENT';
+    }
+    final invalid = packageNames.any((raw) {
+      final name = raw.trim();
+      return name.isNotEmpty &&
+          name != selfPackage &&
+          (name.length > maxPackageLength ||
+              !packageNamePattern.hasMatch(name));
+    });
+    if (invalid) {
+      return 'INVALID_ARGUMENT';
+    }
+    final sanitized = sanitizePackages(packageNames, selfPackage: selfPackage);
+    if (enabled && sanitized.isEmpty) {
+      return 'ANDROID_PER_APP_EMPTY';
+    }
+    return null;
+  }
+
+  factory PerAppProxySettings.fromMap(Map<Object?, Object?> map) {
+    final names = (map['package_names'] as List?)?.whereType<String>().toList(
+      growable: false,
+    );
+    return PerAppProxySettings(
+      enabled: map['enabled'] as bool? ?? false,
+      packageNames: List<String>.unmodifiable(names ?? const <String>[]),
+    );
+  }
+
+  Map<String, Object?> toMap() => <String, Object?>{
+    'enabled': enabled,
+    'package_names': packageNames,
+  };
+}
+
+class InstalledAppInfo {
+  const InstalledAppInfo({
+    required this.packageName,
+    required this.label,
+    required this.isSystem,
+    required this.hasInternet,
+  });
+
+  final String packageName;
+  final String label;
+  final bool isSystem;
+  final bool hasInternet;
+
+  factory InstalledAppInfo.fromMap(Map<Object?, Object?> map) {
+    return InstalledAppInfo(
+      packageName: map['package_name'] as String? ?? '',
+      label: map['label'] as String? ?? '',
+      isSystem: map['is_system'] as bool? ?? false,
+      hasInternet: map['has_internet'] as bool? ?? false,
+    );
+  }
+}
+
+class PlatformPreferences {
+  const PlatformPreferences({
+    this.startOnBoot = false,
+    this.closeToTray = true,
+  });
+
+  final bool startOnBoot;
+  final bool closeToTray;
+
+  factory PlatformPreferences.fromMap(Map<Object?, Object?> map) {
+    return PlatformPreferences(
+      startOnBoot: map['start_on_boot'] as bool? ?? false,
+      closeToTray: map['close_to_tray'] as bool? ?? true,
+    );
+  }
+}
+
+class ProfileCatalog {
+  const ProfileCatalog({
+    required this.profiles,
+    required this.activeProfileId,
+    this.identityStates = const <String, ProfileIdentityState>{},
+    this.identityStatuses = const <String, ProfileIdentityStatus>{},
+    this.sharedNetwork,
+  });
+
+  final UsqueProfile? sharedNetwork;
+  final List<UsqueProfile> profiles;
+  final String activeProfileId;
+  final Map<String, ProfileIdentityState> identityStates;
+  final Map<String, ProfileIdentityStatus> identityStatuses;
+}
+
+class ProfileIdentityStatus {
+  const ProfileIdentityStatus({
+    required this.state,
+    this.licenseState = LicenseState.unknown,
+    this.accountType = '',
+    this.cleanupPending = false,
+    this.provider = IdentityProvider.consumer,
+    this.organization = '',
+  });
+
+  final ProfileIdentityState state;
+  final LicenseState licenseState;
+  final String accountType;
+  final bool cleanupPending;
+  final IdentityProvider provider;
+  final String organization;
+}
+
+class FrontendSettings {
+  const FrontendSettings({
+    required this.tunnel,
+    required this.socks5,
+    required this.http,
+  });
+
+  const FrontendSettings.windowsDefault()
+    : tunnel = true,
+      socks5 = true,
+      http = true;
+
+  const FrontendSettings.androidDefault()
+    : tunnel = true,
+      socks5 = true,
+      http = true;
+
+  final bool tunnel;
+  final bool socks5;
+  final bool http;
+
+  bool get any => tunnel || socks5 || http;
+
+  FrontendSettings copyWith({bool? tunnel, bool? socks5, bool? http}) {
+    return FrontendSettings(
+      tunnel: tunnel ?? this.tunnel,
+      socks5: socks5 ?? this.socks5,
+      http: http ?? this.http,
+    );
+  }
+
+  factory FrontendSettings.fromMap(Map<String, Object?> map) {
+    return FrontendSettings(
+      tunnel: _bool(map, 'tunnel'),
+      socks5: _bool(map, 'socks5'),
+      http: _bool(map, 'http'),
+    );
+  }
+
+  Map<String, Object?> toMap() => <String, Object?>{
+    'tunnel': tunnel,
+    'socks5': socks5,
+    'http': http,
+  };
+}
+
+class ProxySettings {
+  const ProxySettings({
+    this.socksIpv4 = '127.0.0.1',
+    this.socksIpv6 = '::1',
+    this.socksPort = 1080,
+    this.httpIpv4 = '127.0.0.1',
+    this.httpIpv6 = '::1',
+    this.httpPort = 8080,
+    this.dnsMode = ProxyDnsMode.remote,
+    this.dnsIpv4 = '1.1.1.1',
+    this.dnsIpv6 = '2606:4700:4700::1111',
+    this.systemProxy = false,
+    this.authUsername = '',
+    this._socksListeners,
+    this._httpListeners,
+  });
+
+  final String socksIpv4;
+  final String socksIpv6;
+  final int socksPort;
+  final String httpIpv4;
+  final String httpIpv6;
+  final int httpPort;
+  final ProxyDnsMode dnsMode;
+  final String dnsIpv4;
+  final String dnsIpv6;
+  final bool systemProxy;
+  final String authUsername;
+  final List<String>? _socksListeners;
+  final List<String>? _httpListeners;
+
+  List<String> get socksListeners => List<String>.unmodifiable(
+    _socksListeners ?? ['$socksIpv4:$socksPort', '[$socksIpv6]:$socksPort'],
+  );
+  List<String> get httpListeners => List<String>.unmodifiable(
+    _httpListeners ?? ['$httpIpv4:$httpPort', '[$httpIpv6]:$httpPort'],
+  );
+  bool get hasCustomSocksListeners => !listEquals(socksListeners, [
+    '$socksIpv4:$socksPort',
+    '[$socksIpv6]:$socksPort',
+  ]);
+  bool get hasCustomHttpListeners => !listEquals(httpListeners, [
+    '$httpIpv4:$httpPort',
+    '[$httpIpv6]:$httpPort',
+  ]);
+
+  static ({String host, int port})? parseListener(String value) {
+    final match = RegExp(r'^(?:\[([^\]]+)\]|([^:]+)):(\d+)$').firstMatch(value);
+    if (match == null) return null;
+    final host = match.group(1) ?? match.group(2)!;
+    final address = InternetAddress.tryParse(host);
+    final port = int.tryParse(match.group(3)!);
+    if (address == null ||
+        port == null ||
+        port < 1 ||
+        port > 65535 ||
+        (match.group(1) != null) !=
+            (address.type == InternetAddressType.IPv6)) {
+      return null;
+    }
+    return (host: address.address, port: port);
+  }
+
+  bool get remoteDns => dnsMode == ProxyDnsMode.remote;
+
+  bool get hasAuth => authUsername.isNotEmpty;
+
+  bool get exposesLan {
+    return [...socksListeners, ...httpListeners].any((listener) {
+      final address = parseListener(listener)?.host;
+      return address == null ||
+          !(InternetAddress.tryParse(address)?.isLoopback ?? false);
+    });
+  }
+
+  ProxySettings copyWith({
+    String? socksIpv4,
+    String? socksIpv6,
+    int? socksPort,
+    String? httpIpv4,
+    String? httpIpv6,
+    int? httpPort,
+    ProxyDnsMode? dnsMode,
+    String? dnsIpv4,
+    String? dnsIpv6,
+    bool? systemProxy,
+    String? authUsername,
+    List<String>? socksListeners,
+    List<String>? httpListeners,
+  }) {
+    return ProxySettings(
+      socksIpv4: socksIpv4 ?? this.socksIpv4,
+      socksIpv6: socksIpv6 ?? this.socksIpv6,
+      socksPort: socksPort ?? this.socksPort,
+      httpIpv4: httpIpv4 ?? this.httpIpv4,
+      httpIpv6: httpIpv6 ?? this.httpIpv6,
+      httpPort: httpPort ?? this.httpPort,
+      dnsMode: dnsMode ?? this.dnsMode,
+      dnsIpv4: dnsIpv4 ?? this.dnsIpv4,
+      dnsIpv6: dnsIpv6 ?? this.dnsIpv6,
+      systemProxy: systemProxy ?? this.systemProxy,
+      authUsername: authUsername ?? this.authUsername,
+      socksListeners:
+          socksListeners ??
+          (socksIpv4 != null || socksIpv6 != null || socksPort != null
+              ? null
+              : _socksListeners),
+      httpListeners:
+          httpListeners ??
+          (httpIpv4 != null || httpIpv6 != null || httpPort != null
+              ? null
+              : _httpListeners),
+    );
+  }
+
+  factory ProxySettings.fromMap(Map<String, Object?> map) {
+    return ProxySettings(
+      socksIpv4: _string(map, 'socks_ipv4'),
+      socksIpv6: _string(map, 'socks_ipv6'),
+      socksPort: _boundedInt(map, 'socks_port', 1, 65535),
+      httpIpv4: _string(map, 'http_ipv4'),
+      httpIpv6: _string(map, 'http_ipv6'),
+      httpPort: _boundedInt(map, 'http_port', 1, 65535),
+      dnsMode: _enumByName(ProxyDnsMode.values, _string(map, 'dns_mode')),
+      dnsIpv4: _stringOr(map, 'dns_v4', '1.1.1.1'),
+      dnsIpv6: _stringOr(map, 'dns_v6', '2606:4700:4700::1111'),
+      systemProxy: _bool(map, 'system_proxy'),
+      authUsername: _stringOr(map, 'auth_username', ''),
+      socksListeners: map.containsKey('socks5_listeners')
+          ? List<String>.unmodifiable(_stringList(map, 'socks5_listeners'))
+          : null,
+      httpListeners: map.containsKey('http_listeners')
+          ? List<String>.unmodifiable(_stringList(map, 'http_listeners'))
+          : null,
+    );
+  }
+
+  Map<String, Object?> toMap() {
+    return <String, Object?>{
+      'socks_ipv4': socksIpv4,
+      'socks_ipv6': socksIpv6,
+      'socks_port': socksPort,
+      'http_ipv4': httpIpv4,
+      'http_ipv6': httpIpv6,
+      'http_port': httpPort,
+      'dns_mode': dnsMode.name,
+      'dns_v4': dnsIpv4,
+      'dns_v6': dnsIpv6,
+      'system_proxy': systemProxy,
+      'socks5_listeners': socksListeners,
+      'http_listeners': httpListeners,
+      if (authUsername.isNotEmpty) 'auth_username': authUsername,
+    };
+  }
+}
+
+class UsqueProfile {
+  const UsqueProfile({
+    required this.id,
+    required this.name,
+    this.mode = OperatingMode.vpn,
+    this.transport = TransportPolicy.automatic,
+    this.dataPlane = DataPlaneMode.connectIp,
+    this.congestionControl = CongestionControlAlgorithm.cubic,
+    this.ipPolicy = IpPolicy.automatic,
+    this.endpointSelection = EndpointSelection.automatic,
+    this.endpointIpv4 = defaultEndpointIpv4,
+    this.endpointIpv6 = defaultEndpointIpv6,
+    this.endpointPort = defaultEndpointPort,
+    this.sni = defaultSni,
+    this.mtu = defaultMtu,
+    this.dnsIpv4 = defaultDnsIpv4,
+    this.dnsIpv6 = defaultDnsIpv6,
+    this.dnsMode = DnsMode.tunnel,
+    this.killSwitch = true,
+    this.allowLan = true,
+    this.disableQuic = false,
+    this.autoConnect = false,
+    this.bypassCidrs = const <String>[],
+    this.geoDirectCountries = const <String>[],
+    this.bypassDomains = const <String>[],
+    this.proxy = const ProxySettings(),
+    this.frontends = const FrontendSettings.windowsDefault(),
+    this.directDns = const DirectDnsSettings(),
+    this.vpnGate = const VpnGateSettings(),
+    this.chainExit,
+  });
+
+  static const defaultEndpointIpv4 = '162.159.198.2';
+  static const defaultEndpointIpv6 = '2606:4700:103::2';
+  static const defaultEndpointPort = 443;
+  static const defaultSni = 'speed.cloudflare.com';
+  static const defaultMtu = 1280;
+  static const defaultDnsIpv4 = '1.1.1.1';
+  static const defaultDnsIpv6 = '2606:4700:4700::1111';
+  static const defaultProfileId = '8c30b771-9ebd-457a-b67b-bbc74a1ddba6';
+
+  final String id;
+  final String name;
+  final OperatingMode mode;
+  final TransportPolicy transport;
+  final DataPlaneMode dataPlane;
+  final CongestionControlAlgorithm congestionControl;
+  final IpPolicy ipPolicy;
+  final EndpointSelection endpointSelection;
+  final String endpointIpv4;
+  final String endpointIpv6;
+  final int endpointPort;
+  final String sni;
+  final int mtu;
+  final String dnsIpv4;
+  final String dnsIpv6;
+  final DnsMode dnsMode;
+  final bool killSwitch;
+  final bool allowLan;
+  final bool disableQuic;
+  final bool autoConnect;
+  final List<String> bypassCidrs;
+  final List<String> geoDirectCountries;
+  final List<String> bypassDomains;
+  final ProxySettings proxy;
+  final FrontendSettings frontends;
+  final DirectDnsSettings directDns;
+  final VpnGateSettings vpnGate;
+  final ChainExitSettings? chainExit;
+  bool get chainEnabled => chainExit?.enabled ?? vpnGate.enabled;
+  ChainSource get chainSource =>
+      chainExit?.source ??
+      (vpnGate.enabled || vpnGate.hasSelection
+          ? ChainSource.vpnGate
+          : ChainSource.openvpnCustom);
+
+  factory UsqueProfile.defaultProfile() {
+    final android = defaultTargetPlatform == TargetPlatform.android;
+    return UsqueProfile(
+      id: defaultProfileId,
+      name: 'Default',
+      frontends: android
+          ? const FrontendSettings.androidDefault()
+          : const FrontendSettings.windowsDefault(),
+      proxy: const ProxySettings(),
+      directDns: const DirectDnsSettings(),
+    );
+  }
+
+  static OperatingMode modeFromFrontends(FrontendSettings frontends) {
+    if (frontends.tunnel) {
+      return OperatingMode.vpn;
+    }
+    if (frontends.http && !frontends.socks5) {
+      return OperatingMode.httpProxy;
+    }
+    return OperatingMode.socks5;
+  }
+
+  UsqueProfile resetAdvancedDefaults() {
+    return copyWith(
+      congestionControl: CongestionControlAlgorithm.cubic,
+      transport: TransportPolicy.automatic,
+      dataPlane: DataPlaneMode.connectIp,
+      ipPolicy: IpPolicy.automatic,
+      endpointSelection: EndpointSelection.automatic,
+      endpointIpv4: defaultEndpointIpv4,
+      endpointIpv6: defaultEndpointIpv6,
+      endpointPort: defaultEndpointPort,
+      sni: defaultSni,
+      mtu: defaultMtu,
+      dnsIpv4: defaultDnsIpv4,
+      dnsIpv6: defaultDnsIpv6,
+      dnsMode: DnsMode.tunnel,
+      allowLan: false,
+      disableQuic: false,
+      proxy: const ProxySettings(),
+      directDns: const DirectDnsSettings(),
+    );
+  }
+
+  UsqueProfile copyWith({
+    String? id,
+    String? name,
+    OperatingMode? mode,
+    TransportPolicy? transport,
+    DataPlaneMode? dataPlane,
+    CongestionControlAlgorithm? congestionControl,
+    IpPolicy? ipPolicy,
+    EndpointSelection? endpointSelection,
+    String? endpointIpv4,
+    String? endpointIpv6,
+    int? endpointPort,
+    String? sni,
+    int? mtu,
+    String? dnsIpv4,
+    String? dnsIpv6,
+    DnsMode? dnsMode,
+    bool? killSwitch,
+    bool? allowLan,
+    bool? disableQuic,
+    bool? autoConnect,
+    List<String>? bypassCidrs,
+    List<String>? geoDirectCountries,
+    List<String>? bypassDomains,
+    ProxySettings? proxy,
+    FrontendSettings? frontends,
+    DirectDnsSettings? directDns,
+    VpnGateSettings? vpnGate,
+    ChainExitSettings? chainExit,
+    bool clearChainExit = false,
+  }) {
+    final nextFrontends = frontends ?? this.frontends;
+    final nextMode = frontends != null
+        ? modeFromFrontends(nextFrontends)
+        : (mode ?? this.mode);
+    return UsqueProfile(
+      id: id ?? this.id,
+      name: name ?? this.name,
+      mode: nextMode,
+      transport: transport ?? this.transport,
+      dataPlane: dataPlane ?? this.dataPlane,
+      congestionControl: congestionControl ?? this.congestionControl,
+      ipPolicy: ipPolicy ?? this.ipPolicy,
+      endpointSelection: endpointSelection ?? this.endpointSelection,
+      endpointIpv4: endpointIpv4 ?? this.endpointIpv4,
+      endpointIpv6: endpointIpv6 ?? this.endpointIpv6,
+      endpointPort: endpointPort ?? this.endpointPort,
+      sni: sni ?? this.sni,
+      mtu: mtu ?? this.mtu,
+      dnsIpv4: dnsIpv4 ?? this.dnsIpv4,
+      dnsIpv6: dnsIpv6 ?? this.dnsIpv6,
+      dnsMode: dnsMode ?? this.dnsMode,
+      killSwitch: killSwitch ?? this.killSwitch,
+      allowLan: allowLan ?? this.allowLan,
+      disableQuic: disableQuic ?? this.disableQuic,
+      autoConnect: autoConnect ?? this.autoConnect,
+      bypassCidrs: bypassCidrs ?? this.bypassCidrs,
+      geoDirectCountries: geoDirectCountries ?? this.geoDirectCountries,
+      bypassDomains: bypassDomains ?? this.bypassDomains,
+      proxy: proxy ?? this.proxy,
+      frontends: nextFrontends,
+      directDns: directDns ?? this.directDns,
+      vpnGate: vpnGate ?? this.vpnGate,
+      chainExit: clearChainExit ? null : chainExit ?? this.chainExit,
+    );
+  }
+
+  Map<String, Object?> toMap() {
+    return <String, Object?>{
+      'id': id,
+      'name': name,
+      'mode': modeFromFrontends(frontends).name,
+      'transport': transport.name,
+      'data_plane': dataPlane.wireName,
+      'vpn_gate': vpnGate.toMap(),
+      if (chainExit != null) 'chain_exit': chainExit!.toMap(),
+      'congestion_control': congestionControl.name,
+      'ip_policy': ipPolicy.name,
+      'endpoint_selection': endpointSelection.name,
+      'endpoint_v4': endpointIpv4,
+      'endpoint_v6': endpointIpv6,
+      'endpoint_port': endpointPort,
+      'sni': sni,
+      'mtu': mtu,
+      'dns_v4': dnsIpv4,
+      'dns_v6': dnsIpv6,
+      'dns_mode': dnsMode.name,
+      'kill_switch': killSwitch,
+      'allow_lan': allowLan,
+      'disable_quic': disableQuic,
+      'auto_connect': autoConnect,
+      'bypass_cidrs': bypassCidrs,
+      'geo_direct_countries': geoDirectCountries,
+      'bypass_domains': bypassDomains,
+      'proxy': proxy.toMap(),
+      'frontends': frontends.toMap(),
+      'direct_dns': directDns.toMap(),
+    };
+  }
+
+  factory UsqueProfile.fromMap(Map<String, Object?> map) {
+    final id = _string(map, 'id').trim();
+    final name = _string(map, 'name').trim();
+    if (!RegExp(
+      r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+      r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+    ).hasMatch(id)) {
+      throw const FormatException('Invalid profile ID');
+    }
+    if (name.isEmpty || name.runes.length > 64) {
+      throw const FormatException('Invalid profile name');
+    }
+    final bypass = _stringList(map, 'bypass_cidrs');
+    if (bypass.length > 256) {
+      throw const FormatException('Too many bypass routes');
+    }
+    final domains = map.containsKey('bypass_domains')
+        ? _stringList(map, 'bypass_domains')
+        : const <String>[];
+    if (domains.length > 256) {
+      throw const FormatException('Too many bypass domains');
+    }
+    final geoDirect = map.containsKey('geo_direct_countries')
+        ? _stringList(map, 'geo_direct_countries')
+        : const <String>[];
+    if (geoDirect.length > 32) {
+      throw const FormatException('Too many direct countries');
+    }
+    final proxy = map['proxy'];
+    if (proxy is! Map) {
+      throw const FormatException('Missing proxy settings');
+    }
+
+    final frontends = map['frontends'];
+    final directDns = map['direct_dns'];
+    final legacyMode = _enumByName(OperatingMode.values, _string(map, 'mode'));
+    final migratedFrontends = frontends is Map
+        ? FrontendSettings.fromMap(Map<String, Object?>.from(frontends))
+        : FrontendSettings(
+            tunnel: legacyMode == OperatingMode.vpn,
+            socks5: legacyMode == OperatingMode.socks5,
+            http: legacyMode == OperatingMode.httpProxy,
+          );
+
+    return UsqueProfile(
+      id: id,
+      name: name,
+      mode: modeFromFrontends(migratedFrontends),
+      chainExit: map['chain_exit'] is Map
+          ? ChainExitSettings.fromMap(map['chain_exit'] as Map)
+          : null,
+      vpnGate: map['vpn_gate'] is Map
+          ? VpnGateSettings.fromMap(map['vpn_gate'] as Map)
+          : const VpnGateSettings(),
+      transport: _enumByName(TransportPolicy.values, _string(map, 'transport')),
+      dataPlane: map.containsKey('data_plane')
+          ? DataPlaneMode.fromWire(map['data_plane']) ??
+                (throw const FormatException('Invalid data_plane'))
+          : DataPlaneMode.connectIp,
+      congestionControl: map.containsKey('congestion_control')
+          ? _enumByName(
+              CongestionControlAlgorithm.values,
+              _string(map, 'congestion_control'),
+            )
+          : CongestionControlAlgorithm.cubic,
+      ipPolicy: _enumByName(IpPolicy.values, _string(map, 'ip_policy')),
+      endpointSelection: map.containsKey('endpoint_selection')
+          ? _enumByName(
+              EndpointSelection.values,
+              _string(map, 'endpoint_selection'),
+            )
+          : EndpointSelection.custom,
+      endpointIpv4: _string(map, 'endpoint_v4'),
+      endpointIpv6: _string(map, 'endpoint_v6'),
+      endpointPort: _boundedInt(map, 'endpoint_port', 1, 65535),
+      sni: _string(map, 'sni'),
+      mtu: _boundedInt(map, 'mtu', 1280, 9000),
+      dnsIpv4: _string(map, 'dns_v4'),
+      dnsIpv6: _string(map, 'dns_v6'),
+      dnsMode: _enumByName(DnsMode.values, _string(map, 'dns_mode')),
+      killSwitch: _bool(map, 'kill_switch'),
+      allowLan: _bool(map, 'allow_lan'),
+      disableQuic: map.containsKey('disable_quic')
+          ? _bool(map, 'disable_quic')
+          : false,
+      autoConnect: _bool(map, 'auto_connect'),
+      bypassCidrs: List<String>.unmodifiable(bypass),
+      geoDirectCountries: List<String>.unmodifiable(geoDirect),
+      bypassDomains: List<String>.unmodifiable(domains),
+      proxy: ProxySettings.fromMap(Map<String, Object?>.from(proxy)),
+      frontends: migratedFrontends,
+      directDns: directDns is Map
+          ? DirectDnsSettings.fromMap(Map<String, Object?>.from(directDns))
+          : const DirectDnsSettings(),
+    );
+  }
+}
+
+String _string(Map<String, Object?> map, String key) {
+  final value = map[key];
+  if (value is! String || value.length > 4096) {
+    throw FormatException('Invalid $key');
+  }
+  return value;
+}
+
+String _stringOr(Map<String, Object?> map, String key, String fallback) {
+  if (!map.containsKey(key)) {
+    return fallback;
+  }
+  return _string(map, key);
+}
+
+bool _bool(Map<String, Object?> map, String key) {
+  final value = map[key];
+  if (value is! bool) {
+    throw FormatException('Invalid $key');
+  }
+  return value;
+}
+
+int _boundedInt(
+  Map<String, Object?> map,
+  String key,
+  int minimum,
+  int maximum,
+) {
+  final value = map[key];
+  if (value is! int || value < minimum || value > maximum) {
+    throw FormatException('Invalid $key');
+  }
+  return value;
+}
+
+List<String> _stringList(Map<String, Object?> map, String key) {
+  final value = map[key];
+  if (value is! List) {
+    throw FormatException('Invalid $key');
+  }
+  return value
+      .map((item) {
+        if (item is! String || item.length > 128) {
+          throw FormatException('Invalid $key entry');
+        }
+        return item;
+      })
+      .toList(growable: false);
+}
+
+T _enumByName<T extends Enum>(List<T> values, String name) {
+  for (final value in values) {
+    if (value.name == name) {
+      return value;
+    }
+  }
+  throw FormatException('Unknown enum value: $name');
+}
+
+Map<Object?, Object?> _objectMap(Object? value) => value is Map
+    ? Map<Object?, Object?>.from(value)
+    : const <Object?, Object?>{};
+
+int _mapInt(Map<Object?, Object?> map, String key) =>
+    _mapNullableInt(map, key) ?? 0;
+
+int? _mapNullableInt(Map<Object?, Object?> map, String key) {
+  final value = map[key];
+  return value is num && value.isFinite && value >= 0 && value % 1 == 0
+      ? value.toInt()
+      : null;
+}
+
+String _mapString(Map<Object?, Object?> map, String key) =>
+    map[key] is String ? map[key]! as String : '';
+
+T _enumNameOr<T extends Enum>(List<T> values, Object? raw, T fallback) {
+  final name = raw is String ? raw : null;
+  if (name == null) return fallback;
+  return values.firstWhere(
+    (value) => value.name == name,
+    orElse: () => fallback,
+  );
+}
+
+class ExitInfo {
+  const ExitInfo({
+    this.city,
+    this.country,
+    this.countryCode,
+    this.flagSvg,
+    this.ipv4,
+    this.ipv6,
+  });
+
+  final String? city;
+  final String? country;
+  final String? countryCode;
+
+  /// Legacy wire field; flags are now bundled and selected by countryCode.
+  final String? flagSvg;
+  final String? ipv4;
+  final String? ipv6;
+
+  bool get hasLocation => city != null || country != null;
+
+  String get location {
+    return <String?>[
+      city,
+      country,
+    ].whereType<String>().where((value) => value.isNotEmpty).join(', ');
+  }
+
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        other is ExitInfo &&
+            city == other.city &&
+            country == other.country &&
+            countryCode == other.countryCode &&
+            flagSvg == other.flagSvg &&
+            ipv4 == other.ipv4 &&
+            ipv6 == other.ipv6;
+  }
+
+  @override
+  int get hashCode =>
+      Object.hash(city, country, countryCode, flagSvg, ipv4, ipv6);
+}
+
+class FrontendRuntimeStatus {
+  const FrontendRuntimeStatus({
+    required this.kind,
+    required this.phase,
+    this.listeners = const <String>[],
+    this.errorCode,
+  });
+
+  final FrontendKind kind;
+  final FrontendPhase phase;
+  final List<String> listeners;
+  final String? errorCode;
+
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        other is FrontendRuntimeStatus &&
+            kind == other.kind &&
+            phase == other.phase &&
+            listEquals(listeners, other.listeners) &&
+            errorCode == other.errorCode;
+  }
+
+  @override
+  int get hashCode =>
+      Object.hash(kind, phase, Object.hashAll(listeners), errorCode);
+}
+
+enum MetricAvailability { unknown, available, unsupported, notReady, stale }
+
+enum NetworkQualityLevel {
+  unknown,
+  good,
+  fair,
+  poor,
+  limitedData,
+  disconnected,
+}
+
+enum NetworkQueueKind {
+  unknown,
+  tunToTransport,
+  proxyToTransport,
+  transportOutgoing,
+  h3DatagramSend,
+  h3WireSend,
+  transportToTun,
+  transportToProxy,
+  directDns,
+  finalDns,
+}
+
+class NetworkConnectionMetrics {
+  const NetworkConnectionMetrics({
+    this.latestRttMilliseconds,
+    this.latestRttAvailability = MetricAvailability.unknown,
+    this.smoothedRttMilliseconds,
+    this.minimumRttMilliseconds,
+    this.rttVarianceMilliseconds,
+    this.intervalLossBasisPoints,
+    this.congestionWindowBytes,
+    this.bytesInFlight,
+    this.sendRateBitsPerSecond,
+    this.packetsLost = 0,
+    this.bytesLost = 0,
+    this.tunSinkDropCount = 0,
+    this.quicDatagramDropCount = 0,
+    this.queueOldestAgeMilliseconds,
+    this.currentPmtuBytes,
+    this.migrationAttemptCount = 0,
+    this.migrationSuccessCount = 0,
+    this.migrationFailureCount = 0,
+    this.lastMigrationDurationMilliseconds,
+    this.udpSendSyscallCount = 0,
+    this.udpRecvSyscallCount = 0,
+    this.udpDatagramSentCount = 0,
+    this.udpDatagramReceivedCount = 0,
+    this.packetBufferPoolHitCount = 0,
+    this.packetBufferPoolMissCount = 0,
+    this.h2FlowControlStallCount = 0,
+    this.h2FlowControlStallTotalMilliseconds = 0,
+    this.h2FlowControlStallMaxMilliseconds = 0,
+    this.h2StreamReceiveWindowBytes = 0,
+    this.h2ConnectionReceiveWindowBytes = 0,
+    this.directDnsSuccessCount = 0,
+    this.directDnsFailureCount = 0,
+    this.directDnsTimeoutCount = 0,
+    this.directDnsLastRttMilliseconds,
+    this.pmtuChangeCount = 0,
+    this.pmtuRevalidationFailureCount = 0,
+    this.pmtuSendTooLargeCount = 0,
+    this.smoothedRttAvailability = MetricAvailability.unknown,
+    this.minimumRttAvailability = MetricAvailability.unknown,
+    this.rttVarianceAvailability = MetricAvailability.unknown,
+    this.intervalLossAvailability = MetricAvailability.unknown,
+    this.congestionWindowAvailability = MetricAvailability.unknown,
+    this.bytesInFlightAvailability = MetricAvailability.unknown,
+    this.sendRateAvailability = MetricAvailability.unknown,
+  });
+
+  final int? latestRttMilliseconds;
+  final MetricAvailability latestRttAvailability;
+  final int? smoothedRttMilliseconds;
+  final int? minimumRttMilliseconds;
+  final int? rttVarianceMilliseconds;
+  final int? intervalLossBasisPoints;
+  final int? congestionWindowBytes;
+  final int? bytesInFlight;
+  final int? sendRateBitsPerSecond;
+  final int packetsLost;
+  final int bytesLost;
+  final int tunSinkDropCount;
+  final int quicDatagramDropCount;
+  final int? queueOldestAgeMilliseconds;
+  final int? currentPmtuBytes;
+  final int migrationAttemptCount;
+  final int migrationSuccessCount;
+  final int migrationFailureCount;
+  final int? lastMigrationDurationMilliseconds;
+  final int udpSendSyscallCount;
+  final int udpRecvSyscallCount;
+  final int udpDatagramSentCount;
+  final int udpDatagramReceivedCount;
+  final int packetBufferPoolHitCount;
+  final int packetBufferPoolMissCount;
+  final int h2FlowControlStallCount;
+  final int h2FlowControlStallTotalMilliseconds;
+  final int h2FlowControlStallMaxMilliseconds;
+  final int h2StreamReceiveWindowBytes;
+  final int h2ConnectionReceiveWindowBytes;
+  final int directDnsSuccessCount;
+  final int directDnsFailureCount;
+  final int directDnsTimeoutCount;
+  final int? directDnsLastRttMilliseconds;
+  final int pmtuChangeCount;
+  final int pmtuRevalidationFailureCount;
+  final int pmtuSendTooLargeCount;
+  final MetricAvailability smoothedRttAvailability;
+  final MetricAvailability minimumRttAvailability;
+  final MetricAvailability rttVarianceAvailability;
+  final MetricAvailability intervalLossAvailability;
+  final MetricAvailability congestionWindowAvailability;
+  final MetricAvailability bytesInFlightAvailability;
+  final MetricAvailability sendRateAvailability;
+
+  List<Object?> get _values => <Object?>[
+    latestRttMilliseconds,
+    latestRttAvailability,
+    smoothedRttMilliseconds,
+    minimumRttMilliseconds,
+    rttVarianceMilliseconds,
+    intervalLossBasisPoints,
+    congestionWindowBytes,
+    bytesInFlight,
+    sendRateBitsPerSecond,
+    packetsLost,
+    bytesLost,
+    tunSinkDropCount,
+    quicDatagramDropCount,
+    queueOldestAgeMilliseconds,
+    currentPmtuBytes,
+    migrationAttemptCount,
+    migrationSuccessCount,
+    migrationFailureCount,
+    lastMigrationDurationMilliseconds,
+    udpSendSyscallCount,
+    udpRecvSyscallCount,
+    udpDatagramSentCount,
+    udpDatagramReceivedCount,
+    packetBufferPoolHitCount,
+    packetBufferPoolMissCount,
+    h2FlowControlStallCount,
+    h2FlowControlStallTotalMilliseconds,
+    h2FlowControlStallMaxMilliseconds,
+    h2StreamReceiveWindowBytes,
+    h2ConnectionReceiveWindowBytes,
+    directDnsSuccessCount,
+    directDnsFailureCount,
+    directDnsTimeoutCount,
+    directDnsLastRttMilliseconds,
+    pmtuChangeCount,
+    pmtuRevalidationFailureCount,
+    pmtuSendTooLargeCount,
+    smoothedRttAvailability,
+    minimumRttAvailability,
+    rttVarianceAvailability,
+    intervalLossAvailability,
+    congestionWindowAvailability,
+    bytesInFlightAvailability,
+    sendRateAvailability,
+  ];
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is NetworkConnectionMetrics && listEquals(_values, other._values);
+
+  @override
+  int get hashCode => Object.hashAll(_values);
+}
+
+class NetworkQueueQuality {
+  const NetworkQueueQuality({
+    this.backpressure,
+    this.kind = NetworkQueueKind.unknown,
+    this.availability = MetricAvailability.unknown,
+    this.currentItems = 0,
+    this.capacityItems = 0,
+    this.currentBytes = 0,
+    this.capacityBytes = 0,
+    this.highWaterItems = 0,
+    this.highWaterBytes = 0,
+    this.dropItems = 0,
+    this.dropBytes = 0,
+    this.oldestAgeMilliseconds,
+    this.enqueueCount = 0,
+    this.dequeueCount = 0,
+    this.closed = false,
+    this.cancelled = false,
+  });
+
+  final PerformanceCounters? backpressure;
+  final NetworkQueueKind kind;
+  final MetricAvailability availability;
+  final int currentItems;
+  final int capacityItems;
+  final int currentBytes;
+  final int capacityBytes;
+  final int highWaterItems;
+  final int highWaterBytes;
+  final int dropItems;
+  final int dropBytes;
+  final int? oldestAgeMilliseconds;
+  final int enqueueCount;
+  final int dequeueCount;
+  final bool closed;
+  final bool cancelled;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is NetworkQueueQuality &&
+          backpressure == other.backpressure &&
+          kind == other.kind &&
+          availability == other.availability &&
+          currentItems == other.currentItems &&
+          capacityItems == other.capacityItems &&
+          currentBytes == other.currentBytes &&
+          capacityBytes == other.capacityBytes &&
+          highWaterItems == other.highWaterItems &&
+          highWaterBytes == other.highWaterBytes &&
+          dropItems == other.dropItems &&
+          dropBytes == other.dropBytes &&
+          oldestAgeMilliseconds == other.oldestAgeMilliseconds &&
+          enqueueCount == other.enqueueCount &&
+          dequeueCount == other.dequeueCount &&
+          closed == other.closed &&
+          cancelled == other.cancelled;
+
+  @override
+  int get hashCode => Object.hashAll(<Object?>[
+    backpressure,
+    kind,
+    availability,
+    currentItems,
+    capacityItems,
+    currentBytes,
+    capacityBytes,
+    highWaterItems,
+    highWaterBytes,
+    dropItems,
+    dropBytes,
+    oldestAgeMilliseconds,
+    enqueueCount,
+    dequeueCount,
+    closed,
+    cancelled,
+  ]);
+}
+
+class PmtuQualityInfo {
+  const PmtuQualityInfo({
+    this.availability = MetricAvailability.unknown,
+    this.outerPmtuBytes,
+    this.effectiveConnectIpPayloadBytes,
+    this.effectivePayloadAvailability = MetricAvailability.unknown,
+    this.phaseCode = '',
+    this.changeCount = 0,
+    this.revalidationFailureCount = 0,
+    this.sendTooLargeCount = 0,
+  });
+
+  final MetricAvailability availability;
+  final int? outerPmtuBytes;
+  final int? effectiveConnectIpPayloadBytes;
+  final MetricAvailability effectivePayloadAvailability;
+  final String phaseCode;
+  final int changeCount;
+  final int revalidationFailureCount;
+  final int sendTooLargeCount;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is PmtuQualityInfo &&
+          availability == other.availability &&
+          outerPmtuBytes == other.outerPmtuBytes &&
+          effectiveConnectIpPayloadBytes ==
+              other.effectiveConnectIpPayloadBytes &&
+          effectivePayloadAvailability == other.effectivePayloadAvailability &&
+          phaseCode == other.phaseCode &&
+          changeCount == other.changeCount &&
+          revalidationFailureCount == other.revalidationFailureCount &&
+          sendTooLargeCount == other.sendTooLargeCount;
+
+  @override
+  int get hashCode => Object.hash(
+    availability,
+    outerPmtuBytes,
+    effectiveConnectIpPayloadBytes,
+    effectivePayloadAvailability,
+    phaseCode,
+    changeCount,
+    revalidationFailureCount,
+    sendTooLargeCount,
+  );
+}
+
+class MigrationQualityInfo {
+  const MigrationQualityInfo({
+    this.phaseCode = '',
+    this.attemptCount = 0,
+    this.successCount = 0,
+    this.failureCount = 0,
+    this.lastDurationMilliseconds,
+    this.lastReasonCode = '',
+  });
+
+  final String phaseCode;
+  final int attemptCount;
+  final int successCount;
+  final int failureCount;
+  final int? lastDurationMilliseconds;
+  final String lastReasonCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is MigrationQualityInfo &&
+          phaseCode == other.phaseCode &&
+          attemptCount == other.attemptCount &&
+          successCount == other.successCount &&
+          failureCount == other.failureCount &&
+          lastDurationMilliseconds == other.lastDurationMilliseconds &&
+          lastReasonCode == other.lastReasonCode;
+
+  @override
+  int get hashCode => Object.hash(
+    phaseCode,
+    attemptCount,
+    successCount,
+    failureCount,
+    lastDurationMilliseconds,
+    lastReasonCode,
+  );
+}
+
+class DirectDnsQualityInfo {
+  const DirectDnsQualityInfo({
+    this.mode = DirectDnsMode.unknown,
+    this.phaseCode = '',
+    this.successCount = 0,
+    this.failureCount = 0,
+    this.timeoutCount = 0,
+    this.lastRttMilliseconds,
+    this.lastReasonCode = '',
+  });
+
+  final DirectDnsMode mode;
+  final String phaseCode;
+  final int successCount;
+  final int failureCount;
+  final int timeoutCount;
+  final int? lastRttMilliseconds;
+  final String lastReasonCode;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is DirectDnsQualityInfo &&
+          mode == other.mode &&
+          phaseCode == other.phaseCode &&
+          successCount == other.successCount &&
+          failureCount == other.failureCount &&
+          timeoutCount == other.timeoutCount &&
+          lastRttMilliseconds == other.lastRttMilliseconds &&
+          lastReasonCode == other.lastReasonCode;
+
+  @override
+  int get hashCode => Object.hash(
+    mode,
+    phaseCode,
+    successCount,
+    failureCount,
+    timeoutCount,
+    lastRttMilliseconds,
+    lastReasonCode,
+  );
+}
+
+/// One real source observation. Null counters/metrics are not zero readings.
+class NetworkQualitySample {
+  const NetworkQualitySample({
+    required this.sequence,
+    required this.sampledAt,
+    required this.monotonicMillis,
+    this.downloadedBytes,
+    this.uploadedBytes,
+    this.rttMilliseconds,
+    this.lossBasisPoints,
+  });
+
+  final int sequence;
+  final DateTime sampledAt;
+  final int monotonicMillis;
+  final int? downloadedBytes;
+  final int? uploadedBytes;
+  final int? rttMilliseconds;
+  final int? lossBasisPoints;
+
+  static NetworkQualitySample? fromMap(Map<Object?, Object?> map) {
+    final sequence = _mapNullableInt(map, 'sequence');
+    final at = _mapNullableInt(map, 'sampled_at_unix_ms');
+    final monotonic = _mapNullableInt(map, 'monotonic_millis');
+    if (sequence == null ||
+        sequence <= 0 ||
+        at == null ||
+        at <= 0 ||
+        at > 8640000000000000 ||
+        monotonic == null ||
+        monotonic > 8640000000000000) {
+      return null;
+    }
+    final loss = _mapNullableInt(map, 'loss_basis_points');
+    return NetworkQualitySample(
+      sequence: sequence,
+      sampledAt: DateTime.fromMillisecondsSinceEpoch(at, isUtc: true),
+      monotonicMillis: monotonic,
+      downloadedBytes: _mapNullableInt(map, 'downloaded_bytes'),
+      uploadedBytes: _mapNullableInt(map, 'uploaded_bytes'),
+      rttMilliseconds: _mapNullableInt(map, 'rtt_ms'),
+      lossBasisPoints: loss != null && loss <= 10000 ? loss : null,
+    );
+  }
+}
+
+class NetworkQualitySnapshot {
+  const NetworkQualitySnapshot({
+    this.transportPerformance,
+    this.udpSocketReceive,
+    this.sampledAt,
+    this.connectionInstanceId,
+    this.level = NetworkQualityLevel.unknown,
+    this.metrics = const NetworkConnectionMetrics(),
+    this.queues = const <NetworkQueueQuality>[],
+    this.pmtu = const PmtuQualityInfo(),
+    this.migration = const MigrationQualityInfo(),
+    this.directDns = const DirectDnsQualityInfo(),
+    this.samples = const <NetworkQualitySample>[],
+  });
+
+  final DateTime? sampledAt;
+  final String? connectionInstanceId;
+  final NetworkQualityLevel level;
+  final NetworkConnectionMetrics metrics;
+  final List<NetworkQueueQuality> queues;
+  final PmtuQualityInfo pmtu;
+  final MigrationQualityInfo migration;
+  final DirectDnsQualityInfo directDns;
+  final List<NetworkQualitySample> samples;
+  final UdpSocketReceiveSnapshot? udpSocketReceive;
+  final TransportPerformanceSnapshot? transportPerformance;
+
+  factory NetworkQualitySnapshot.fromMap(Map<Object?, Object?> map) {
+    final metricsMap = _objectMap(map['metrics']);
+    final pmtuMap = _objectMap(map['pmtu']);
+    final migrationMap = _objectMap(map['migration']);
+    final directDnsMap = _objectMap(map['direct_dns']);
+    final sampledAtMilliseconds = _mapInt(map, 'sampled_at_unix_ms');
+    final connectionId = _mapString(map, 'connection_instance_id');
+    return NetworkQualitySnapshot(
+      transportPerformance: TransportPerformanceSnapshot.from(
+        map['transport_performance'],
+      ),
+      udpSocketReceive: UdpSocketReceiveSnapshot.from(
+        map['udp_socket_receive'],
+      ),
+      samples: List.unmodifiable(
+        (map['samples'] is List<Object?>
+                ? map['samples'] as List<Object?>
+                : const <Object?>[])
+            .take(16)
+            .whereType<Map<Object?, Object?>>()
+            .map(
+              (value) => NetworkQualitySample.fromMap(
+                Map<Object?, Object?>.from(value),
+              ),
+            )
+            .whereType<NetworkQualitySample>(),
+      ),
+      sampledAt:
+          sampledAtMilliseconds <= 0 || sampledAtMilliseconds > 8640000000000000
+          ? null
+          : DateTime.fromMillisecondsSinceEpoch(
+              sampledAtMilliseconds,
+              isUtc: true,
+            ),
+      connectionInstanceId: connectionId.isEmpty || connectionId.length > 64
+          ? null
+          : connectionId,
+      level: _enumNameOr(
+        NetworkQualityLevel.values,
+        map['level'],
+        NetworkQualityLevel.unknown,
+      ),
+      metrics: NetworkConnectionMetrics(
+        latestRttMilliseconds: _mapNullableInt(
+          metricsMap,
+          'latest_rtt_milliseconds',
+        ),
+        latestRttAvailability: _enumNameOr(
+          MetricAvailability.values,
+          metricsMap['latest_rtt_availability'],
+          MetricAvailability.unknown,
+        ),
+        smoothedRttMilliseconds: _mapNullableInt(
+          metricsMap,
+          'smoothed_rtt_milliseconds',
+        ),
+        minimumRttMilliseconds: _mapNullableInt(
+          metricsMap,
+          'minimum_rtt_milliseconds',
+        ),
+        rttVarianceMilliseconds: _mapNullableInt(
+          metricsMap,
+          'rtt_variance_milliseconds',
+        ),
+        intervalLossBasisPoints: _mapNullableInt(
+          metricsMap,
+          'interval_loss_basis_points',
+        ),
+        congestionWindowBytes: _mapNullableInt(
+          metricsMap,
+          'congestion_window_bytes',
+        ),
+        bytesInFlight: _mapNullableInt(metricsMap, 'bytes_in_flight'),
+        sendRateBitsPerSecond: _mapNullableInt(
+          metricsMap,
+          'send_rate_bits_per_second',
+        ),
+        packetsLost: _mapInt(metricsMap, 'packets_lost'),
+        bytesLost: _mapInt(metricsMap, 'bytes_lost'),
+        tunSinkDropCount: _mapInt(metricsMap, 'tun_sink_drop_count'),
+        quicDatagramDropCount: _mapInt(metricsMap, 'quic_datagram_drop_count'),
+        queueOldestAgeMilliseconds: _mapNullableInt(
+          metricsMap,
+          'queue_oldest_age_milliseconds',
+        ),
+        currentPmtuBytes: _mapNullableInt(metricsMap, 'current_pmtu_bytes'),
+        migrationAttemptCount: _mapInt(metricsMap, 'migration_attempt_count'),
+        migrationSuccessCount: _mapInt(metricsMap, 'migration_success_count'),
+        migrationFailureCount: _mapInt(metricsMap, 'migration_failure_count'),
+        lastMigrationDurationMilliseconds: _mapNullableInt(
+          metricsMap,
+          'last_migration_duration_milliseconds',
+        ),
+        udpSendSyscallCount: _mapInt(metricsMap, 'udp_send_syscall_count'),
+        udpRecvSyscallCount: _mapInt(metricsMap, 'udp_recv_syscall_count'),
+        udpDatagramSentCount: _mapInt(metricsMap, 'udp_datagram_sent_count'),
+        udpDatagramReceivedCount: _mapInt(
+          metricsMap,
+          'udp_datagram_received_count',
+        ),
+        packetBufferPoolHitCount: _mapInt(
+          metricsMap,
+          'packet_buffer_pool_hit_count',
+        ),
+        packetBufferPoolMissCount: _mapInt(
+          metricsMap,
+          'packet_buffer_pool_miss_count',
+        ),
+        h2FlowControlStallCount: _mapInt(
+          metricsMap,
+          'h2_flow_control_stall_count',
+        ),
+        h2FlowControlStallTotalMilliseconds: _mapInt(
+          metricsMap,
+          'h2_flow_control_stall_total_milliseconds',
+        ),
+        h2FlowControlStallMaxMilliseconds: _mapInt(
+          metricsMap,
+          'h2_flow_control_stall_max_milliseconds',
+        ),
+        h2StreamReceiveWindowBytes: _mapInt(
+          metricsMap,
+          'h2_stream_receive_window_bytes',
+        ),
+        h2ConnectionReceiveWindowBytes: _mapInt(
+          metricsMap,
+          'h2_connection_receive_window_bytes',
+        ),
+        directDnsSuccessCount: _mapInt(metricsMap, 'direct_dns_success_count'),
+        directDnsFailureCount: _mapInt(metricsMap, 'direct_dns_failure_count'),
+        directDnsTimeoutCount: _mapInt(metricsMap, 'direct_dns_timeout_count'),
+        directDnsLastRttMilliseconds: _mapNullableInt(
+          metricsMap,
+          'direct_dns_last_rtt_milliseconds',
+        ),
+        pmtuChangeCount: _mapInt(metricsMap, 'pmtu_change_count'),
+        pmtuRevalidationFailureCount: _mapInt(
+          metricsMap,
+          'pmtu_revalidation_failure_count',
+        ),
+        pmtuSendTooLargeCount: _mapInt(metricsMap, 'pmtu_send_too_large_count'),
+        smoothedRttAvailability: _enumNameOr(
+          MetricAvailability.values,
+          metricsMap['smoothed_rtt_availability'],
+          MetricAvailability.unknown,
+        ),
+        minimumRttAvailability: _enumNameOr(
+          MetricAvailability.values,
+          metricsMap['minimum_rtt_availability'],
+          MetricAvailability.unknown,
+        ),
+        rttVarianceAvailability: _enumNameOr(
+          MetricAvailability.values,
+          metricsMap['rtt_variance_availability'],
+          MetricAvailability.unknown,
+        ),
+        intervalLossAvailability: _enumNameOr(
+          MetricAvailability.values,
+          metricsMap['interval_loss_availability'],
+          MetricAvailability.unknown,
+        ),
+        congestionWindowAvailability: _enumNameOr(
+          MetricAvailability.values,
+          metricsMap['congestion_window_availability'],
+          MetricAvailability.unknown,
+        ),
+        bytesInFlightAvailability: _enumNameOr(
+          MetricAvailability.values,
+          metricsMap['bytes_in_flight_availability'],
+          MetricAvailability.unknown,
+        ),
+        sendRateAvailability: _enumNameOr(
+          MetricAvailability.values,
+          metricsMap['send_rate_availability'],
+          MetricAvailability.unknown,
+        ),
+      ),
+      queues: List<NetworkQueueQuality>.unmodifiable(
+        (map['queues'] is List ? map['queues']! as List : const <Object?>[])
+            .take(8)
+            .whereType<Map<Object?, Object?>>()
+            .map((raw) {
+              final queue = Map<Object?, Object?>.from(raw);
+              return NetworkQueueQuality(
+                backpressure: PerformanceCounters.from(
+                  queue['backpressure'],
+                  queueBackpressureFields,
+                  bucketLimit: 32,
+                ),
+                kind: _enumNameOr(
+                  NetworkQueueKind.values,
+                  queue['kind'],
+                  NetworkQueueKind.unknown,
+                ),
+                availability: _enumNameOr(
+                  MetricAvailability.values,
+                  queue['availability'],
+                  MetricAvailability.unknown,
+                ),
+                currentItems: _mapInt(queue, 'current_items'),
+                capacityItems: _mapInt(queue, 'capacity_items'),
+                currentBytes: _mapInt(queue, 'current_bytes'),
+                capacityBytes: _mapInt(queue, 'capacity_bytes'),
+                highWaterItems: _mapInt(queue, 'high_water_items'),
+                highWaterBytes: _mapInt(queue, 'high_water_bytes'),
+                dropItems: _mapInt(queue, 'drop_items'),
+                dropBytes: _mapInt(queue, 'drop_bytes'),
+                oldestAgeMilliseconds: _mapNullableInt(
+                  queue,
+                  'oldest_age_milliseconds',
+                ),
+                enqueueCount: _mapInt(queue, 'enqueue_count'),
+                dequeueCount: _mapInt(queue, 'dequeue_count'),
+                closed: queue['closed'] == true,
+                cancelled: queue['cancelled'] == true,
+              );
+            }),
+      ),
+      pmtu: PmtuQualityInfo(
+        availability: _enumNameOr(
+          MetricAvailability.values,
+          pmtuMap['availability'],
+          MetricAvailability.unknown,
+        ),
+        outerPmtuBytes: _mapNullableInt(pmtuMap, 'outer_pmtu_bytes'),
+        effectiveConnectIpPayloadBytes: _mapNullableInt(
+          pmtuMap,
+          'effective_connect_ip_payload_bytes',
+        ),
+        effectivePayloadAvailability: _enumNameOr(
+          MetricAvailability.values,
+          pmtuMap['effective_payload_availability'],
+          MetricAvailability.unknown,
+        ),
+        phaseCode: _mapString(pmtuMap, 'phase_code'),
+        changeCount: _mapInt(pmtuMap, 'change_count'),
+        revalidationFailureCount: _mapInt(
+          pmtuMap,
+          'revalidation_failure_count',
+        ),
+        sendTooLargeCount: _mapInt(pmtuMap, 'send_too_large_count'),
+      ),
+      migration: MigrationQualityInfo(
+        phaseCode: _mapString(migrationMap, 'phase_code'),
+        attemptCount: _mapInt(migrationMap, 'attempt_count'),
+        successCount: _mapInt(migrationMap, 'success_count'),
+        failureCount: _mapInt(migrationMap, 'failure_count'),
+        lastDurationMilliseconds: _mapNullableInt(
+          migrationMap,
+          'last_duration_milliseconds',
+        ),
+        lastReasonCode: _mapString(migrationMap, 'last_reason_code'),
+      ),
+      directDns: DirectDnsQualityInfo(
+        mode: _enumNameOr(
+          DirectDnsMode.values,
+          directDnsMap['mode'],
+          DirectDnsMode.unknown,
+        ),
+        phaseCode: _mapString(directDnsMap, 'phase_code'),
+        successCount: _mapInt(directDnsMap, 'success_count'),
+        failureCount: _mapInt(directDnsMap, 'failure_count'),
+        timeoutCount: _mapInt(directDnsMap, 'timeout_count'),
+        lastRttMilliseconds: _mapNullableInt(
+          directDnsMap,
+          'last_rtt_milliseconds',
+        ),
+        lastReasonCode: _mapString(directDnsMap, 'last_reason_code'),
+      ),
+    );
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is NetworkQualitySnapshot &&
+          connectionInstanceId == other.connectionInstanceId &&
+          level == other.level &&
+          metrics == other.metrics &&
+          listEquals(queues, other.queues) &&
+          pmtu == other.pmtu &&
+          migration == other.migration &&
+          directDns == other.directDns;
+
+  @override
+  int get hashCode => Object.hash(
+    connectionInstanceId,
+    level,
+    metrics,
+    Object.hashAll(queues),
+    pmtu,
+    migration,
+    directDns,
+  );
+}
+
+class EngineCapabilities {
+  const EngineCapabilities({
+    this.vpnGateTcp = false,
+    this.chainProfileImport = false,
+    this.chainOpenvpnUdp = false,
+    this.chainWireguard = false,
+    this.chainWarpWireguard = false,
+    this.chainHttpProxy = false,
+    this.chainSocks5Proxy = false,
+    this.chainProxyEncryptedDns = false,
+    this.customBypass = false,
+    this.automaticEndpoints = false,
+    this.chainOpenvpnMultiEndpoint = false,
+    this.vpnGatePoolFavorites = false,
+    this.networkSettingsApplication = false,
+    this.applicationQuicBlocking = false,
+    this.accountMetadataMutations = false,
+    this.sharedProxyAuthApplication = false,
+    this.l4Tcp = false,
+    this.l4TunTcp = false,
+    this.l4DnsConversion = false,
+    this.h3CongestionControlAlgorithms = const <CongestionControlAlgorithm>[],
+    this.networkQuality = false,
+    this.encryptedDirectDns = false,
+    this.quicMigration = false,
+    this.automaticPmtu = false,
+  });
+
+  factory EngineCapabilities.fromMap(Map<Object?, Object?> map) =>
+      EngineCapabilities(
+        vpnGateTcp: map['vpn_gate_tcp'] == true,
+        chainProfileImport: map['chain_profile_import'] == true,
+        chainOpenvpnUdp: map['chain_openvpn_udp'] == true,
+        chainWireguard: map['chain_wireguard'] == true,
+        chainWarpWireguard: map['chain_warp_wireguard'] == true,
+        chainHttpProxy: map['chain_http_proxy'] == true,
+        chainSocks5Proxy: map['chain_socks5_proxy'] == true,
+        chainProxyEncryptedDns: map['chain_proxy_encrypted_dns'] == true,
+        customBypass: map['custom_bypass'] == true,
+        automaticEndpoints: map['automatic_endpoints'] == true,
+        chainOpenvpnMultiEndpoint: map['chain_openvpn_multi_endpoint'] == true,
+        vpnGatePoolFavorites: map['vpn_gate_pool_favorites'] == true,
+        networkSettingsApplication: map['network_settings_application'] == true,
+        applicationQuicBlocking: map['application_quic_blocking'] == true,
+        accountMetadataMutations: map['account_metadata_mutations'] == true,
+        sharedProxyAuthApplication:
+            map['shared_proxy_auth_application'] == true,
+        l4Tcp: map['l4_tcp'] == true,
+        l4TunTcp: map['l4_tun_tcp'] == true,
+        l4DnsConversion: map['l4_dns_conversion'] == true,
+        h3CongestionControlAlgorithms: CongestionControlAlgorithm.values
+            .where(
+              (algorithm) =>
+                  (map['h3_congestion_control_algorithms'] as List?)?.contains(
+                    algorithm.name,
+                  ) ??
+                  false,
+            )
+            .toList(growable: false),
+        networkQuality: map['network_quality'] == true,
+        encryptedDirectDns: map['encrypted_direct_dns'] == true,
+        quicMigration: map['quic_migration'] == true,
+        automaticPmtu: map['automatic_pmtu'] == true,
+      );
+
+  final bool customBypass;
+  final bool automaticEndpoints;
+  final bool networkQuality;
+  final bool vpnGateTcp;
+  final bool chainProfileImport,
+      chainOpenvpnUdp,
+      chainWireguard,
+      chainWarpWireguard,
+      chainHttpProxy,
+      chainSocks5Proxy,
+      chainProxyEncryptedDns,
+      chainOpenvpnMultiEndpoint;
+  final bool vpnGatePoolFavorites;
+  final bool networkSettingsApplication;
+  final bool applicationQuicBlocking;
+  final bool accountMetadataMutations;
+  final bool sharedProxyAuthApplication;
+  final bool l4Tcp;
+  final bool l4TunTcp;
+  final bool l4DnsConversion;
+  bool get l4Available => l4Tcp && l4TunTcp && l4DnsConversion;
+  final List<CongestionControlAlgorithm> h3CongestionControlAlgorithms;
+  final bool encryptedDirectDns;
+  final bool quicMigration;
+  final bool automaticPmtu;
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is EngineCapabilities &&
+          vpnGateTcp == other.vpnGateTcp &&
+          chainProfileImport == other.chainProfileImport &&
+          chainOpenvpnUdp == other.chainOpenvpnUdp &&
+          chainWireguard == other.chainWireguard &&
+          chainWarpWireguard == other.chainWarpWireguard &&
+          chainHttpProxy == other.chainHttpProxy &&
+          chainSocks5Proxy == other.chainSocks5Proxy &&
+          chainProxyEncryptedDns == other.chainProxyEncryptedDns &&
+          customBypass == other.customBypass &&
+          automaticEndpoints == other.automaticEndpoints &&
+          chainOpenvpnMultiEndpoint == other.chainOpenvpnMultiEndpoint &&
+          vpnGatePoolFavorites == other.vpnGatePoolFavorites &&
+          networkSettingsApplication == other.networkSettingsApplication &&
+          applicationQuicBlocking == other.applicationQuicBlocking &&
+          accountMetadataMutations == other.accountMetadataMutations &&
+          sharedProxyAuthApplication == other.sharedProxyAuthApplication &&
+          l4Tcp == other.l4Tcp &&
+          l4TunTcp == other.l4TunTcp &&
+          l4DnsConversion == other.l4DnsConversion &&
+          listEquals(
+            h3CongestionControlAlgorithms,
+            other.h3CongestionControlAlgorithms,
+          ) &&
+          networkQuality == other.networkQuality &&
+          encryptedDirectDns == other.encryptedDirectDns &&
+          quicMigration == other.quicMigration &&
+          automaticPmtu == other.automaticPmtu;
+
+  @override
+  int get hashCode => Object.hash(
+    networkSettingsApplication,
+    applicationQuicBlocking,
+    accountMetadataMutations,
+    sharedProxyAuthApplication,
+    vpnGateTcp,
+    chainProfileImport,
+    chainOpenvpnUdp,
+    chainWireguard,
+    Object.hash(
+      chainWarpWireguard,
+      chainHttpProxy,
+      chainSocks5Proxy,
+      chainProxyEncryptedDns,
+      customBypass,
+      automaticEndpoints,
+    ),
+    chainOpenvpnMultiEndpoint,
+    vpnGatePoolFavorites,
+    l4Tcp,
+    l4TunTcp,
+    l4DnsConversion,
+    Object.hashAll(h3CongestionControlAlgorithms),
+    networkQuality,
+    encryptedDirectDns,
+    quicMigration,
+    automaticPmtu,
+  );
+}
+
+class L4Snapshot {
+  const L4Snapshot({
+    this.connectVerified = false,
+    this.sessions = 0,
+    this.drainingSessions = 0,
+    this.activeFlows = 0,
+    this.pendingFlows = 0,
+    this.connectSuccesses = 0,
+    this.connectFailures = 0,
+    this.connectTimeouts = 0,
+    this.bufferBytes = 0,
+    this.budgetRejections = 0,
+    this.sendBackpressure = 0,
+    this.receiveBackpressure = 0,
+    this.udpRejected = 0,
+    this.dnsSuccesses = 0,
+    this.dnsFailures = 0,
+    this.dnsTimeouts = 0,
+    this.migrationPreservedFlows = 0,
+    this.reconnectTerminatedFlows = 0,
+    this.tunFlows = 0,
+    this.halfOpenFlows = 0,
+    this.connectLatencyUs = 0,
+    this.unsupportedPackets = 0,
+    this.performance,
+  });
+  final bool connectVerified;
+  final int sessions;
+  final int drainingSessions;
+  final int activeFlows;
+  final int pendingFlows;
+  final int connectSuccesses;
+  final int connectFailures;
+  final int connectTimeouts;
+  final int bufferBytes;
+  final int budgetRejections;
+  final int sendBackpressure;
+  final int receiveBackpressure;
+  final int udpRejected;
+  final int dnsSuccesses;
+  final int dnsFailures;
+  final int dnsTimeouts;
+  final int migrationPreservedFlows;
+  final int reconnectTerminatedFlows;
+  final int tunFlows;
+  final int halfOpenFlows;
+  final int connectLatencyUs;
+  final int unsupportedPackets;
+  final L4PerformanceSnapshot? performance;
+  factory L4Snapshot.fromMap(Map<Object?, Object?> map) => L4Snapshot(
+    connectVerified: map['connect_verified'] == true,
+    sessions: (map['sessions'] as num?)?.toInt() ?? 0,
+    drainingSessions: (map['draining_sessions'] as num?)?.toInt() ?? 0,
+    activeFlows: (map['active_flows'] as num?)?.toInt() ?? 0,
+    pendingFlows: (map['pending_flows'] as num?)?.toInt() ?? 0,
+    connectSuccesses: (map['connect_successes'] as num?)?.toInt() ?? 0,
+    connectFailures: (map['connect_failures'] as num?)?.toInt() ?? 0,
+    connectTimeouts: (map['connect_timeouts'] as num?)?.toInt() ?? 0,
+    bufferBytes: (map['buffer_bytes'] as num?)?.toInt() ?? 0,
+    budgetRejections: (map['budget_rejections'] as num?)?.toInt() ?? 0,
+    sendBackpressure: (map['send_backpressure'] as num?)?.toInt() ?? 0,
+    receiveBackpressure: (map['receive_backpressure'] as num?)?.toInt() ?? 0,
+    udpRejected: (map['udp_rejected'] as num?)?.toInt() ?? 0,
+    dnsSuccesses: (map['dns_successes'] as num?)?.toInt() ?? 0,
+    dnsFailures: (map['dns_failures'] as num?)?.toInt() ?? 0,
+    dnsTimeouts: (map['dns_timeouts'] as num?)?.toInt() ?? 0,
+    migrationPreservedFlows:
+        (map['migration_preserved_flows'] as num?)?.toInt() ?? 0,
+    reconnectTerminatedFlows:
+        (map['reconnect_terminated_flows'] as num?)?.toInt() ?? 0,
+    tunFlows: (map['tun_flows'] as num?)?.toInt() ?? 0,
+    halfOpenFlows: (map['half_open_flows'] as num?)?.toInt() ?? 0,
+    connectLatencyUs: (map['connect_latency_us'] as num?)?.toInt() ?? 0,
+    unsupportedPackets: (map['unsupported_packets'] as num?)?.toInt() ?? 0,
+    performance: map['performance'] is Map
+        ? L4PerformanceSnapshot.fromMap(map['performance'] as Map)
+        : null,
+  );
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is L4Snapshot &&
+          connectVerified == other.connectVerified &&
+          sessions == other.sessions &&
+          drainingSessions == other.drainingSessions &&
+          activeFlows == other.activeFlows &&
+          pendingFlows == other.pendingFlows &&
+          connectSuccesses == other.connectSuccesses &&
+          connectFailures == other.connectFailures &&
+          connectTimeouts == other.connectTimeouts &&
+          bufferBytes == other.bufferBytes &&
+          budgetRejections == other.budgetRejections &&
+          sendBackpressure == other.sendBackpressure &&
+          receiveBackpressure == other.receiveBackpressure &&
+          udpRejected == other.udpRejected &&
+          dnsSuccesses == other.dnsSuccesses &&
+          dnsFailures == other.dnsFailures &&
+          dnsTimeouts == other.dnsTimeouts &&
+          migrationPreservedFlows == other.migrationPreservedFlows &&
+          reconnectTerminatedFlows == other.reconnectTerminatedFlows &&
+          tunFlows == other.tunFlows &&
+          halfOpenFlows == other.halfOpenFlows &&
+          connectLatencyUs == other.connectLatencyUs &&
+          unsupportedPackets == other.unsupportedPackets &&
+          performance == other.performance;
+  @override
+  int get hashCode => Object.hashAll([
+    connectVerified,
+    sessions,
+    drainingSessions,
+    activeFlows,
+    pendingFlows,
+    connectSuccesses,
+    connectFailures,
+    connectTimeouts,
+    bufferBytes,
+    budgetRejections,
+    sendBackpressure,
+    receiveBackpressure,
+    udpRejected,
+    dnsSuccesses,
+    dnsFailures,
+    dnsTimeouts,
+    migrationPreservedFlows,
+    reconnectTerminatedFlows,
+    tunFlows,
+    halfOpenFlows,
+    connectLatencyUs,
+    unsupportedPackets,
+    performance,
+  ]);
+}
+
+class EngineSnapshot {
+  const EngineSnapshot({
+    this.vpnGate = const VpnGateStatus(),
+    this.chainExit = const ChainExitStatus(),
+    this.sessionCongestionControl,
+    this.dataPlane,
+    this.l4,
+    this.phase = ConnectionPhase.disconnected,
+    this.transport,
+    this.addressFamily,
+    this.connectedAt,
+    this.downloadBytesPerSecond = 0,
+    this.uploadBytesPerSecond = 0,
+    this.downloadedBytes = 0,
+    this.uploadedBytes = 0,
+    this.reconnectCount = 0,
+    this.activeListeners = const <String>[],
+    this.killSwitchState,
+    this.platformLockdown = false,
+    this.alwaysOn = false,
+    this.exit = const ExitInfo(),
+    this.warning,
+    this.errorCode,
+    this.errorRetryable,
+    this.failure,
+    this.frontends = const <FrontendRuntimeStatus>[],
+    this.networkQuality,
+  });
+
+  final ConnectionPhase phase;
+  final VpnGateStatus vpnGate;
+  final ChainExitStatus chainExit;
+  final CongestionControlAlgorithm? sessionCongestionControl;
+  final DataPlaneMode? dataPlane;
+  final L4Snapshot? l4;
+  final String? transport;
+  final String? addressFamily;
+  final DateTime? connectedAt;
+  final int downloadBytesPerSecond;
+  final int uploadBytesPerSecond;
+  final int downloadedBytes;
+  final int uploadedBytes;
+  final int reconnectCount;
+  final List<String> activeListeners;
+  final String? killSwitchState;
+  final bool platformLockdown;
+  final bool alwaysOn;
+  final ExitInfo exit;
+  final String? warning;
+  final String? errorCode;
+  final bool? errorRetryable;
+  final TransportFailureInfo? failure;
+  final List<FrontendRuntimeStatus> frontends;
+  final NetworkQualitySnapshot? networkQuality;
+
+  bool get isConnected =>
+      phase == ConnectionPhase.connected || phase == ConnectionPhase.degraded;
+
+  bool get isTransitional =>
+      phase == ConnectionPhase.preparing ||
+      phase == ConnectionPhase.connectingH3 ||
+      phase == ConnectionPhase.connectingH2 ||
+      phase == ConnectionPhase.reconnecting ||
+      phase == ConnectionPhase.disconnecting;
+
+  factory EngineSnapshot.fromMap(Map<Object?, Object?> map) {
+    ConnectionPhase parsePhase(String? value) {
+      return ConnectionPhase.values.firstWhere(
+        (phase) => phase.name == value,
+        orElse: () => ConnectionPhase.error,
+      );
+    }
+
+    final connectedAt = map['connected_at'] as String?;
+    return EngineSnapshot(
+      phase: parsePhase(map['phase'] as String?),
+      dataPlane: DataPlaneMode.fromWire(map['data_plane']),
+      l4: map['l4'] is Map ? L4Snapshot.fromMap(map['l4'] as Map) : null,
+      chainExit: ChainExitStatus.fromMap(
+        (map['chain_exit'] ?? map['vpn_gate']) is Map
+            ? (map['chain_exit'] ?? map['vpn_gate']) as Map
+            : const {},
+      ),
+      vpnGate: map['vpn_gate'] is Map
+          ? VpnGateStatus.fromMap(map['vpn_gate'] as Map)
+          : const VpnGateStatus(),
+      sessionCongestionControl: CongestionControlAlgorithm.values
+          .where(
+            (algorithm) => algorithm.name == map['session_congestion_control'],
+          )
+          .firstOrNull,
+      transport: map['transport'] as String?,
+      addressFamily: map['address_family'] as String?,
+      connectedAt: connectedAt == null ? null : DateTime.tryParse(connectedAt),
+      downloadBytesPerSecond:
+          (map['download_bytes_per_second'] as num?)?.toInt() ?? 0,
+      uploadBytesPerSecond:
+          (map['upload_bytes_per_second'] as num?)?.toInt() ?? 0,
+      downloadedBytes: (map['downloaded_bytes'] as num?)?.toInt() ?? 0,
+      uploadedBytes: (map['uploaded_bytes'] as num?)?.toInt() ?? 0,
+      reconnectCount: (map['reconnect_count'] as num?)?.toInt() ?? 0,
+      activeListeners:
+          (map['active_listeners'] as List?)?.whereType<String>().toList(
+            growable: false,
+          ) ??
+          const <String>[],
+      killSwitchState: map['kill_switch_state'] as String?,
+      platformLockdown: map['platform_lockdown'] as bool? ?? false,
+      alwaysOn: map['always_on'] as bool? ?? false,
+      exit: ExitInfo(
+        city: map['exit_city'] as String?,
+        country: map['exit_country'] as String?,
+        countryCode: map['exit_country_code'] as String?,
+        flagSvg: map['exit_flag_svg'] as String?,
+        ipv4: map['exit_ipv4'] as String?,
+        ipv6: map['exit_ipv6'] as String?,
+      ),
+      warning: map['warning'] as String?,
+      errorCode: map['error_code'] as String?,
+      errorRetryable: map['error_retryable'] as bool?,
+      failure: map['failure'] is Map
+          ? TransportFailureInfo.fromMap(
+              Map<Object?, Object?>.from(map['failure'] as Map),
+            )
+          : null,
+      frontends:
+          (map['frontends'] as List?)
+              ?.whereType<Map<Object?, Object?>>()
+              .map((value) {
+                final kind = FrontendKind.values.firstWhere(
+                  (item) => item.name == value['kind'],
+                  orElse: () => FrontendKind.tunnel,
+                );
+                final phase = FrontendPhase.values.firstWhere(
+                  (item) => item.name == value['phase'],
+                  orElse: () => FrontendPhase.error,
+                );
+                return FrontendRuntimeStatus(
+                  kind: kind,
+                  phase: phase,
+                  listeners:
+                      (value['listeners'] as List?)?.whereType<String>().toList(
+                        growable: false,
+                      ) ??
+                      const <String>[],
+                  errorCode: value['error_code'] as String?,
+                );
+              })
+              .toList(growable: false) ??
+          const <FrontendRuntimeStatus>[],
+      networkQuality: map['network_quality'] is Map
+          ? NetworkQualitySnapshot.fromMap(
+              Map<Object?, Object?>.from(map['network_quality'] as Map),
+            )
+          : null,
+    );
+  }
+
+  @override
+  bool operator ==(Object other) {
+    return identical(this, other) ||
+        other is EngineSnapshot &&
+            sessionCongestionControl == other.sessionCongestionControl &&
+            dataPlane == other.dataPlane &&
+            vpnGate == other.vpnGate &&
+            chainExit == other.chainExit &&
+            l4 == other.l4 &&
+            phase == other.phase &&
+            transport == other.transport &&
+            addressFamily == other.addressFamily &&
+            connectedAt == other.connectedAt &&
+            downloadBytesPerSecond == other.downloadBytesPerSecond &&
+            uploadBytesPerSecond == other.uploadBytesPerSecond &&
+            downloadedBytes == other.downloadedBytes &&
+            uploadedBytes == other.uploadedBytes &&
+            reconnectCount == other.reconnectCount &&
+            listEquals(activeListeners, other.activeListeners) &&
+            killSwitchState == other.killSwitchState &&
+            platformLockdown == other.platformLockdown &&
+            alwaysOn == other.alwaysOn &&
+            exit == other.exit &&
+            warning == other.warning &&
+            errorCode == other.errorCode &&
+            errorRetryable == other.errorRetryable &&
+            failure == other.failure &&
+            listEquals(frontends, other.frontends) &&
+            networkQuality == other.networkQuality;
+  }
+
+  @override
+  int get hashCode => Object.hashAll(<Object?>[
+    sessionCongestionControl,
+    dataPlane,
+    vpnGate,
+    chainExit,
+    l4,
+    phase,
+    transport,
+    addressFamily,
+    connectedAt,
+    downloadBytesPerSecond,
+    uploadBytesPerSecond,
+    downloadedBytes,
+    uploadedBytes,
+    reconnectCount,
+    Object.hashAll(activeListeners),
+    killSwitchState,
+    platformLockdown,
+    alwaysOn,
+    exit,
+    warning,
+    errorCode,
+    errorRetryable,
+    failure,
+    Object.hashAll(frontends),
+    networkQuality,
+  ]);
+}

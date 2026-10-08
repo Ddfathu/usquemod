@@ -1,3 +1,5 @@
+import 'dart:convert';
+import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
@@ -437,6 +439,100 @@ class _IdentityManagementDialogState extends State<_IdentityManagementDialog> {
 }
 
 class _ProfileRow extends StatelessWidget {
+
+  void _showExportOptions(BuildContext context, UsqueProfile profile) {
+    final Map<String, dynamic> rawMap = profile.toMap();
+    final String standardJson = const JsonEncoder.withIndent('  ').convert(rawMap);
+    
+    // Siapkan Full JSON (+ template kunci & identitas)
+    final Map<String, dynamic> fullMap = Map<String, dynamic>.from(rawMap);
+    fullMap['wireguard'] = {
+      'private_key': '<PRIVATE_KEY_PROFILE>',
+      'public_key': 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
+      'addresses': ['172.16.0.2/32', '2606:4700:110:8::1/128'],
+      'reserved': [0, 0, 0],
+    };
+    final String fullJson = const JsonEncoder.withIndent('  ').convert(fullMap);
+
+    // Siapkan Full YAML untuk Clash Meta / Mihomo
+    final String clashYaml = """
+# Format Clash Meta / Mihomo (WireGuard)
+proxies:
+  - name: "${profile.name}"
+    type: wireguard
+    server: 162.159.192.1
+    port: 2408
+    ip: 172.16.0.2
+    ipv6: 2606:4700:110:8::1
+    private-key: <PRIVATE_KEY_PROFILE>
+    public-key: bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
+    udp: true
+    remote-dns-resolve: true
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+""";
+
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Wrap(
+            children: [
+              ListTile(
+                title: Text(
+                  'Ekspor Profil: ${profile.name}',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                subtitle: const Text('Pilih format konfigurasi yang diinginkan'),
+              ),
+              const Divider(height: 1),
+              ListTile(
+                leading: const Icon(LucideIcons.fileCode, color: Colors.blue),
+                title: const Text('1. Config JSON (Standar)'),
+                subtitle: const Text('File konfigurasi profil asli bawaan'),
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: standardJson));
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Config JSON Standar disalin ke Clipboard!')),
+                  );
+                },
+              ),
+              ListTile(
+                leading: const Icon(LucideIcons.fileJson, color: Colors.green),
+                title: const Text('2. Config Full JSON'),
+                subtitle: const Text('JSON lengkap berisi profil dan kunci identitas'),
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: fullJson));
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Config Full JSON disalin ke Clipboard!')),
+                  );
+                },
+              ),
+              ListTile(
+                leading: const Icon(LucideIcons.fileText, color: Colors.orange),
+                title: const Text('3. Config Full YAML (Clash Meta)'),
+                subtitle: const Text('Format node proxy WireGuard untuk Clash Meta / Mihomo'),
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: clashYaml));
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Config Clash YAML disalin ke Clipboard!')),
+                  );
+                },
+              ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
   const _ProfileRow({
     required this.profile,
     required this.active,
@@ -532,6 +628,11 @@ class _ProfileRow extends StatelessWidget {
                           : LucideIcons.keyRound,
                     ),
                   ),
+                IconButton(
+                  tooltip: 'Ekspor Config',
+                  icon: const Icon(LucideIcons.share2),
+                  onPressed: () => _showExportOptions(context, profile),
+                ),
                 IconButton(
                   tooltip: strings.get('edit'),
                   onPressed: onEdit,

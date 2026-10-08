@@ -938,6 +938,7 @@ class MainActivity : FlutterFragmentActivity() {
             try {
                 secret =
                     identityStore.get(profileId, SecureIdentityStore.Record.WARP_SECRET)
+                        ?: identityStore.get(profileId, SecureIdentityStore.Record.MASQUE_PRIVATE_KEY)
                         ?: throw IllegalStateException("The Profile identity is missing")
                 contentResolver.openOutputStream(destination, "wt").use { output ->
                     checkNotNull(output) { "The document provider returned no output stream" }

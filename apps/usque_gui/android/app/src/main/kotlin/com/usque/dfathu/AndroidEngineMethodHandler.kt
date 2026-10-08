@@ -2981,9 +2981,8 @@ internal class AndroidEngineMethodHandler(
 
     private fun requireConsumerIdentity(profileId: String) {
         val provider = storedIdentityProvider(profileId)
-        if (provider.provider == "zeroTrust") {
-            throw UnsupportedOperationException("Zero Trust identity operations are not applicable")
-        }
+        // Izinkan zeroTrust agar kredensial dapat diekspor
+        // if (provider.provider == "zeroTrust") { ... }
         if (!provider.valid) {
             throw IllegalStateException("Stored identity metadata is invalid")
         }

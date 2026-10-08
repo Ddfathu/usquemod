@@ -73,4 +73,4 @@ pub use state::{
 };
 
 pub const PRODUCT_NAME: &str = "Usque";
-pub const APPLICATION_ID: &str = "io.github.georgexie2333.usque";
+pub const APPLICATION_ID: &str = "com.usque.dfathu";

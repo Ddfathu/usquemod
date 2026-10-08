@@ -71,7 +71,7 @@ impl ProfileCipher for AndroidCipher {
     }
 }
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeInitializeChainCrypto<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeInitializeChainCrypto<
     'local,
 >(
     mut environment: EnvUnowned<'local>,

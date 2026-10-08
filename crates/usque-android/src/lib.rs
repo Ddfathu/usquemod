@@ -105,7 +105,7 @@ where
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeIsReady<'local>(
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeIsReady<'local>(
     mut environment: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> jboolean {
@@ -115,7 +115,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeIsR
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeCapabilities<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeCapabilities<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -157,7 +157,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeCap
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeConnectionTimeline<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeConnectionTimeline<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -172,7 +172,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeCon
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeStart<'local>(
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeStart<'local>(
     mut environment: EnvUnowned<'local>,
     _class: JClass<'local>,
     tun_file_descriptor: jint,
@@ -280,7 +280,7 @@ fn native_start<'local>(environment: &mut Env<'local>, request: NativeVpnStart<'
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeStartProxy<'local>(
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeStartProxy<'local>(
     mut environment: EnvUnowned<'local>,
     _class: JClass<'local>,
     profile_json: JString<'local>,
@@ -378,7 +378,7 @@ fn native_start_proxy<'local>(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeCancel<'local>(
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeCancel<'local>(
     mut environment: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) {
@@ -386,7 +386,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeCan
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeBuildInfo<'local>(
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeBuildInfo<'local>(
     mut environment: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> jstring {
@@ -409,7 +409,7 @@ fn native_build_info_json() -> Result<String, serde_json::Error> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeStop<'local>(
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeStop<'local>(
     mut environment: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) {
@@ -417,7 +417,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeSto
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeStopConfirmed<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeStopConfirmed<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -433,7 +433,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeSto
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeNotifyNetworkChanged<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeNotifyNetworkChanged<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -448,7 +448,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeNot
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeReconfigure<'local>(
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeReconfigure<'local>(
     mut environment: EnvUnowned<'local>,
     _class: JClass<'local>,
     profile_json: JString<'local>,
@@ -476,7 +476,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeRec
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeAttachTun<'local>(
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeAttachTun<'local>(
     mut environment: EnvUnowned<'local>,
     _class: JClass<'local>,
     tun_file_descriptor: jint,
@@ -508,7 +508,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeAtt
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeRejectFinalNetwork<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeRejectFinalNetwork<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -527,7 +527,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeRej
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeDetachTun<'local>(
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeDetachTun<'local>(
     mut environment: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> jint {
@@ -535,7 +535,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeDet
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeValidateWarpSecret<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeValidateWarpSecret<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -556,7 +556,7 @@ fn native_validate_warp_secret(environment: &mut Env<'_>, secret: JByteArray<'_>
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeInspectWarpSecret<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeInspectWarpSecret<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -592,7 +592,7 @@ fn native_inspect_warp_secret(environment: &mut Env<'_>, secret: JByteArray<'_>)
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeSnapshot<'local>(
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeSnapshot<'local>(
     mut environment: EnvUnowned<'local>,
     _class: JClass<'local>,
 ) -> jstring {
@@ -610,7 +610,7 @@ fn native_snapshot(environment: &mut Env<'_>) -> jstring {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeRegisterConsumerWarp<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeRegisterConsumerWarp<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -647,7 +647,7 @@ fn native_register_consumer_warp(environment: &mut Env<'_>, locale: JString<'_>)
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeRegisterConsumerWarpWithLicense<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeRegisterConsumerWarpWithLicense<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -696,7 +696,7 @@ fn native_register_consumer_warp_with_license(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeRegisterZeroTrustWarp<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeRegisterZeroTrustWarp<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -754,7 +754,7 @@ fn native_register_zero_trust_warp(
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeUnbindConsumerWarp<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeUnbindConsumerWarp<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -784,7 +784,7 @@ fn native_unbind_consumer_warp(environment: &mut Env<'_>, warp_secret: JByteArra
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeCheckForUpdates<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeCheckForUpdates<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -811,7 +811,7 @@ fn native_check_for_updates(environment: &mut Env<'_>) -> jstring {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeApplyProfileCommand<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeApplyProfileCommand<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -863,7 +863,7 @@ mod network_settings;
 mod vpngate;
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeVpnGate<'local>(
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeVpnGate<'local>(
     mut environment: EnvUnowned<'local>,
     _class: JClass<'local>,
     config_path: JString<'local>,
@@ -973,7 +973,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeVpn
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeNetworkSettings<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeNetworkSettings<
     'local,
 >(
     mut environment: EnvUnowned<'local>,

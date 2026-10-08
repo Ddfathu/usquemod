@@ -75,7 +75,7 @@ fn claim(id: jint) -> Option<(ProbeGuard, CancellationToken)> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativePrepareDiagnosticProbe<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativePrepareDiagnosticProbe<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -88,7 +88,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativePre
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeCancelDiagnosticProbe<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeCancelDiagnosticProbe<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -99,7 +99,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeCan
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeValidateDiagnosticProfile<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeValidateDiagnosticProfile<
     'local,
 >(
     mut environment: EnvUnowned<'local>,
@@ -120,7 +120,7 @@ pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeVal
 }
 
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_io_github_georgexie2333_usque_NativeEngine_nativeDiagnosticProbe<
+pub extern "system" fn Java_com_usque_dfathu_NativeEngine_nativeDiagnosticProbe<
     'local,
 >(
     mut environment: EnvUnowned<'local>,

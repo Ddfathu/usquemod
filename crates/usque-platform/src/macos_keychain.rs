@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 use crate::{SecretRecord, SecretVault, VaultError};
 
 const MAX_SECRET_BYTES: usize = 5 * 512;
-const KEYCHAIN_SERVICE: &str = "io.github.georgexie2333.usque.identity";
+const KEYCHAIN_SERVICE: &str = "com.usque.dfathu.identity";
 const ERR_SEC_ITEM_NOT_FOUND: i32 = -25_300;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -99,7 +99,7 @@ mod tests {
             account_name(profile, SecretRecord::EndpointPin),
             "8c30b771-9ebd-457a-b67b-bbc74a1ddba6/endpoint-pin"
         );
-        assert_eq!(KEYCHAIN_SERVICE, "io.github.georgexie2333.usque.identity");
+        assert_eq!(KEYCHAIN_SERVICE, "com.usque.dfathu.identity");
     }
 
     #[tokio::test]

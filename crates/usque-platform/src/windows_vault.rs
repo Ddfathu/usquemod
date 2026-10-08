@@ -14,7 +14,7 @@ use zeroize::Zeroizing;
 use crate::{SecretRecord, SecretVault, VaultError};
 
 const MAX_CREDENTIAL_BLOB_BYTES: usize = 5 * 512;
-const TARGET_PREFIX: &str = "io.github.georgexie2333.usque/identity";
+const TARGET_PREFIX: &str = "com.usque.dfathu/identity";
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WindowsCredentialVault;
@@ -293,17 +293,17 @@ mod tests {
         let profile = Uuid::parse_str("8c30b771-9ebd-457a-b67b-bbc74a1ddba6").unwrap();
         assert_eq!(
             target_name(profile, SecretRecord::EndpointPin),
-            "io.github.georgexie2333.usque/identity/8c30b771-9ebd-457a-b67b-bbc74a1ddba6/endpoint-pin"
+            "com.usque.dfathu/identity/8c30b771-9ebd-457a-b67b-bbc74a1ddba6/endpoint-pin"
         );
         assert_eq!(
             enumeration_filter(),
-            "io.github.georgexie2333.usque/identity/*"
+            "com.usque.dfathu/identity/*"
         );
         assert!(is_namespaced_target(
-            "io.github.georgexie2333.usque/identity/profile/warp-secret"
+            "com.usque.dfathu/identity/profile/warp-secret"
         ));
         assert!(!is_namespaced_target(
-            "io.github.georgexie2333.usque/identity-other/profile/warp-secret"
+            "com.usque.dfathu/identity-other/profile/warp-secret"
         ));
     }
 

@@ -71,7 +71,7 @@ use windows_sys::Win32::{
     },
 };
 
-const AGENT_PIPE_NAME: &str = r"\\.\pipe\io.github.georgexie2333.usque.agent.v1";
+const AGENT_PIPE_NAME: &str = r"\\.\pipe\com.usque.dfathu.agent.v1";
 const AGENT_PROTOCOL_VERSION: u32 = 3;
 const MAX_AGENT_FRAME_BYTES: usize = 64 * 1024;
 const AGENT_START_TIMEOUT: Duration = Duration::from_secs(30);

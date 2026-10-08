@@ -22,7 +22,7 @@ use windows_sys::{
 
 use crate::{ControlService, event_stream::handle_event_stream, ipc_stream::handle_stream};
 
-const PIPE_PREFIX: &str = r"\\.\pipe\io.github.georgexie2333.usque.engine.v1";
+const PIPE_PREFIX: &str = r"\\.\pipe\com.usque.dfathu.engine.v1";
 
 pub fn current_user_pipe_name() -> io::Result<String> {
     Ok(format!("{PIPE_PREFIX}-{}", current_user_sid()?))

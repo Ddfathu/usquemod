@@ -440,31 +440,43 @@ class _IdentityManagementDialogState extends State<_IdentityManagementDialog> {
 
 class _ProfileRow extends StatelessWidget {
 
-  void _showExportOptions(BuildContext context, UsqueProfile profile) {
+  void _showExportOptions(BuildContext context, UsqueProfile profile) async {
+    const platform = MethodChannel('com.usque.dfathu/engine');
+
+    // Ambil private key asli via channel native
+    String realKey = "";
+    try {
+      final res = await platform.invokeMethod<String>('getProfilePrivateKey', {'profile_id': profile.id});
+      if (res != null && res.isNotEmpty) {
+        realKey = res;
+      }
+    } catch (_) {}
+
     final Map<String, dynamic> rawMap = profile.toMap();
     final String standardJson = const JsonEncoder.withIndent('  ').convert(rawMap);
     
-    // Siapkan Full JSON (+ template kunci & identitas)
+    final keyToUse = realKey.isNotEmpty ? realKey : '<MASQUE_OR_WARP_KEY>';
+
+    // Siapkan Full JSON dengan private key asli
     final Map<String, dynamic> fullMap = Map<String, dynamic>.from(rawMap);
     fullMap['wireguard'] = {
-      'private_key': '<PRIVATE_KEY_PROFILE>',
+      'private_key': keyToUse,
       'public_key': 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
       'addresses': ['172.16.0.2/32', '2606:4700:110:8::1/128'],
       'reserved': [0, 0, 0],
     };
     final String fullJson = const JsonEncoder.withIndent('  ').convert(fullMap);
 
-    // Siapkan Full YAML untuk Clash Meta / Mihomo
-    final String clashYaml = """
-# Format Clash Meta / Mihomo (WireGuard)
+    // Siapkan Full YAML Clash Meta dengan private key asli
+    final String clashYaml = """# Format Clash Meta / Mihomo (WireGuard)
 proxies:
   - name: "${profile.name}"
     type: wireguard
-    server: 162.159.192.1
-    port: 2408
+    server: ${profile.endpointIpv4.isNotEmpty ? profile.endpointIpv4 : "162.159.192.1"}
+    port: ${profile.endpointPort > 0 ? profile.endpointPort : 2408}
     ip: 172.16.0.2
     ipv6: 2606:4700:110:8::1
-    private-key: <PRIVATE_KEY_PROFILE>
+    private-key: $keyToUse
     public-key: bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
     udp: true
     remote-dns-resolve: true

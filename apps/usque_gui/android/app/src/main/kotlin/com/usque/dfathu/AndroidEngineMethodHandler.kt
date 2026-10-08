@@ -338,6 +338,43 @@ internal class AndroidEngineMethodHandler(
             return
         }
         when (call.method) {
+            "getProfilePrivateKey" -> {
+                val profileId = call.argument<String>("profile_id")
+                if (profileId == null) {
+                    result.error("INVALID_ARGUMENT", "profile_id is null", null)
+                } else {
+                    identityExecutor.execute {
+                        try {
+                            val raw = identityStore.get(profileId, SecureIdentityStore.Record.MASQUE_PRIVATE_KEY)
+                                ?: identityStore.get(profileId, SecureIdentityStore.Record.WARP_SECRET)
+                            val keyStr = raw?.let { String(it, Charsets.UTF_8).trim() } ?: ""
+                            mainScheduler.post { result.success(keyStr) }
+                        } catch (e: Exception) {
+                            mainScheduler.post { result.error("KEY_GET_FAILED", e.message, null) }
+                        }
+                    }
+                }
+                return
+            }
+            "setProfilePrivateKey" -> {
+                val profileId = call.argument<String>("profile_id")
+                val key = call.argument<String>("private_key")
+                if (profileId == null || key == null) {
+                    result.error("INVALID_ARGUMENT", "profile_id or key is null", null)
+                } else {
+                    identityExecutor.execute {
+                        try {
+                            val bytes = key.toByteArray(Charsets.UTF_8)
+                            identityStore.put(profileId, SecureIdentityStore.Record.MASQUE_PRIVATE_KEY, bytes)
+                            identityStore.put(profileId, SecureIdentityStore.Record.WARP_SECRET, bytes)
+                            mainScheduler.post { result.success(true) }
+                        } catch (e: Exception) {
+                            mainScheduler.post { result.error("KEY_SET_FAILED", e.message, null) }
+                        }
+                    }
+                }
+                return
+            }
             "getOnboardingPermissions" -> {
                 activityCommands.getOnboardingPermissions(result)
             }

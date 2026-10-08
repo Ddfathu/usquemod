@@ -190,22 +190,42 @@ class _AdvancedSettingsScreenState extends State<AdvancedSettingsScreen> {
 
   @override
   
-  void _showJsonConfigDialog() {
+  Future<void> _showJsonConfigDialog() async {
     final profile = widget.controller.activeProfile;
-    final jsonString = const JsonEncoder.withIndent('  ').convert(profile.toMap());
+    const platform = MethodChannel('com.usque.dfathu/engine');
+
+    // Ambil private key riil dari storage native Android
+    String realKey = '';
+    try {
+      final res = await platform.invokeMethod<String>('getProfilePrivateKey', {'profile_id': profile.id});
+      if (res != null && res.isNotEmpty) {
+        realKey = res;
+      }
+    } catch (_) {}
+
+    final rawMap = Map<String, dynamic>.from(profile.toMap());
+    rawMap['wireguard'] = {
+      'private_key': realKey.isNotEmpty ? realKey : '<MASQUE_OR_WARP_KEY>',
+      'public_key': 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
+      'addresses': ['172.16.0.2/32', '2606:4700:110:8::1/128'],
+      'reserved': [0, 0, 0],
+    };
+
+    final jsonString = const JsonEncoder.withIndent('  ').convert(rawMap);
     final textController = TextEditingController(text: jsonString);
     String? jsonError;
 
+    if (!mounted) return;
     showDialog(
       context: context,
       builder: (ctx) {
         return StatefulBuilder(
           builder: (context, setDialogState) {
             return AlertDialog(
-              title: const Text('Config JSON Profile'),
+              title: Text('Edit Full Config (${profile.name})'),
               content: SizedBox(
                 width: double.maxFinite,
-                height: 450,
+                height: 480,
                 child: Column(
                   children: [
                     Expanded(
@@ -233,10 +253,22 @@ class _AdvancedSettingsScreenState extends State<AdvancedSettingsScreen> {
                   child: const Text('Batal'),
                 ),
                 ElevatedButton(
-                  onPressed: () {
+                  onPressed: () async {
                     try {
                       final decoded = jsonDecode(textController.text);
                       if (decoded is Map<String, dynamic>) {
+                        // Simpan kembali private key jika diedit
+                        if (decoded.containsKey('wireguard') && decoded['wireguard'] is Map) {
+                          final wg = decoded['wireguard'] as Map;
+                          final newKey = wg['private_key']?.toString();
+                          if (newKey != null && !newKey.startsWith('<')) {
+                            await platform.invokeMethod('setProfilePrivateKey', {
+                              'profile_id': profile.id,
+                              'private_key': newKey,
+                            });
+                          }
+                        }
+
                         final updatedProfile = UsqueProfile.fromMap(decoded);
                         setState(() {
                           _endpointV4.text = updatedProfile.endpointIpv4;
@@ -259,7 +291,7 @@ class _AdvancedSettingsScreenState extends State<AdvancedSettingsScreen> {
                         Navigator.of(ctx).pop();
                         ScaffoldMessenger.of(context).showSnackBar(
                           const SnackBar(
-                            content: Text('Config JSON dimuat ke form! Pilih "Terapkan perubahan" untuk menyimpan.'),
+                            content: Text('Config berhasil dimuat! Pilih "Terapkan perubahan" untuk menyimpan.'),
                           ),
                         );
                       } else {
@@ -282,6 +314,7 @@ class _AdvancedSettingsScreenState extends State<AdvancedSettingsScreen> {
       },
     );
   }
+
 
   Widget build(BuildContext context) =>
       ControllerSelector<

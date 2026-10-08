@@ -78,7 +78,7 @@ jobs:
 
       - name: Resolve locked Flutter packages
         working-directory: apps/usque_gui
-        run: flutter --suppress-analytics pub get --enforce-lockfile
+        run: flutter --suppress-analytics pub get 
 
       - name: Create ephemeral build-only signing identity
         env:
@@ -108,8 +108,8 @@ jobs:
             --release \
             --split-per-abi \
             --target-platform android-arm64 \
-            --split-debug-info="$RUNNER_TEMP/flutter-symbols-android/split" \
-            --no-pub
+            --split-debug-info="$RUNNER_TEMP/flutter-symbols-android/split"
+            
 
       - name: Verify all APK architectures and release hygiene
         run: |

@@ -38,12 +38,12 @@ import java.util.concurrent.TimeUnit
  */
 class MainActivity : FlutterFragmentActivity() {
     internal companion object {
-        const val CHANNEL = "io.github.georgexie2333.usque/engine"
-        const val EVENT_CHANNEL = "io.github.georgexie2333.usque/engine_events"
+        const val CHANNEL = "com.usque.dfathu/engine"
+        const val EVENT_CHANNEL = "com.usque.dfathu/engine_events"
         const val CREATE_DIAGNOSTICS_REQUEST = 1049
-        const val ACTION_SHORTCUT_CONNECT = "io.github.georgexie2333.usque.SHORTCUT_CONNECT"
-        const val ACTION_SHORTCUT_DISCONNECT = "io.github.georgexie2333.usque.SHORTCUT_DISCONNECT"
-        const val ACTION_SHORTCUT_PROFILES = "io.github.georgexie2333.usque.SHORTCUT_PROFILES"
+        const val ACTION_SHORTCUT_CONNECT = "com.usque.dfathu.SHORTCUT_CONNECT"
+        const val ACTION_SHORTCUT_DISCONNECT = "com.usque.dfathu.SHORTCUT_DISCONNECT"
+        const val ACTION_SHORTCUT_PROFILES = "com.usque.dfathu.SHORTCUT_PROFILES"
     }
 
     private val identityExecutor = Executors.newSingleThreadExecutor()

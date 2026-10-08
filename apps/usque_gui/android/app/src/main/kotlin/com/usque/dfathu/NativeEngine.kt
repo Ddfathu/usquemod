@@ -1,0 +1,332 @@
+package com.usque.dfathu
+
+import java.io.File
+
+internal object NativeEngine {
+    private external fun nativeInitializeChainCrypto(codec: ChainProfileCipher): Boolean
+
+    fun networkSettings(
+        path: String,
+        request: String,
+    ): String? = if (libraryLoaded) nativeNetworkSettings(path, request) else null
+
+    private external fun nativeNetworkSettings(
+        path: String,
+        request: String,
+    ): String?
+
+    private val libraryLoaded: Boolean =
+        try {
+            System.loadLibrary("usque_android")
+            nativeInitializeChainCrypto(ChainProfileCipher)
+        } catch (_: UnsatisfiedLinkError) {
+            false
+        }
+
+    fun isReady(): Boolean = libraryLoaded && nativeIsReady()
+
+    fun isLinked(): Boolean = libraryLoaded
+
+    fun buildInfo(): String? =
+        try {
+            if (libraryLoaded) nativeBuildInfo() else null
+        } catch (_: UnsatisfiedLinkError) {
+            null
+        }
+
+    private external fun nativeBuildInfo(): String?
+
+    fun connectionTimeline(): String? =
+        try {
+            if (libraryLoaded) nativeConnectionTimeline() else null
+        } catch (_: UnsatisfiedLinkError) {
+            null
+        }
+
+    private external fun nativeConnectionTimeline(): String?
+
+    fun capabilities(): String? =
+        try {
+            if (libraryLoaded) nativeCapabilities() else null
+        } catch (_: UnsatisfiedLinkError) {
+            null
+        }
+
+    fun validateDiagnosticProfile(profile: String): Boolean? =
+        try {
+            if (libraryLoaded) nativeValidateDiagnosticProfile(profile) else null
+        } catch (_: UnsatisfiedLinkError) {
+            null
+        }
+
+    fun prepareDiagnosticProbe(id: Int): Boolean =
+        try {
+            libraryLoaded && nativePrepareDiagnosticProbe(id)
+        } catch (_: UnsatisfiedLinkError) {
+            false
+        }
+
+    fun cancelDiagnosticProbe(id: Int) {
+        try {
+            if (libraryLoaded) nativeCancelDiagnosticProbe(id)
+        } catch (_: UnsatisfiedLinkError) {
+            // old engine
+        }
+    }
+
+    fun diagnosticProbe(
+        id: Int,
+        kind: String,
+        profile: String,
+        secret: ByteArray,
+        service: UsqueVpnService,
+        vpn: Boolean,
+    ): String? =
+        try {
+            if (libraryLoaded) nativeDiagnosticProbe(id, kind, profile, secret, service, vpn) else null
+        } catch (
+            _: UnsatisfiedLinkError,
+        ) {
+            null
+        }
+
+    private external fun nativeValidateDiagnosticProfile(profile: String): Boolean
+
+    private external fun nativePrepareDiagnosticProbe(id: Int): Boolean
+
+    private external fun nativeCancelDiagnosticProbe(id: Int)
+
+    private external fun nativeDiagnosticProbe(
+        id: Int,
+        kind: String,
+        profile: String,
+        secret: ByteArray,
+        service: UsqueVpnService,
+        vpn: Boolean,
+    ): String?
+
+    fun start(
+        tunFileDescriptor: Int,
+        profileJson: String,
+        warpSecret: ByteArray,
+        proxyPassword: ByteArray,
+        vpnService: UsqueVpnService,
+    ): Int {
+        if (!libraryLoaded) return ERROR_NOT_LINKED
+        return nativeStart(
+            tunFileDescriptor,
+            profileJson,
+            warpSecret,
+            proxyPassword,
+            geoCacheDirectory(vpnService),
+            vpnService,
+        )
+    }
+
+    fun stop(): Boolean = !libraryLoaded || runCatching { nativeStopConfirmed() }.getOrDefault(false)
+
+    fun cancel() {
+        if (libraryLoaded) nativeCancel()
+    }
+
+    fun notifyNetworkChanged(generation: Long) {
+        if (libraryLoaded) nativeNotifyNetworkChanged(generation)
+    }
+
+    fun startProxy(
+        profileJson: String,
+        warpSecret: ByteArray,
+        proxyPassword: ByteArray,
+        vpnService: UsqueVpnService,
+    ): Int {
+        if (!libraryLoaded) return ERROR_NOT_LINKED
+        return nativeStartProxy(
+            profileJson,
+            warpSecret,
+            proxyPassword,
+            geoCacheDirectory(vpnService),
+            vpnService,
+        )
+    }
+
+    private fun geoCacheDirectory(vpnService: UsqueVpnService): String =
+        File(vpnService.noBackupFilesDir, "usque_config").absolutePath
+
+    fun validateWarpSecret(secret: ByteArray): Int {
+        if (!libraryLoaded) return ERROR_NOT_LINKED
+        return nativeValidateWarpSecret(secret)
+    }
+
+    fun inspectWarpSecret(secret: ByteArray): String? {
+        if (!libraryLoaded) return null
+        return nativeInspectWarpSecret(secret)
+    }
+
+    fun snapshot(): String? {
+        if (!libraryLoaded) return null
+        return nativeSnapshot()
+    }
+
+    fun vpnGate(
+        configPath: String,
+        request: String,
+        secret: ByteArray,
+        service: UsqueVpnService,
+    ): String? = if (libraryLoaded) nativeVpnGate(configPath, request, secret, service) else null
+
+    private external fun nativeVpnGate(
+        configPath: String,
+        request: String,
+        secret: ByteArray,
+        service: UsqueVpnService,
+    ): String?
+
+    fun registerConsumerWarp(locale: String): ByteArray? {
+        if (!libraryLoaded) return null
+        return nativeRegisterConsumerWarp(locale)
+    }
+
+    fun registerConsumerWarpWithLicense(
+        locale: String,
+        licenseKey: String,
+    ): ByteArray? {
+        if (!libraryLoaded) return null
+        return nativeRegisterConsumerWarpWithLicense(locale, licenseKey)
+    }
+
+    fun registerZeroTrustWarp(
+        locale: String,
+        team: String,
+        callbackUri: String,
+    ): ByteArray? {
+        if (!libraryLoaded) return null
+        return nativeRegisterZeroTrustWarp(locale, team, callbackUri)
+    }
+
+    fun unbindConsumerWarp(warpSecret: ByteArray): Boolean {
+        if (!libraryLoaded) return false
+        return nativeUnbindConsumerWarp(warpSecret) == OK
+    }
+
+    fun checkForUpdates(): String? {
+        if (!libraryLoaded) return null
+        return nativeCheckForUpdates()
+    }
+
+    fun applyProfileCommand(
+        configPath: String,
+        requestJson: String,
+    ): String? {
+        if (!libraryLoaded) return null
+        return nativeApplyProfileCommand(configPath, requestJson)
+    }
+
+    fun reconfigure(
+        profileJson: String,
+        proxyPassword: ByteArray,
+    ): Int {
+        if (!libraryLoaded) return ERROR_NOT_LINKED
+        return nativeReconfigure(profileJson, proxyPassword)
+    }
+
+    fun attachTun(
+        tunFileDescriptor: Int,
+        profileJson: String,
+        proxyPassword: ByteArray,
+    ): Int {
+        if (!libraryLoaded) return ERROR_NOT_LINKED
+        return nativeAttachTun(tunFileDescriptor, profileJson, proxyPassword)
+    }
+
+    fun detachTun(): Int {
+        if (!libraryLoaded) return ERROR_NOT_LINKED
+        return nativeDetachTun()
+    }
+
+    fun rejectFinalNetwork(): Int {
+        if (!libraryLoaded) return ERROR_NOT_LINKED
+        return nativeRejectFinalNetwork()
+    }
+
+    private external fun nativeIsReady(): Boolean
+
+    private external fun nativeCapabilities(): String?
+
+    private external fun nativeStart(
+        tunFileDescriptor: Int,
+        profileJson: String,
+        warpSecret: ByteArray,
+        proxyPassword: ByteArray,
+        geoCacheDirectory: String,
+        vpnService: UsqueVpnService,
+    ): Int
+
+    private external fun nativeStopConfirmed(): Boolean
+
+    private external fun nativeCancel()
+
+    private external fun nativeNotifyNetworkChanged(generation: Long)
+
+    private external fun nativeStartProxy(
+        profileJson: String,
+        warpSecret: ByteArray,
+        proxyPassword: ByteArray,
+        geoCacheDirectory: String,
+        vpnService: UsqueVpnService,
+    ): Int
+
+    private external fun nativeValidateWarpSecret(secret: ByteArray): Int
+
+    private external fun nativeInspectWarpSecret(secret: ByteArray): String?
+
+    private external fun nativeSnapshot(): String?
+
+    private external fun nativeRegisterConsumerWarp(locale: String): ByteArray?
+
+    private external fun nativeRegisterConsumerWarpWithLicense(
+        locale: String,
+        licenseKey: String,
+    ): ByteArray?
+
+    private external fun nativeRegisterZeroTrustWarp(
+        locale: String,
+        team: String,
+        callbackUri: String,
+    ): ByteArray?
+
+    private external fun nativeUnbindConsumerWarp(warpSecret: ByteArray): Int
+
+    private external fun nativeCheckForUpdates(): String?
+
+    private external fun nativeApplyProfileCommand(
+        configPath: String,
+        requestJson: String,
+    ): String?
+
+    private external fun nativeReconfigure(
+        profileJson: String,
+        proxyPassword: ByteArray,
+    ): Int
+
+    private external fun nativeAttachTun(
+        tunFileDescriptor: Int,
+        profileJson: String,
+        proxyPassword: ByteArray,
+    ): Int
+
+    private external fun nativeDetachTun(): Int
+
+    private external fun nativeRejectFinalNetwork(): Int
+
+    const val OK = 0
+    const val RECONFIGURE_NEED_COLD = 1
+    const val RECONFIGURE_NEED_ATTACH = 2
+    const val ERROR_NOT_LINKED = -2
+    const val ERROR_INVALID_WARP_SECRET = -3
+    const val ERROR_ALREADY_RUNNING = -4
+    const val ERROR_INVALID_PROFILE = -5
+    const val ERROR_PLATFORM_FAILURE = -6
+    const val ERROR_TRANSPORT_FAILURE = -7
+    const val ERROR_TUN_FAILURE = -8
+    const val RECONFIGURE_NOT_RUNNING = -10
+}

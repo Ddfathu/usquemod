@@ -1,0 +1,1157 @@
+package com.usque.dfathu
+
+import java.util.UUID
+import java.util.concurrent.Executor
+
+/**
+ * Platform-side diagnostic session for Android. It consumes only the
+ * read-only, already-sanitized VPN-process snapshot and never opens sockets,
+ * creates a TUN, or changes platform network state.
+ */
+internal class AndroidDiagnosticsCoordinator(
+    private val executor: Executor,
+    private val publish: (Map<String, Any?>) -> Unit = {},
+    private val nowMillis: () -> Long = System::currentTimeMillis,
+    private val newSessionId: () -> String = { UUID.randomUUID().toString() },
+    private val networkProbe: (
+        String,
+        () -> Boolean,
+    ) -> Map<String, Any?> = { id, _ -> NetworkDiagnosticChecks.probe(id, null) },
+) {
+    class DiagnosticsException(
+        val code: String,
+        override val message: String,
+    ) : IllegalStateException(message)
+
+    private val lock = Any()
+    private var generation = 0L
+    private var session: Map<String, Any?>? = null
+    private var latestSnapshot: Map<String, Any?> = emptyMap()
+    private val timeline = ArrayDeque<Map<String, Any?>>()
+    private var nextSequence = 1L
+    private var attemptStartedAtMillis: Long? = null
+    private var lastTimelineFingerprint: String? = null
+    private var lastObservedPhase: String? = null
+    private var lastNetworkGeneration: Long? = null
+    private var observedNetworkChanges = 0L
+    private var droppedTimelineEvents = 0L
+    private var nativeTimeline: Map<String, Any?>? = null
+    private var activeWorkerSessionId: String? = null
+
+    fun clear() {
+        synchronized(lock) {
+            generation++
+            session = null
+            latestSnapshot = emptyMap()
+            timeline.clear()
+            nextSequence = 1L
+            attemptStartedAtMillis = null
+            lastTimelineFingerprint = null
+            lastObservedPhase = null
+            lastNetworkGeneration = null
+            observedNetworkChanges = 0L
+            droppedTimelineEvents = 0L
+            nativeTimeline = null
+        }
+    }
+
+    fun observeNativeTimeline(value: Map<String, Any?>?) {
+        synchronized(lock) { nativeTimeline = value?.toMap() }
+    }
+
+    fun observeSnapshot(snapshot: Map<String, Any?>) {
+        synchronized(lock) {
+            latestSnapshot = snapshot.toMap()
+            val phase = snapshot["phase"] as? String ?: "disconnected"
+            val networkGeneration = DiagnosticMetadata.unsigned(snapshot["network_generation"])
+            val fingerprint = "$phase:$networkGeneration:${snapshot["error_code"] ?: ""}"
+            if (fingerprint == lastTimelineFingerprint) return
+            lastTimelineFingerprint = fingerprint
+            val previousPhase = lastObservedPhase
+            lastObservedPhase = phase
+            val previousGeneration = lastNetworkGeneration
+            if (previousGeneration != null && networkGeneration != null && previousGeneration != networkGeneration) {
+                observedNetworkChanges += 1
+            }
+            lastNetworkGeneration = networkGeneration
+            val now = nowMillis()
+            if (
+                attemptStartedAtMillis == null ||
+                (phase in CONNECTION_START_PHASES && previousPhase !in CONNECTION_START_PHASES)
+            ) {
+                attemptStartedAtMillis = now
+            }
+            val failure = failureFromSnapshot(snapshot)
+            appendTimeline(
+                mapOf(
+                    "sequence" to nextSequence++,
+                    "timestamp_unix_milliseconds" to now,
+                    "elapsed_from_attempt_start_milliseconds" to
+                        (now - (attemptStartedAtMillis ?: now)).coerceAtLeast(0L),
+                    "event_type" to phaseEvent(phase, previousPhase),
+                    "stage" to (failure?.get("stage") ?: phaseStage(phase)),
+                    "transport" to safeTransport(snapshot["transport"]),
+                    "address_family" to safeFamily(snapshot["address_family"]),
+                    "failure" to failure,
+                ).filterValues { value -> value != null },
+            )
+        }
+    }
+
+    fun start(
+        mode: String,
+        snapshot: Map<String, Any?>,
+        controlReachable: Boolean,
+        eventStreamReachable: Boolean,
+        nativeLinked: Boolean,
+        nativeReady: Boolean,
+    ): Map<String, Any?> {
+        val normalizedMode = mode.lowercase()
+        if (normalizedMode !in setOf("standard", "deep")) {
+            throw DiagnosticsException("INVALID_ARGUMENT", "The diagnostic mode is invalid.")
+        }
+        val runGeneration: Long
+        val sessionId: String
+        synchronized(lock) {
+            if (session?.get("state") in ACTIVE_STATES) {
+                throw DiagnosticsException(
+                    "DIAGNOSTICS_ALREADY_RUNNING",
+                    "Another diagnostic session is already active.",
+                )
+            }
+            latestSnapshot = snapshot.toMap()
+            generation += 1
+            runGeneration = generation
+            sessionId = newSessionId()
+            session =
+                mapOf(
+                    "session_id" to sessionId,
+                    "state" to "running",
+                    "started_at_unix_milliseconds" to nowMillis(),
+                    "mode" to normalizedMode,
+                    "current_check" to CHECKS.first().id,
+                    "progress_percent" to 0,
+                    "findings" to CHECKS.map(::pendingFinding),
+                    "summary" to emptySummary(),
+                )
+        }
+        publishSession(requireNotNull(current()))
+        try {
+            executor.execute {
+                synchronized(lock) { activeWorkerSessionId = sessionId }
+                try {
+                    complete(
+                        runGeneration,
+                        sessionId,
+                        normalizedMode,
+                        snapshot.toMap(),
+                        controlReachable,
+                        eventStreamReachable,
+                        nativeLinked,
+                        nativeReady,
+                    )
+                } catch (_: Exception) {
+                    failRunner(runGeneration, sessionId)
+                } finally {
+                    synchronized(lock) { if (activeWorkerSessionId == sessionId) activeWorkerSessionId = null }
+                    finishCancellation(sessionId)
+                }
+            }
+        } catch (_: Exception) {
+            failRunner(runGeneration, sessionId)
+        }
+        return requireNotNull(current())
+    }
+
+    fun cancel(sessionId: String): Map<String, Any?> {
+        val cancelled: Map<String, Any?>
+        synchronized(lock) {
+            val current =
+                session
+                    ?: throw DiagnosticsException("DIAGNOSTICS_NOT_FOUND", "No diagnostic session exists.")
+            if (current["session_id"] != sessionId) {
+                throw DiagnosticsException(
+                    "DIAGNOSTICS_SESSION_MISMATCH",
+                    "The diagnostic session identifier does not match.",
+                )
+            }
+            if (current["state"] !in ACTIVE_STATES || current["state"] == "cancelling") return current.toMap()
+            generation += 1
+            val findings =
+                (current["findings"] as? List<*>)
+                    ?.mapNotNull(::stringMap)
+                    ?.map { finding ->
+                        if (finding["status"] in setOf("pending", "running")) {
+                            finding + ("status" to "cancelled")
+                        } else {
+                            finding
+                        }
+                    }.orEmpty()
+            cancelled =
+                current +
+                mapOf(
+                    "state" to "cancelling",
+                    "current_check" to null,
+                    "progress_percent" to 100,
+                    "findings" to findings,
+                    "summary" to summarize(findings),
+                )
+            session = cancelled
+        }
+        publishSession(cancelled)
+        // Runs after the active probe worker has released its socket/lease.
+        try {
+            executor.execute { finishCancellation(sessionId) }
+        } catch (_: Exception) {
+            // An active worker owns cleanup; its finally block completes cancellation.
+            if (synchronized(lock) { activeWorkerSessionId != sessionId }) finishCancellation(sessionId)
+        }
+        return cancelled.toMap()
+    }
+
+    fun current(): Map<String, Any?>? = synchronized(lock) { session?.toMap() }
+
+    private fun finishCancellation(sessionId: String) {
+        val terminal =
+            synchronized(lock) {
+                val current = session ?: return
+                if (current["session_id"] != sessionId || current["state"] != "cancelling") return
+                if (activeWorkerSessionId == sessionId) return
+                (current + mapOf("state" to "cancelled", "completed_at_unix_milliseconds" to nowMillis())).also {
+                    session =
+                        it
+                }
+            }
+        runCatching { publishSession(terminal) }
+    }
+
+    private fun failRunner(
+        runGeneration: Long,
+        sessionId: String,
+    ) {
+        val terminal =
+            synchronized(lock) {
+                val current = session ?: return
+                if (generation != runGeneration || current["session_id"] != sessionId) return
+                val findings =
+                    (current["findings"] as? List<*>).orEmpty().mapNotNull(::stringMap).map {
+                        if (it["status"] in
+                            setOf("pending", "running")
+                        ) {
+                            it +
+                                mapOf(
+                                    "status" to "skipped",
+                                    "summary_key" to "diagnostic_check_failed_internally",
+                                    "remediation_key" to "export_diagnostics",
+                                )
+                        } else {
+                            it
+                        }
+                    }
+                (
+                    current +
+                        mapOf(
+                            "state" to "failed",
+                            "completed_at_unix_milliseconds" to nowMillis(),
+                            "current_check" to null,
+                            "progress_percent" to 100,
+                            "findings" to findings,
+                            "summary" to summarize(findings),
+                        )
+                ).also {
+                    session =
+                        it
+                }
+            }
+        runCatching { publishSession(terminal) }
+    }
+
+    fun matchesSession(sessionId: String?): Boolean =
+        sessionId == null || synchronized(lock) { session?.get("session_id") == sessionId }
+
+    fun timeline(): Map<String, Any?> =
+        synchronized(lock) {
+            nativeTimeline?.let { return@synchronized it.toMap() }
+            val snapshot = latestSnapshot
+            mapOf(
+                "events" to timeline.map(Map<String, Any?>::toMap),
+                "metrics" to
+                    mapOf(
+                        "reconnect_count" to
+                            (snapshot["reconnect_count"] as? Number)?.toLong(),
+                        "network_change_count" to if (lastNetworkGeneration != null) observedNetworkChanges else null,
+                        "current_smoothed_rtt_known" to false,
+                        "last_failure_code" to (snapshot["error_code"] as? String),
+                    ).filterValues { value -> value != null },
+                "dropped_event_count" to droppedTimelineEvents,
+                "source" to "platform",
+                "availability" to "inferred",
+            )
+        }
+
+    private fun complete(
+        runGeneration: Long,
+        sessionId: String,
+        mode: String,
+        snapshot: Map<String, Any?>,
+        controlReachable: Boolean,
+        eventStreamReachable: Boolean,
+        nativeLinked: Boolean,
+        nativeReady: Boolean,
+    ) {
+        val findings = CHECKS.map(::pendingFinding).toMutableList()
+        val started = System.nanoTime()
+        val budgetNanos = if (mode == "deep") 15_000_000_000L else 2_000_000_000L
+        for ((index, check) in CHECKS.withIndex()) {
+            val running =
+                synchronized(lock) {
+                    if (generation != runGeneration || session?.get("session_id") != sessionId) {
+                        return
+                    }
+                    findings[index] =
+                        findings[index] +
+                        mapOf(
+                            "status" to "running",
+                            "started_at_unix_milliseconds" to nowMillis(),
+                        )
+                    val next =
+                        requireNotNull(session) +
+                            mapOf(
+                                "current_check" to check.id,
+                                "findings" to findings.toList(),
+                                "progress_percent" to ((index * 100) / CHECKS.size),
+                                "summary" to summarize(findings),
+                            )
+                    session = next
+                    next
+                }
+            publishSession(running)
+
+            val checkStartedNanos = System.nanoTime()
+            val rawFinding =
+                try {
+                    if (System.nanoTime() - started >= budgetNanos) {
+                        NetworkDiagnosticChecks.result(check.id, "warning", "diagnostic_check_timed_out", "nq_retry")
+                    } else if (check.id in NetworkDiagnosticChecks.deepIds) {
+                        val dependency =
+                            if (check.id.startsWith(
+                                    "dns.",
+                                )
+                            ) {
+                                "dns.direct_encrypted_configuration"
+                            } else {
+                                "engine.configuration"
+                            }
+                        val dependencyReady =
+                            findings.firstOrNull { it["check_id"] == dependency }?.get("status") in
+                                setOf("passed", "warning")
+                        if (mode == "deep" && (!dependencyReady || !controlReachable || !nativeReady)) {
+                            NetworkDiagnosticChecks.result(check.id, "skipped", "diagnostic_dependency_failed")
+                        } else if (mode == "deep") {
+                            networkProbe(check.id) { synchronized(lock) { generation != runGeneration } }
+                        } else {
+                            NetworkDiagnosticChecks.result(check.id, "skipped", "diagnostic_requires_deep_mode")
+                        }
+                    } else if (check.id in NetworkDiagnosticChecks.standardIds) {
+                        if (!controlReachable) {
+                            NetworkDiagnosticChecks.result(check.id, "skipped", "nq_finding_unavailable")
+                        } else if (check.id == "dns.direct_encrypted_runtime_state" &&
+                            findings.firstOrNull { it["check_id"] == "dns.direct_encrypted_configuration" }?.get(
+                                "status",
+                            ) !in
+                            setOf("passed", "warning")
+                        ) {
+                            NetworkDiagnosticChecks.result(check.id, "skipped", "diagnostic_dependency_failed")
+                        } else {
+                            NetworkDiagnosticChecks.evaluate(check.id, snapshot, nowMillis())
+                        }
+                    } else {
+                        evaluate(
+                            check = check,
+                            mode = mode,
+                            snapshot = snapshot,
+                            controlReachable = controlReachable,
+                            eventStreamReachable = eventStreamReachable,
+                            nativeLinked = nativeLinked,
+                        )
+                    }
+                } catch (_: Exception) {
+                    NetworkDiagnosticChecks.result(
+                        check.id,
+                        "failed",
+                        "diagnostic_check_failed_internally",
+                        "export_diagnostics",
+                    ) +
+                        mapOf("failure" to fallbackFailure("INTERNAL"))
+                }
+            var finding =
+                DiagnosticMetadata.attach(rawFinding - "cleanup_confirmed", snapshot, nowMillis(), controlReachable) +
+                    mapOf(
+                        "duration_milliseconds" to
+                            ((System.nanoTime() - checkStartedNanos) / 1_000_000L).coerceAtLeast(0L),
+                    )
+            if (rawFinding["cleanup_confirmed"] == false) {
+                failUnconfirmedProbeCleanup(sessionId, finding)
+                return
+            }
+            val oldGeneration = DiagnosticMetadata.unsigned(snapshot["network_generation"])
+            val currentGeneration =
+                synchronized(lock) { DiagnosticMetadata.unsigned(latestSnapshot["network_generation"]) }
+            if (oldGeneration != null && currentGeneration != null && oldGeneration != currentGeneration &&
+                DiagnosticMetadata.source(check.id) in setOf("runtime", "platform", "active_probe")
+            ) {
+                finding =
+                    finding +
+                    mapOf("observation" to ((finding["observation"] as Map<*, *>) + ("availability" to "stale")))
+            }
+            val updated =
+                synchronized(lock) {
+                    if (generation != runGeneration || session?.get("session_id") != sessionId) {
+                        return
+                    }
+                    findings[index] = finding
+                    val next =
+                        requireNotNull(session) +
+                            mapOf(
+                                "current_check" to null,
+                                "findings" to findings.toList(),
+                                "progress_percent" to (((index + 1) * 100) / CHECKS.size),
+                                "summary" to summarize(findings),
+                            )
+                    session = next
+                    next
+                }
+            publishSession(updated)
+        }
+        val completed: Map<String, Any?>
+        synchronized(lock) {
+            if (generation != runGeneration || session?.get("session_id") != sessionId) return
+            completed =
+                requireNotNull(session) +
+                mapOf(
+                    "state" to "completed",
+                    "completed_at_unix_milliseconds" to nowMillis(),
+                    "current_check" to null,
+                    "progress_percent" to 100,
+                    "findings" to findings,
+                    "summary" to summarize(findings),
+                )
+            session = completed
+        }
+        publishSession(completed)
+    }
+
+    private fun failUnconfirmedProbeCleanup(
+        sessionId: String,
+        cleanupFinding: Map<String, Any?>,
+    ) {
+        val terminal =
+            synchronized(lock) {
+                val current = session ?: return
+                if (current["session_id"] != sessionId || current["state"] !in ACTIVE_STATES) return
+                val findings =
+                    (current["findings"] as? List<*>).orEmpty().mapNotNull(::stringMap).map { finding ->
+                        if (finding["check_id"] == cleanupFinding["check_id"]) {
+                            cleanupFinding
+                        } else if (finding["status"] in setOf("pending", "running")) {
+                            finding + mapOf("status" to "skipped", "summary_key" to "nq_finding_unavailable")
+                        } else {
+                            finding
+                        }
+                    }
+                (
+                    current +
+                        mapOf(
+                            "state" to "failed",
+                            "completed_at_unix_milliseconds" to nowMillis(),
+                            "current_check" to null,
+                            "progress_percent" to 100,
+                            "findings" to findings,
+                            "summary" to summarize(findings),
+                        )
+                ).also { session = it }
+            }
+        publishSession(terminal)
+    }
+
+    private fun evaluate(
+        check: Check,
+        mode: String,
+        snapshot: Map<String, Any?>,
+        controlReachable: Boolean,
+        eventStreamReachable: Boolean,
+        nativeLinked: Boolean,
+    ): Map<String, Any?> {
+        val phase = snapshot["phase"] as? String ?: "disconnected"
+        val connected = phase == "connected" || phase == "degraded"
+        val familyMask = DiagnosticMetadata.unsigned(snapshot["underlying_family_mask"])
+        val hasNetwork = snapshot["underlying_network_present"] == true
+        val tunOpen = snapshot["tun_fd_valid"] == true
+        val dnsCount = DiagnosticMetadata.unsigned(snapshot["dns_server_count"])
+        val activeFrontends = snapshot["active_frontends"] as? List<*> ?: emptyList<Any?>()
+        val tunnelIpv4Available = snapshot["tunnel_ipv4_available"] == true
+        val tunnelIpv6Available = snapshot["tunnel_ipv6_available"] == true
+        val platformStateObserved = controlReachable && snapshot["platform_state_observed"] == true
+        val errorCode = (snapshot["error_code"] as? String)?.takeIf(DiagnosticsContract.failureCodes::contains)
+        val status: String
+        val evidence = mutableListOf<String>()
+        var failure: Map<String, Any?>? = null
+
+        when (check.id) {
+            "engine.control_channel" -> {
+                status = if (controlReachable) "passed" else "failed"
+            }
+
+            "engine.event_stream" -> {
+                status = if (eventStreamReachable) "passed" else "warning"
+            }
+
+            "engine.capabilities" -> {
+                status = if (nativeLinked) "passed" else "failed"
+            }
+
+            "engine.configuration" -> {
+                status =
+                    if (!controlReachable) {
+                        "skipped"
+                    } else if (errorCode == "CONFIGURATION_INVALID") {
+                        "failed"
+                    } else {
+                        "warning"
+                    }
+            }
+
+            "engine.secure_storage_metadata" -> {
+                status = "skipped"
+            }
+
+            "frontend.socks_port" -> {
+                status =
+                    if (controlReachable && "socks5" in activeFrontends) "passed" else "skipped"
+            }
+
+            "frontend.http_port" -> {
+                status =
+                    if (controlReachable && "http" in activeFrontends) "passed" else "skipped"
+            }
+
+            "frontend.system_proxy_state" -> {
+                status = "skipped"
+            }
+
+            "physical.network_present" -> {
+                status =
+                    if (!platformStateObserved || snapshot["underlying_network_present"] !is Boolean) {
+                        "skipped"
+                    } else if (hasNetwork) {
+                        "passed"
+                    } else {
+                        "warning"
+                    }
+                evidence +=
+                    "network=${
+                        if (!platformStateObserved) {
+                            "unknown"
+                        } else if (hasNetwork) {
+                            "present"
+                        } else {
+                            "absent"
+                        }
+                    }"
+            }
+
+            "physical.ipv4_route" -> {
+                status = if (!platformStateObserved || familyMask == null) "skipped" else "warning"
+                if (platformStateObserved && familyMask != null) evidence += "family_mask=$familyMask"
+            }
+
+            "physical.ipv6_route" -> {
+                status = if (!platformStateObserved || familyMask == null) "skipped" else "warning"
+                if (platformStateObserved && familyMask != null) evidence += "family_mask=$familyMask"
+            }
+
+            "physical.dns_available" -> {
+                status =
+                    if (!platformStateObserved || dnsCount == null) {
+                        "skipped"
+                    } else {
+                        "warning"
+                    }
+                evidence +=
+                    if (platformStateObserved &&
+                        dnsCount != null
+                    ) {
+                        "dns_server_count=$dnsCount"
+                    } else {
+                        "dns_server_count=unknown"
+                    }
+            }
+
+            "physical.network_generation" -> {
+                val generation = DiagnosticMetadata.unsigned(snapshot["network_generation"])
+                status =
+                    if (!platformStateObserved) {
+                        "skipped"
+                    } else if (generation != null) {
+                        "passed"
+                    } else {
+                        "skipped"
+                    }
+                if (platformStateObserved) generation?.let { evidence += "network_generation=$it" }
+            }
+
+            "transport.h3_connect", "transport.h3_datagram" -> {
+                val l4 = snapshot["data_plane"] == "l4_proxy"
+                val verified = (snapshot["l4"] as? Map<*, *>)?.get("connect_verified") == true
+                status =
+                    if (l4 && (check.id == "transport.h3_datagram" || !verified)) {
+                        "skipped"
+                    } else {
+                        if (connected &&
+                            controlReachable &&
+                            snapshot["transport"] == "h3"
+                        ) {
+                            "passed"
+                        } else {
+                            "skipped"
+                        }
+                    }
+            }
+
+            "transport.h2_tcp", "transport.h2_tls", "transport.h2_connect" -> {
+                status =
+                    if (connected &&
+                        controlReachable &&
+                        snapshot["transport"] == "h2"
+                    ) {
+                        "passed"
+                    } else {
+                        "skipped"
+                    }
+            }
+
+            "transport.endpoint_pin" -> {
+                status =
+                    if (!controlReachable) {
+                        "skipped"
+                    } else if (errorCode == "ENDPOINT_PIN_MISMATCH") {
+                        "failed"
+                    } else {
+                        "skipped"
+                    }
+            }
+
+            "transport.fallback_policy" -> {
+                status = "skipped"
+            }
+
+            "tunnel.address_assignment" -> {
+                status =
+                    if (snapshot["data_plane"] == "l4_proxy") {
+                        "skipped"
+                    } else if (!platformStateObserved ||
+                        (snapshot["tunnel_ipv4_available"] !is Boolean && snapshot["tunnel_ipv6_available"] !is Boolean)
+                    ) {
+                        "skipped"
+                    } else if (
+                        connected &&
+                        tunOpen &&
+                        (tunnelIpv4Available || tunnelIpv6Available)
+                    ) {
+                        "passed"
+                    } else if (connected) {
+                        "failed"
+                    } else {
+                        "skipped"
+                    }
+            }
+
+            "tunnel.routes", "tunnel.dns" -> {
+                status =
+                    if (!platformStateObserved || snapshot["tun_fd_valid"] !is Boolean ||
+                        (!tunOpen && snapshot["data_plane"] == "l4_proxy")
+                    ) {
+                        "skipped"
+                    } else if (connected && tunOpen) {
+                        // The service confirms its configured state, but only an external
+                        // observer can prove effective OS routing or DNS ownership.
+                        "warning"
+                    } else if (connected) {
+                        "warning"
+                    } else {
+                        "skipped"
+                    }
+            }
+
+            "tunnel.first_packet" -> {
+                val downloaded = DiagnosticMetadata.unsigned(snapshot["downloaded_bytes"])
+                val uploaded = DiagnosticMetadata.unsigned(snapshot["uploaded_bytes"])
+                val bytes =
+                    if (downloaded != null &&
+                        uploaded != null
+                    ) {
+                        downloaded + minOf(uploaded, Long.MAX_VALUE - downloaded)
+                    } else {
+                        null
+                    }
+                status =
+                    if (!controlReachable || bytes == null) {
+                        "skipped"
+                    } else if (bytes > 0L) {
+                        "passed"
+                    } else if (snapshot["data_plane"] == "l4_proxy") {
+                        "skipped"
+                    } else if (connected) {
+                        "warning"
+                    } else {
+                        "skipped"
+                    }
+                if (controlReachable && bytes != null) evidence += "transferred_bytes=$bytes"
+            }
+
+            "tunnel.ipv4_egress", "tunnel.ipv6_egress" -> {
+                status = if (mode == "deep") "warning" else "skipped"
+            }
+
+            "protection.kill_switch" -> {
+                val killSwitchState = snapshot["kill_switch_state"] as? String
+                status =
+                    if (!platformStateObserved) {
+                        "skipped"
+                    } else {
+                        when (killSwitchState) {
+                            "active" -> "passed"
+                            "notApplicable" -> "skipped"
+                            else -> "warning"
+                        }
+                    }
+                evidence += "kill_switch=${killSwitchState ?: "unknown"}"
+            }
+
+            "protection.dns_path", "protection.route_ownership" -> {
+                status =
+                    if (connected && tunOpen) "warning" else "skipped"
+            }
+
+            "protection.recovery_journal" -> {
+                status =
+                    if (!platformStateObserved || snapshot["pending_cleanup"] !is Boolean) {
+                        "skipped"
+                    } else if (snapshot["pending_cleanup"] == true) {
+                        "failed"
+                    } else {
+                        "skipped"
+                    }
+            }
+
+            else -> {
+                status = "skipped"
+            }
+        }
+
+        if (status == "failed") {
+            val code = defaultFailureCode(check.id)
+            failure =
+                if (errorCode == code) failureFromSnapshot(snapshot) ?: fallbackFailure(code) else fallbackFailure(code)
+        }
+        return mapOf(
+            "check_id" to check.id,
+            "category" to check.category,
+            "status" to status,
+            "failure" to failure,
+            "severity" to
+                if (status == "failed") {
+                    "error"
+                } else if (status == "warning") {
+                    "warning"
+                } else {
+                    "info"
+                },
+            "summary_key" to summaryKey(check.id, status),
+            "remediation_key" to
+                if (check.id.endsWith("egress") || check.id in INDEPENDENT_OBSERVER_CHECKS) {
+                    "run_release_leak_gate"
+                } else if (status == "warning" || status == "failed") {
+                    "inspect_platform_state"
+                } else {
+                    "none"
+                },
+            "sanitized_evidence" to evidence,
+            "started_at_unix_milliseconds" to nowMillis(),
+            "duration_milliseconds" to 0L,
+        ).filterValues { value -> value != null }
+    }
+
+    private fun publishSession(value: Map<String, Any?>) {
+        // Delivery is supplemental; GetDiagnostics remains the authoritative snapshot.
+        runCatching { publish(mapOf("diagnostic_session" to value)) }
+    }
+
+    private fun summaryKey(
+        id: String,
+        status: String,
+    ): String =
+        when (id) {
+            "engine.control_channel" -> {
+                if (status ==
+                    "passed"
+                ) {
+                    "diagnostic_engine_control_ok"
+                } else {
+                    "diagnostics.$id.$status"
+                }
+            }
+
+            "engine.event_stream" -> {
+                if (status ==
+                    "passed"
+                ) {
+                    "diagnostic_event_stream_ok"
+                } else {
+                    "diagnostic_event_stream_unknown"
+                }
+            }
+
+            "engine.capabilities" -> {
+                if (status == "passed") "diagnostic_capabilities_ok" else "diagnostics.$id.$status"
+            }
+
+            "engine.configuration" -> {
+                if (status ==
+                    "failed"
+                ) {
+                    "diagnostic_configuration_invalid"
+                } else {
+                    "nq_finding_unavailable"
+                }
+            }
+
+            "engine.secure_storage_metadata" -> {
+                "diagnostic_secure_storage_not_supported"
+            }
+
+            "physical.ipv4_route" -> {
+                "diagnostic_ipv4_route_unknown"
+            }
+
+            "physical.ipv6_route" -> {
+                "diagnostic_ipv6_route_unknown"
+            }
+
+            "physical.dns_available" -> {
+                "diagnostic_physical_dns_unknown"
+            }
+
+            "physical.network_generation" -> {
+                if (status ==
+                    "passed"
+                ) {
+                    "diagnostic_network_generation_observed"
+                } else {
+                    "diagnostic_network_generation_unknown"
+                }
+            }
+
+            "transport.endpoint_pin" -> {
+                if (status ==
+                    "failed"
+                ) {
+                    "diagnostic_endpoint_pin_mismatch"
+                } else {
+                    "diagnostic_endpoint_pin_not_tested"
+                }
+            }
+
+            "transport.fallback_policy" -> {
+                "nq_finding_unavailable"
+            }
+
+            "tunnel.routes" -> {
+                "diagnostic_tunnel_routes_unknown"
+            }
+
+            "tunnel.dns" -> {
+                "diagnostic_tunnel_dns_unknown"
+            }
+
+            "tunnel.first_packet" -> {
+                if (status ==
+                    "passed"
+                ) {
+                    "diagnostic_first_packet_observed"
+                } else if (status ==
+                    "warning"
+                ) {
+                    "diagnostic_first_packet_not_observed"
+                } else {
+                    "diagnostic_first_packet_unknown"
+                }
+            }
+
+            "tunnel.ipv4_egress" -> {
+                "diagnostic_ipv4_egress_requires_external_observer"
+            }
+
+            "tunnel.ipv6_egress" -> {
+                "diagnostic_ipv6_egress_requires_external_observer"
+            }
+
+            "protection.dns_path" -> {
+                "diagnostic_dns_path_actual_state_unknown"
+            }
+
+            "protection.route_ownership" -> {
+                "diagnostic_route_ownership_actual_state_unknown"
+            }
+
+            "protection.recovery_journal" -> {
+                if (status ==
+                    "failed"
+                ) {
+                    "diagnostic_recovery_journal_pending_cleanup"
+                } else {
+                    "diagnostic_recovery_journal_not_supported"
+                }
+            }
+
+            else -> {
+                "diagnostics.$id.$status"
+            }
+        }
+
+    private fun appendTimeline(event: Map<String, Any?>) {
+        if (timeline.size == MAX_TIMELINE_EVENTS) {
+            timeline.removeFirst()
+            droppedTimelineEvents += 1
+        }
+        timeline.addLast(event)
+    }
+
+    private fun stringMap(value: Any?): Map<String, Any?>? {
+        val raw = value as? Map<*, *> ?: return null
+        if (raw.keys.any { key -> key !is String }) return null
+        return raw.entries.associate { (key, entryValue) -> (key as String) to entryValue }
+    }
+
+    private fun pendingFinding(check: Check): Map<String, Any?> =
+        mapOf(
+            "check_id" to check.id,
+            "category" to check.category,
+            "status" to "pending",
+            "severity" to "info",
+            "summary_key" to "diagnostics.${check.id}.pending",
+            "remediation_key" to "none",
+            "sanitized_evidence" to emptyList<String>(),
+        )
+
+    private fun summarize(findings: List<Map<String, Any?>>): Map<String, Long> =
+        mapOf(
+            "passed" to findings.count { it["status"] == "passed" }.toLong(),
+            "warnings" to findings.count { it["status"] == "warning" }.toLong(),
+            "failed" to findings.count { it["status"] == "failed" }.toLong(),
+            "skipped" to findings.count { it["status"] == "skipped" }.toLong(),
+            "cancelled" to findings.count { it["status"] == "cancelled" }.toLong(),
+        )
+
+    private fun emptySummary(): Map<String, Long> =
+        mapOf("passed" to 0L, "warnings" to 0L, "failed" to 0L, "skipped" to 0L, "cancelled" to 0L)
+
+    private fun failureFromSnapshot(snapshot: Map<String, Any?>): Map<String, Any?>? {
+        val code =
+            (snapshot["error_code"] as? String)?.takeIf(DiagnosticsContract.failureCodes::contains) ?: return null
+        val structured = stringMap(snapshot["failure"])
+        if (structured != null && structured["code"] == code) {
+            val stage = (structured["stage"] as? String)?.takeIf(DiagnosticMetadata.transportStages::contains)
+            if (stage != null) {
+                return mapOf(
+                    "code" to code,
+                    "stage" to stage,
+                    "transport" to
+                        (structured["transport"] as? String)?.takeIf { it in setOf("h2", "h3", "http2", "http3") },
+                    "address_family" to
+                        (structured["address_family"] as? String)?.takeIf { it in setOf("ipv4", "ipv6", "dual") },
+                    "retryable" to (structured["retryable"] as? Boolean ?: false),
+                    "fallback_allowed" to
+                        (structured["fallback_allowed"] as? Boolean ?: false),
+                    "severity" to
+                        (structured["severity"] as? String)?.takeIf {
+                            it in
+                                setOf("info", "warning", "error", "critical")
+                        },
+                    "remediation_key" to
+                        (structured["remediation_key"] as? String)?.takeIf(
+                            DiagnosticsContract.remediationKeys::contains,
+                        ),
+                    "sanitized_detail" to
+                        (structured["sanitized_detail"] as? String)?.takeIf(::safeFailureDetail),
+                ).filterValues { value -> value != null }
+            }
+        }
+        return fallbackFailure(code)
+    }
+
+    private fun fallbackFailure(code: String): Map<String, Any?> =
+        mapOf(
+            "code" to code,
+            "stage" to failureStage(code),
+            "retryable" to true,
+            "fallback_allowed" to (code in H3_FALLBACK_CODES),
+            "severity" to "error",
+            "remediation_key" to
+                if (code in H3_FALLBACK_CODES) "try_http2" else "inspect_platform_state",
+        )
+
+    private fun defaultFailureCode(checkId: String): String =
+        when (checkId) {
+            "engine.control_channel" -> "ENGINE_UNAVAILABLE"
+            "engine.capabilities" -> "VPN_SERVICE_UNAVAILABLE"
+            "engine.configuration" -> "CONFIGURATION_INVALID"
+            "transport.endpoint_pin" -> "ENDPOINT_PIN_MISMATCH"
+            "tunnel.address_assignment" -> "TUN_ADDRESS_MISSING"
+            "tunnel.routes" -> "ROUTE_APPLY_FAILED"
+            "tunnel.dns" -> "DNS_APPLY_FAILED"
+            "protection.recovery_journal" -> "PLATFORM_RECOVERY_PENDING"
+            else -> "INTERNAL"
+        }
+
+    private fun safeFailureDetail(value: String): Boolean =
+        value.length <= 64 &&
+            FAILURE_DETAIL_PREFIXES.any { prefix ->
+                value.removePrefix(prefix).let { suffix ->
+                    suffix.length < value.length &&
+                        suffix.isNotEmpty() &&
+                        suffix.all { character -> character in '0'..'9' }
+                }
+            }
+
+    private fun safeTransport(value: Any?): String? =
+        (value as? String)?.lowercase()?.takeIf { it == "h2" || it == "h3" }
+
+    private fun safeFamily(value: Any?): String? =
+        (value as? String)?.lowercase()?.takeIf { it == "ipv4" || it == "ipv6" || it == "dual" }
+
+    private fun phaseEvent(
+        phase: String,
+        previousPhase: String?,
+    ): String =
+        when (phase) {
+            "connectingH2" -> {
+                if (previousPhase == "connectingH3") "fallback_started" else "attempt_started"
+            }
+
+            "preparing", "connectingH3" -> {
+                "attempt_started"
+            }
+
+            "connected", "degraded" -> {
+                "tunnel_ready"
+            }
+
+            "reconnecting" -> {
+                "reconnect_scheduled"
+            }
+
+            "error" -> {
+                "failed"
+            }
+
+            else -> {
+                "disconnected"
+            }
+        }
+
+    private fun phaseStage(phase: String): String =
+        when (phase) {
+            "connectingH3" -> "quic_handshake"
+            "connectingH2" -> "tls_handshake"
+            "connected", "degraded" -> "tunnel_startup"
+            "error" -> "platform_recovery"
+            else -> "tunnel_startup"
+        }
+
+    private fun failureStage(code: String): String =
+        when {
+            code in LOCAL_FAILURE_CODES -> "diagnostics"
+            code.startsWith("H3_") -> "quic_handshake"
+            code == "H2_TLS_FAILED" -> "tls_handshake"
+            code.startsWith("H2_") -> "masque_connect"
+            code == "ENDPOINT_PIN_MISMATCH" -> "tls_handshake"
+            code.startsWith("PHYSICAL_") -> "endpoint_resolution"
+            code.startsWith("DNS_") -> "dns_apply"
+            code.startsWith("ROUTE_") -> "route_apply"
+            code.startsWith("KILL_SWITCH_") -> "kill_switch_apply"
+            code.startsWith("PACKET_SEND") || code == "SEND_QUEUE_FULL" -> "packet_send"
+            code.startsWith("PACKET_RECEIVE") -> "packet_receive"
+            else -> "platform_recovery"
+        }
+
+    private data class Check(
+        val id: String,
+        val category: String,
+    )
+
+    companion object {
+        private const val MAX_TIMELINE_EVENTS = 256
+        private val ACTIVE_STATES = setOf("pending", "running", "cancelling")
+        private val CONNECTION_START_PHASES = setOf("preparing", "connectingH3", "connectingH2")
+        private val FAILURE_DETAIL_PREFIXES =
+            setOf("attempt ", "status ", "generation ", "queue depth ")
+        private val H3_FALLBACK_CODES =
+            setOf(
+                "H3_UDP_UNREACHABLE",
+                "H3_HANDSHAKE_TIMEOUT",
+                "H3_PROTOCOL_ERROR",
+                "H3_DATAGRAM_UNAVAILABLE",
+                "H3_CONNECTION_CLOSED",
+            )
+        private val LOCAL_FAILURE_CODES =
+            setOf(
+                "INTERNAL",
+                "ENGINE_UNAVAILABLE",
+                "VPN_SERVICE_UNAVAILABLE",
+                "CONFIGURATION_INVALID",
+            )
+        private val INDEPENDENT_OBSERVER_CHECKS =
+            setOf("protection.dns_path", "protection.route_ownership")
+        private val CHECKS =
+            listOf(
+                Check("engine.control_channel", "local_component"),
+                Check("engine.event_stream", "local_component"),
+                Check("engine.capabilities", "local_component"),
+                Check("engine.configuration", "local_component"),
+                Check("engine.secure_storage_metadata", "local_component"),
+                Check("frontend.socks_port", "local_component"),
+                Check("frontend.http_port", "local_component"),
+                Check("frontend.system_proxy_state", "local_component"),
+                Check("physical.network_present", "physical_network"),
+                Check("physical.ipv4_route", "physical_network"),
+                Check("physical.ipv6_route", "physical_network"),
+                Check("physical.dns_available", "physical_network"),
+                Check("physical.network_generation", "physical_network"),
+                Check("transport.h3_connect", "transport"),
+                Check("transport.h3_datagram", "transport"),
+                Check("transport.h2_tcp", "transport"),
+                Check("transport.h2_tls", "transport"),
+                Check("transport.h2_connect", "transport"),
+                Check("transport.endpoint_pin", "transport"),
+                Check("transport.fallback_policy", "transport"),
+                Check("tunnel.address_assignment", "tunnel"),
+                Check("tunnel.routes", "tunnel"),
+                Check("tunnel.dns", "tunnel"),
+                Check("tunnel.first_packet", "tunnel"),
+                Check("tunnel.ipv4_egress", "tunnel"),
+                Check("tunnel.ipv6_egress", "tunnel"),
+                Check("protection.kill_switch", "protection"),
+                Check("protection.dns_path", "protection"),
+                Check("protection.route_ownership", "protection"),
+                Check("protection.recovery_journal", "recovery"),
+            ) +
+                NetworkDiagnosticChecks.standardIds.map {
+                    Check(
+                        it,
+                        if (it.startsWith("dns.")) "protection" else "transport",
+                    )
+                } +
+                NetworkDiagnosticChecks.deepIds.map { Check(it, "transport") }
+    }
+}

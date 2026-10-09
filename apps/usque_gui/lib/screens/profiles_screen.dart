@@ -107,55 +107,78 @@ class ProfilesScreen extends StatelessWidget {
       }
     } catch (_) {}
 
+    String wgPrivateKey = realKey;
+    String pubKey = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG7SxI8tsW8OR1A5tv/zCzVbCRRh2t87/kxnP6lAy0lkr7qYwu+ox+k3dr6w==";
+    String clientIpv4 = "172.16.0.2";
+    String clientIpv6 = "2606:4700:110:8::1";
+
+    if (realKey.trim().startsWith('{')) {
+      try {
+        final parsed = jsonDecode(realKey);
+        if (parsed is Map) {
+          if (parsed['private_key'] != null) wgPrivateKey = parsed['private_key'].toString();
+          if (parsed['ipv4'] != null) clientIpv4 = parsed['ipv4'].toString();
+          if (parsed['ipv6'] != null) clientIpv6 = parsed['ipv6'].toString();
+          if (parsed['endpoint_pub_key'] != null) {
+            String ep = parsed['endpoint_pub_key'].toString();
+            ep = ep.replaceAll('-----BEGIN PUBLIC KEY-----', '').replaceAll('-----END PUBLIC KEY-----', '');
+            ep = ep.replaceAll(' ', '').replaceAll('\n', '').replaceAll('\r', '').trim();
+            if (ep.isNotEmpty) pubKey = ep;
+          }
+        }
+      } catch (_) {}
+    }
+
+    final keyToUse = wgPrivateKey.isNotEmpty ? wgPrivateKey : '<MASQUE_KEY>';
+
     final Map<String, dynamic> rawMap = profile.toMap();
     final String standardJson = const JsonEncoder.withIndent('  ').convert(rawMap);
-    final keyToUse = realKey.isNotEmpty ? realKey : '<MASQUE_OR_WARP_KEY>';
 
     final Map<String, dynamic> fullMap = Map<String, dynamic>.from(rawMap);
     fullMap['wireguard'] = {
       'private_key': keyToUse,
-      'public_key': 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
-      'addresses': ['172.16.0.2/32', '2606:4700:110:8::1/128'],
+      'public_key': pubKey,
+      'addresses': ['$clientIpv4/32', '$clientIpv6/128'],
       'reserved': [0, 0, 0],
     };
     final String fullJson = const JsonEncoder.withIndent('  ').convert(fullMap);
 
-    final epServer = profile.endpointIpv4.isNotEmpty ? profile.endpointIpv4 : '162.159.197.2';
+    final epServer = profile.endpointIpv4.isNotEmpty ? profile.endpointIpv4 : '162.159.198.2';
     final epPort = profile.endpointPort > 0 ? profile.endpointPort : 443;
-    final epSni = profile.sni.isNotEmpty ? profile.sni : 'classroom.google.com';
+    final epSni = profile.sni.isNotEmpty ? profile.sni : 'web.whatsapp.com';
 
-    final String clashYaml = """msq-dfathu: &msq_dfathu
+    final String clashYaml = """msq-df: &msq_df
   type: masque
   private-key: $keyToUse
-  public-key: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG7SxI8tsW8OR1A5tv/zCzVbCRRh2t87/kxnP6lAy0lkr7qYwu+ox+k3dr6w==
-  ip: 100.96.0.6
-  ipv6: 2606:4700:cf1:1000::6
+  public-key: $pubKey
+  ip: $clientIpv4
+  ipv6: $clientIpv6
   mtu: 1280
   udp: true
   remote-dns-resolve: true
-  dns: [1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001]
+  dns: [1.1.1.1, 2606:4700:4700::1111]
 
 proxies:
-  - name: "${profile.name} WARP"
+  - name: "${profile.name} - MASQUE"
     server: $epServer
     port: $epPort
     sni: $epSni
-    <<: *msq_dfathu
+    <<: *msq_df
 
-  - name: "${profile.name} WARP h2"
+  - name: "${profile.name} - MASQUE h2"
     server: $epServer
     port: $epPort
     sni: $epSni
     network: h2
-    <<: *msq_dfathu
+    <<: *msq_df
 
 proxy-groups:
   - name: WARP
     type: select
     icon: https://www.vectorlogo.zone/logos/cloudflare/cloudflare-icon.svg
     proxies:
-      - "${profile.name} WARP"
-      - "${profile.name} WARP h2"
+      - "${profile.name} - MASQUE"
+      - "${profile.name} - MASQUE h2"
     url: 'http://speed.cloudflare.com/'
     interval: 300
 

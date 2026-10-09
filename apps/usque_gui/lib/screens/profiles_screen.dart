@@ -1,6 +1,6 @@
 import 'dart:convert';
-import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../core/app_strings.dart';
@@ -52,6 +52,7 @@ class ProfilesScreen extends StatelessWidget {
                   controller.identityStatus(profile.id),
                   strings,
                 ),
+                onExport: () => _showExportOptions(context, profile),
                 onDelete: () => _deleteProfile(context, profile, strings),
               ),
             )
@@ -93,6 +94,133 @@ class ProfilesScreen extends StatelessWidget {
         status: status,
         strings: strings,
       ),
+    );
+  }
+
+  Future<void> _showExportOptions(BuildContext context, UsqueProfile profile) async {
+    const platform = MethodChannel('com.usque.dfathu/engine');
+    String realKey = "";
+    try {
+      final res = await platform.invokeMethod<String>('getProfilePrivateKey', {'profile_id': profile.id});
+      if (res != null && res.isNotEmpty) {
+        realKey = res;
+      }
+    } catch (_) {}
+
+    final Map<String, dynamic> rawMap = profile.toMap();
+    final String standardJson = const JsonEncoder.withIndent('  ').convert(rawMap);
+    final keyToUse = realKey.isNotEmpty ? realKey : '<MASQUE_OR_WARP_KEY>';
+
+    final Map<String, dynamic> fullMap = Map<String, dynamic>.from(rawMap);
+    fullMap['wireguard'] = {
+      'private_key': keyToUse,
+      'public_key': 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
+      'addresses': ['172.16.0.2/32', '2606:4700:110:8::1/128'],
+      'reserved': [0, 0, 0],
+    };
+    final String fullJson = const JsonEncoder.withIndent('  ').convert(fullMap);
+
+    final epServer = profile.endpointIpv4.isNotEmpty ? profile.endpointIpv4 : '162.159.197.2';
+    final epPort = profile.endpointPort > 0 ? profile.endpointPort : 443;
+    final epSni = profile.sni.isNotEmpty ? profile.sni : 'classroom.google.com';
+
+    final String clashYaml = """msq-dfathu: &msq_dfathu
+  type: masque
+  private-key: $keyToUse
+  public-key: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEIaU7MToJm9NKp8YfGxR6r+/h4mcG7SxI8tsW8OR1A5tv/zCzVbCRRh2t87/kxnP6lAy0lkr7qYwu+ox+k3dr6w==
+  ip: 100.96.0.6
+  ipv6: 2606:4700:cf1:1000::6
+  mtu: 1280
+  udp: true
+  remote-dns-resolve: true
+  dns: [1.1.1.1, 1.0.0.1, 2606:4700:4700::1111, 2606:4700:4700::1001]
+
+proxies:
+  - name: "${profile.name} WARP"
+    server: $epServer
+    port: $epPort
+    sni: $epSni
+    <<: *msq_dfathu
+
+  - name: "${profile.name} WARP h2"
+    server: $epServer
+    port: $epPort
+    sni: $epSni
+    network: h2
+    <<: *msq_dfathu
+
+proxy-groups:
+  - name: WARP
+    type: select
+    icon: https://www.vectorlogo.zone/logos/cloudflare/cloudflare-icon.svg
+    proxies:
+      - "${profile.name} WARP"
+      - "${profile.name} WARP h2"
+    url: 'http://speed.cloudflare.com/'
+    interval: 300
+
+rules:
+  - MATCH,WARP
+""";
+
+    if (!context.mounted) return;
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Wrap(
+            children: [
+              ListTile(
+                title: Text(
+                  'Ekspor Profil: ${profile.name}',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                subtitle: const Text('Pilih format konfigurasi yang diinginkan'),
+              ),
+              const Divider(height: 1),
+              ListTile(
+                leading: const Icon(LucideIcons.fileCode, color: Colors.blue),
+                title: const Text('1. Config JSON (Standar)'),
+                subtitle: const Text('File konfigurasi profil asli bawaan'),
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: standardJson));
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Config JSON Standar disalin ke Clipboard!')),
+                  );
+                },
+              ),
+              ListTile(
+                leading: const Icon(LucideIcons.fileJson, color: Colors.green),
+                title: const Text('2. Config Full JSON'),
+                subtitle: const Text('JSON lengkap berisi profil dan kunci identitas'),
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: fullJson));
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Config Full JSON disalin ke Clipboard!')),
+                  );
+                },
+              ),
+              ListTile(
+                leading: const Icon(LucideIcons.fileText, color: Colors.orange),
+                title: const Text('3. Config Clash Meta / Mihomo (MASQUE)'),
+                subtitle: const Text('Format YAML MASQUE untuk Clash Meta / Mihomo'),
+                onTap: () {
+                  Clipboard.setData(ClipboardData(text: clashYaml));
+                  Navigator.pop(ctx);
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(content: Text('Config YAML MASQUE disalin ke Clipboard!')),
+                  );
+                },
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 
@@ -439,112 +567,6 @@ class _IdentityManagementDialogState extends State<_IdentityManagementDialog> {
 }
 
 class _ProfileRow extends StatelessWidget {
-
-  void _showExportOptions(BuildContext context, UsqueProfile profile) async {
-    const platform = MethodChannel('com.usque.dfathu/engine');
-
-    // Ambil private key asli via channel native
-    String realKey = "";
-    try {
-      final res = await platform.invokeMethod<String>('getProfilePrivateKey', {'profile_id': profile.id});
-      if (res != null && res.isNotEmpty) {
-        realKey = res;
-      }
-    } catch (_) {}
-
-    final Map<String, dynamic> rawMap = profile.toMap();
-    final String standardJson = const JsonEncoder.withIndent('  ').convert(rawMap);
-    
-    final keyToUse = realKey.isNotEmpty ? realKey : '<MASQUE_OR_WARP_KEY>';
-
-    // Siapkan Full JSON dengan private key asli
-    final Map<String, dynamic> fullMap = Map<String, dynamic>.from(rawMap);
-    fullMap['wireguard'] = {
-      'private_key': keyToUse,
-      'public_key': 'bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=',
-      'addresses': ['172.16.0.2/32', '2606:4700:110:8::1/128'],
-      'reserved': [0, 0, 0],
-    };
-    final String fullJson = const JsonEncoder.withIndent('  ').convert(fullMap);
-
-    // Siapkan Full YAML Clash Meta dengan private key asli
-    final String clashYaml = """# Format Clash Meta / Mihomo (WireGuard)
-proxies:
-  - name: "${profile.name}"
-    type: wireguard
-    server: ${profile.endpointIpv4.isNotEmpty ? profile.endpointIpv4 : "162.159.192.1"}
-    port: ${profile.endpointPort > 0 ? profile.endpointPort : 2408}
-    ip: 172.16.0.2
-    ipv6: 2606:4700:110:8::1
-    private-key: $keyToUse
-    public-key: bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=
-    udp: true
-    remote-dns-resolve: true
-    dns:
-      - 1.1.1.1
-      - 1.0.0.1
-""";
-
-    showModalBottomSheet(
-      context: context,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(16)),
-      ),
-      builder: (ctx) {
-        return SafeArea(
-          child: Wrap(
-            children: [
-              ListTile(
-                title: Text(
-                  'Ekspor Profil: ${profile.name}',
-                  style: const TextStyle(fontWeight: FontWeight.bold),
-                ),
-                subtitle: const Text('Pilih format konfigurasi yang diinginkan'),
-              ),
-              const Divider(height: 1),
-              ListTile(
-                leading: const Icon(LucideIcons.fileCode, color: Colors.blue),
-                title: const Text('1. Config JSON (Standar)'),
-                subtitle: const Text('File konfigurasi profil asli bawaan'),
-                onTap: () {
-                  Clipboard.setData(ClipboardData(text: standardJson));
-                  Navigator.pop(ctx);
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Config JSON Standar disalin ke Clipboard!')),
-                  );
-                },
-              ),
-              ListTile(
-                leading: const Icon(LucideIcons.fileJson, color: Colors.green),
-                title: const Text('2. Config Full JSON'),
-                subtitle: const Text('JSON lengkap berisi profil dan kunci identitas'),
-                onTap: () {
-                  Clipboard.setData(ClipboardData(text: fullJson));
-                  Navigator.pop(ctx);
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Config Full JSON disalin ke Clipboard!')),
-                  );
-                },
-              ),
-              ListTile(
-                leading: const Icon(LucideIcons.fileText, color: Colors.orange),
-                title: const Text('3. Config Full YAML (Clash Meta)'),
-                subtitle: const Text('Format node proxy WireGuard untuk Clash Meta / Mihomo'),
-                onTap: () {
-                  Clipboard.setData(ClipboardData(text: clashYaml));
-                  Navigator.pop(ctx);
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text('Config Clash YAML disalin ke Clipboard!')),
-                  );
-                },
-              ),
-            ],
-          ),
-        );
-      },
-    );
-  }
-
   const _ProfileRow({
     required this.profile,
     required this.active,
@@ -555,6 +577,7 @@ proxies:
     required this.onConfigureIdentity,
     required this.onEdit,
     required this.onManageIdentity,
+    required this.onExport,
     required this.onDelete,
   });
 
@@ -567,6 +590,7 @@ proxies:
   final VoidCallback onConfigureIdentity;
   final VoidCallback onEdit;
   final VoidCallback onManageIdentity;
+  final VoidCallback onExport;
   final VoidCallback onDelete;
 
   @override
@@ -641,9 +665,9 @@ proxies:
                     ),
                   ),
                 IconButton(
-                  tooltip: 'Ekspor Config',
+                  tooltip: 'Export Config',
+                  onPressed: onExport,
                   icon: const Icon(LucideIcons.share2),
-                  onPressed: () => _showExportOptions(context, profile),
                 ),
                 IconButton(
                   tooltip: strings.get('edit'),
@@ -741,15 +765,11 @@ String _accountIdentityLabel(ProfileIdentityStatus status, AppStrings strings) {
   return strings.get('warp_free');
 }
 
-/// One fact about a profile. Outlined rather than filled, so a card full of
-/// them still reads as a single object.
 class _ProfileTag extends StatelessWidget {
   const _ProfileTag({required this.icon, required this.label, this.tone});
 
   final IconData icon;
   final String label;
-
-  /// Overrides the neutral colour when the fact needs attention.
   final Color? tone;
 
   @override

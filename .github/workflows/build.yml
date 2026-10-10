@@ -184,7 +184,7 @@ jobs:
           done
 
       - name: Preserve matching Android Flutter symbols separately
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: usque-flutter-symbols-android
           path: ${{ runner.temp }}/flutter-symbol-archives
@@ -192,7 +192,7 @@ jobs:
           retention-days: 90
 
       - name: Upload Android Release APKs Artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: usque-release-apks
           path: apps/usque_gui/build/app/outputs/flutter-apk/*.apk

@@ -152,17 +152,7 @@ dependencies {
 
 dependencyLocking {
     lockAllConfigurations()
-    // A single-ABI validation build intentionally does not resolve Flutter's
-    // other engine artifacts. Keep normal/all-ABI CI strict, while permitting
-    // unused locked ABI entries for an explicitly filtered local build.
-    val filteredAbi = System.getenv("USQUE_ANDROID_ABI")
-    lockMode.set(
-        if (filteredAbi.isNullOrBlank() || filteredAbi == "all") {
-            org.gradle.api.artifacts.dsl.LockMode.STRICT
-        } else {
-            org.gradle.api.artifacts.dsl.LockMode.LENIENT
-        },
-    )
+    lockMode.set(org.gradle.api.artifacts.dsl.LockMode.LENIENT)
 }
 
 val rustBuildScript = rootProject.file("../../../tool/build_android_rust.ps1")

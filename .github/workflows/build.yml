@@ -1,4 +1,4 @@
-name: Build
+name: Build and Release APKs
 
 on:
   push:
@@ -6,6 +6,8 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+  release:
+    types: [published]
   workflow_dispatch:
 
 concurrency:
@@ -13,7 +15,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -24,13 +26,13 @@ env:
 
 jobs:
   android:
-    name: Android ARMv8, x64, ARMv7, and universal compile
+    name: Android ARMv8 and ARMv7 compile & release
     if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
     timeout-minutes: 240
     steps:
       - name: Checkout untrusted source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
 
@@ -38,7 +40,7 @@ jobs:
         run: python tool/check_openvpn_sources.py
 
       - name: Install Java
-        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
@@ -61,7 +63,8 @@ jobs:
           rustup toolchain install 1.97.1 --profile minimal --component clippy
           rustup default 1.97.1
           rustup target add \
-            aarch64-linux-android
+            aarch64-linux-android \
+            armv7-linux-androideabi
           android_sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
           test -n "$android_sdk"
           sdkmanager="$android_sdk/cmdline-tools/latest/bin/sdkmanager"
@@ -95,10 +98,9 @@ jobs:
             -validity 1 \
             -dname "CN=Untrusted Usque CI Build, O=Usque Development, C=XX"
 
-      - name: Build split and universal Release APKs without release secrets
+      - name: Build split Release APKs (arm64-v8a and armeabi-v7a)
         working-directory: apps/usque_gui
         env:
-          USQUE_ANDROID_ABI: arm64-v8a
           USQUE_ANDROID_KEYSTORE: ${{ runner.temp }}/usque-build-only.jks
           USQUE_ANDROID_STORE_PASSWORD: usque-build-only-password
           USQUE_ANDROID_KEY_ALIAS: usque-build-only
@@ -107,9 +109,8 @@ jobs:
           flutter --suppress-analytics build apk \
             --release \
             --split-per-abi \
-            --target-platform android-arm64 \
+            --target-platform android-arm,android-arm64 \
             --split-debug-info="$RUNNER_TEMP/flutter-symbols-android/split"
-            
 
       - name: Verify all APK architectures and release hygiene
         run: |
@@ -121,6 +122,7 @@ jobs:
           source_dir=apps/usque_gui/build/app/outputs/flutter-apk
           declare -A expected_abis=(
             [app-arm64-v8a-release.apk]="arm64-v8a"
+            [app-armeabi-v7a-release.apk]="armeabi-v7a"
           )
           count=0
           for name in "${!expected_abis[@]}"; do
@@ -162,7 +164,7 @@ jobs:
             "$apksigner" verify --verbose --print-certs "$apk"
             count=$((count + 1))
           done
-          test "$count" -eq 1
+          test "$count" -eq 2
           echo "ANDROID_BUILD_OK=$source_dir"
 
       - name: Archive matching Android Flutter symbols separately
@@ -172,7 +174,7 @@ jobs:
           set -euo pipefail
           version="$(sed -n 's/^version: //p' pubspec.yaml | tr -d '\r')"
           commit="$(git rev-parse HEAD)"
-          for abi in arm64-v8a; do
+          for abi in arm64-v8a armeabi-v7a; do
             python ../../tool/archive_flutter_symbols.py archive \
               --artifact "build/app/outputs/flutter-apk/app-$abi-release.apk" \
               --symbols "$RUNNER_TEMP/flutter-symbols-android/split" \
@@ -180,17 +182,16 @@ jobs:
               --version "$version" --source-commit "$commit" \
               --platform android --kind split --architecture "$abi"
           done
-# universal build skipped
 
       - name: Preserve matching Android Flutter symbols separately
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@v4
         with:
           name: usque-flutter-symbols-android
           path: ${{ runner.temp }}/flutter-symbol-archives
           if-no-files-found: error
           retention-days: 90
 
-      - name: Upload Android Release APKs
+      - name: Upload Android Release APKs Artifact
         uses: actions/upload-artifact@v4
         with:
           name: usque-release-apks
@@ -198,9 +199,18 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Publish APKs to GitHub Release
+        if: ${{ github.event_name == 'release' && github.event.action == 'published' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            apps/usque_gui/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
+            apps/usque_gui/build/app/outputs/flutter-apk/app-armeabi-v7a-release.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Remove ephemeral identity and compile output
         if: ${{ always() }}
         run: |
           rm -f "$RUNNER_TEMP/usque-build-only.jks"
           rm -rf apps/usque_gui/build apps/usque_gui/android/app/src/main/jniLibs
-

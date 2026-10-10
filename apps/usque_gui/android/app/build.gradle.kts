@@ -166,7 +166,7 @@ dependencyLocking {
 }
 
 val rustBuildScript = rootProject.file("../../../tool/build_android_rust.ps1")
-val rustAbiFilter = providers.environmentVariable("USQUE_ANDROID_ABI").orElse("arm64-v8a")
+val rustAbiFilter = providers.environmentVariable("USQUE_ANDROID_ABI").orElse("all")
 val powerShellExecutable =
     if (System.getProperty("os.name").startsWith("Windows", ignoreCase = true)) {
         "powershell.exe"

@@ -32,7 +32,7 @@ jobs:
     timeout-minutes: 240
     steps:
       - name: Checkout untrusted source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           persist-credentials: false
 

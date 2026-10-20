@@ -25,7 +25,6 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import rikka.shizuku.Shizuku
-import rikka.shizuku.ShizukuProcess
 import rikka.shizuku.ShizukuProvider
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -1013,8 +1012,16 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
 private fun execShizukuProcess(cmd: String): Int {
-        val process = ShizukuProcess.create(arrayOf("sh", "-c", cmd), null, null)
-        return process.waitFor()
+        val method = Shizuku::class.java.getDeclaredMethod(
+            "newProcess",
+            Array<String>::class.java,
+            Array<String>::class.java,
+            String::class.java
+        )
+        method.isAccessible = true
+        val proc = method.invoke(null, arrayOf("sh", "-c", cmd), null, null)
+        val waitForMethod = proc.javaClass.getMethod("waitFor")
+        return waitForMethod.invoke(proc) as Int
     }
 
     private fun checkShizuku(): Boolean {

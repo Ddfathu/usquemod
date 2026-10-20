@@ -439,6 +439,11 @@ class MainActivity : FlutterFragmentActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+        try {
+            Shizuku.addBinderReceivedListenerSticky {
+                // Binder Shizuku siap digunakan
+            }
+        } catch (_: Throwable) {}
         ensureEngineComponents()
         engineMethodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
         engineMethodChannel?.setMethodCallHandler { call, result ->
@@ -1012,6 +1017,9 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
 private fun execShizukuProcess(cmd: String): Int {
+        if (!Shizuku.pingBinder()) {
+            throw IllegalStateException("Shizuku belum berjalan atau izin belum aktif.")
+        }
         val method = Shizuku::class.java.getDeclaredMethod(
             "newProcess",
             Array<String>::class.java,
@@ -1019,9 +1027,8 @@ private fun execShizukuProcess(cmd: String): Int {
             String::class.java
         )
         method.isAccessible = true
-        val proc = method.invoke(null, arrayOf("sh", "-c", cmd), null, null)
-        val waitForMethod = proc.javaClass.getMethod("waitFor")
-        return waitForMethod.invoke(proc) as Int
+        val proc = method.invoke(null, arrayOf("sh", "-c", cmd), null, null) as java.lang.Process
+        return proc.waitFor()
     }
 
     private fun checkShizuku(): Boolean {
@@ -1076,7 +1083,15 @@ private fun execShizukuProcess(cmd: String): Int {
                     else -> runOnUiThread { result.success(false) }
                 }
             } catch (e: Throwable) {
-                runOnUiThread { result.error("EXEC_FAILED", e.message, null) }
+                var cause: Throwable? = e
+                while (cause is java.lang.reflect.InvocationTargetException && cause.targetException != null) {
+                    cause = cause.targetException
+                }
+                while (cause?.cause != null) {
+                    cause = cause.cause
+                }
+                val errMsg = cause?.message ?: cause?.toString() ?: "Unknown error"
+                runOnUiThread { result.error("EXEC_FAILED", errMsg, null) }
             }
         }
     }

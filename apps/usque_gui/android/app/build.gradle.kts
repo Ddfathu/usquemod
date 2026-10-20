@@ -139,6 +139,9 @@ flutter {
 }
 
 dependencies {
+    // Shizuku API & Provider for non-root system command execution
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
     implementation("androidx.activity:activity:1.13.0")
     testImplementation("junit:junit:4.13.2")
     // Host-side Android unit tests otherwise resolve org.json to framework stubs.

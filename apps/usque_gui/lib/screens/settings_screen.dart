@@ -1,3 +1,4 @@
+import 'package:flutter/services.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
@@ -196,6 +197,7 @@ class SettingsScreen extends StatelessWidget {
                         ),
                       ],
                       if (android) ...<Widget>[
+            const ReconnectSettingsSection(),
                         ListTile(
                           contentPadding: EdgeInsets.zero,
                           leading: const Icon(LucideIcons.panelTop),
@@ -820,6 +822,179 @@ class _Picker<T> extends StatelessWidget {
           ),
         ),
       ),
+    );
+  }
+}
+
+
+/// Komponen Pengaturan Reconnect Command & Auto IP Hunter
+class ReconnectSettingsSection extends StatefulWidget {
+  const ReconnectSettingsSection({super.key});
+
+  @override
+  State<ReconnectSettingsSection> createState() => _ReconnectSettingsSectionState();
+}
+
+class _ReconnectSettingsSectionState extends State<ReconnectSettingsSection> {
+  static const MethodChannel _platform = MethodChannel('com.usque.dfathu/engine');
+
+  bool _httpPingEnabled = true;
+  String _pingUrl = "https://dns.google";
+  String _reconnectCommand = "airplane_root"; // default ROOT
+
+  final Map<String, String> _commandLabels = {
+    'airplane_root': 'Airplane Mode ROOT',
+    'airplane_legacy_root': 'Airplane Mode Legacy ROOT',
+    'airplane_shizuku': 'Airplane Mode Shizuku',
+    'data_root': 'Mobile Data ROOT',
+    'data_shizuku': 'Mobile Data Shizuku',
+    'disabled': 'Disabled',
+  };
+
+  void _showCommandDialog() {
+    String selected = _reconnectCommand;
+    showDialog(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Reconnect Command'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: _commandLabels.entries.map((e) {
+                    return RadioListTile<String>(
+                      title: Text(e.value),
+                      value: e.key,
+                      groupValue: selected,
+                      onChanged: (val) {
+                        if (val != null) {
+                          setDialogState(() => selected = val);
+                        }
+                      },
+                    );
+                  }).toList(),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx),
+                  child: const Text('Cancel'),
+                ),
+                FilledButton(
+                  onPressed: () {
+                    setState(() => _reconnectCommand = selected);
+                    Navigator.pop(ctx);
+                  },
+                  child: const Text('OK'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _testReconnect() async {
+    if (_reconnectCommand == 'disabled') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Reconnect Command sedang Disabled!')),
+      );
+      return;
+    }
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Menjalankan ${_commandLabels[_reconnectCommand]}...')),
+    );
+    try {
+      final res = await _platform.invokeMethod<bool>(
+        'executeReconnectCommand',
+        {'mode': _reconnectCommand},
+      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(res == true ? 'Perintah berhasil dieksekusi!' : 'Gagal mengeksekusi perintah.')),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Error: $e')),
+        );
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const SizedBox(height: 16),
+        Text(
+          'HTTP Ping & Reconnect',
+          style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                color: Theme.of(context).colorScheme.primary,
+                fontWeight: FontWeight.bold,
+              ),
+        ),
+        const SizedBox(height: 8),
+        Card(
+          elevation: 0,
+          shape: RoundedRectangleBorder(
+            side: BorderSide(color: Theme.of(context).colorScheme.outlineVariant),
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Column(
+            children: [
+              SwitchListTile(
+                title: const Text('HTTP Ping'),
+                subtitle: const Text('Enable http ping after connected'),
+                value: _httpPingEnabled,
+                onChanged: (val) => setState(() => _httpPingEnabled = val),
+              ),
+              const Divider(height: 1),
+              ListTile(
+                title: const Text('URL'),
+                subtitle: Text(_pingUrl),
+                trailing: const Icon(LucideIcons.pencil, size: 18),
+                onTap: () async {
+                  final textCtrl = TextEditingController(text: _pingUrl);
+                  final newUrl = await showDialog<String>(
+                    context: context,
+                    builder: (ctx) => AlertDialog(
+                      title: const Text('Ping URL'),
+                      content: TextField(controller: textCtrl),
+                      actions: [
+                        TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
+                        FilledButton(onPressed: () => Navigator.pop(ctx, textCtrl.text.trim()), child: const Text('Save')),
+                      ],
+                    ),
+                  );
+                  if (newUrl != null && newUrl.isNotEmpty) {
+                    setState(() => _pingUrl = newUrl);
+                  }
+                },
+              ),
+              const Divider(height: 1),
+              ListTile(
+                title: const Text('Reconnect Command'),
+                subtitle: Text(_commandLabels[_reconnectCommand] ?? _reconnectCommand),
+                trailing: const Icon(LucideIcons.chevronRight, size: 18),
+                onTap: _showCommandDialog,
+              ),
+              const Divider(height: 1),
+              ListTile(
+                leading: const Icon(LucideIcons.refreshCw, color: Colors.teal),
+                title: const Text('Test Reconnect Now'),
+                subtitle: const Text('Jalankan perintah toggle secara manual'),
+                onTap: _testReconnect,
+              ),
+            ],
+          ),
+        ),
+      ],
     );
   }
 }

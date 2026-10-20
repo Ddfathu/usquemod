@@ -24,6 +24,10 @@ import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
+import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuProvider
+import java.io.BufferedReader
+import java.io.InputStreamReader
 import java.io.File
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.Executors
@@ -450,6 +454,11 @@ class MainActivity : FlutterFragmentActivity() {
                         result.error("CHAIN_FILE_UNAVAILABLE", "Paste the configuration text instead.", null)
                     }
                 }
+            } else if (call.method == "executeReconnectCommand") {
+                val mode = call.argument<String>("mode") ?: "disabled"
+                executeReconnect(mode, result)
+            } else if (call.method == "checkShizukuPermission") {
+                result.success(checkShizuku())
             } else if (call.method == "updatePlatformLocale") {
                 updatePlatformLocale(call.argument<String>("catalog_id"), result)
             } else {
@@ -1000,5 +1009,65 @@ class MainActivity : FlutterFragmentActivity() {
                     },
             ),
         )
+    }
+
+    private fun checkShizuku(): Boolean {
+        return try {
+            if (!Shizuku.pingBinder()) false
+            else Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
+    private fun executeReconnect(mode: String, result: MethodChannel.Result) {
+        Executors.newSingleThreadExecutor().execute {
+            try {
+                when (mode) {
+                    "airplane_root" -> {
+                        // Toggle Airplane Mode via root cmd connectivity
+                        val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "cmd connectivity airplane-mode enable && sleep 1 && cmd connectivity airplane-mode disable"))
+                        p.waitFor()
+                        runOnUiThread { result.success(true) }
+                    }
+                    "airplane_legacy_root" -> {
+                        // Legacy Android settings put global + broadcast intent
+                        val cmd = "settings put global airplane_mode_on 1 && am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true && sleep 1 && settings put global airplane_mode_on 0 && am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false"
+                        val p = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+                        p.waitFor()
+                        runOnUiThread { result.success(true) }
+                    }
+                    "data_root" -> {
+                        // Toggle Mobile Data via root svc
+                        val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "svc data disable && sleep 1 && svc data enable"))
+                        p.waitFor()
+                        runOnUiThread { result.success(true) }
+                    }
+                    "airplane_shizuku" -> {
+                        if (!checkShizuku()) {
+                            runOnUiThread { result.error("SHIZUKU_UNAVAILABLE", "Shizuku tidak aktif atau izin ditolak.", null) }
+                            return@execute
+                        }
+                        val cmd = "cmd connectivity airplane-mode enable && sleep 1 && cmd connectivity airplane-mode disable"
+                        val process = Shizuku.newProcess(arrayOf("sh", "-c", cmd), null, null)
+                        process.waitFor()
+                        runOnUiThread { result.success(true) }
+                    }
+                    "data_shizuku" -> {
+                        if (!checkShizuku()) {
+                            runOnUiThread { result.error("SHIZUKU_UNAVAILABLE", "Shizuku tidak aktif atau izin ditolak.", null) }
+                            return@execute
+                        }
+                        val cmd = "svc data disable && sleep 1 && svc data enable"
+                        val process = Shizuku.newProcess(arrayOf("sh", "-c", cmd), null, null)
+                        process.waitFor()
+                        runOnUiThread { result.success(true) }
+                    }
+                    else -> runOnUiThread { result.success(false) }
+                }
+            } catch (e: Throwable) {
+                runOnUiThread { result.error("EXEC_FAILED", e.message, null) }
+            }
+        }
     }
 }

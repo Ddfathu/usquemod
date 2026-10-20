@@ -365,17 +365,11 @@ class AppController extends ChangeNotifier {
   }
 
   UsqueProfile _hydrateAccount(UsqueProfile account) {
-    final zeroTrust =
-        identityStatus(account.id).provider == IdentityProvider.zeroTrust;
     return sharedNetwork.copyWith(
       id: account.id,
       name: account.name,
-      endpointIpv4: zeroTrust
-          ? account.endpointIpv4
-          : sharedNetwork.endpointIpv4,
-      endpointIpv6: zeroTrust
-          ? account.endpointIpv6
-          : sharedNetwork.endpointIpv6,
+      endpointIpv4: sharedNetwork.endpointIpv4,
+      endpointIpv6: sharedNetwork.endpointIpv6,
     );
   }
 
@@ -389,14 +383,7 @@ class AppController extends ChangeNotifier {
           identityStatus(profile.id).provider != IdentityProvider.zeroTrust,
       orElse: () => profiles.first,
     );
-    final zeroTrust =
-        identityStatus(source.id).provider == IdentityProvider.zeroTrust;
-    sharedNetwork = zeroTrust
-        ? source.copyWith(
-            endpointIpv4: UsqueProfile.defaultEndpointIpv4,
-            endpointIpv6: UsqueProfile.defaultEndpointIpv6,
-          )
-        : source;
+    sharedNetwork = source;
   }
 
   void _acceptNetworkSettings() {
@@ -408,10 +395,7 @@ class AppController extends ChangeNotifier {
     _acceptedSettings = state;
     final stored = state?.sharedNetwork ?? state?.storedProfile;
     if (stored != null) {
-      final managed =
-          state?.sharedNetwork == null &&
-          (_managedAccountIds.contains(stored.id) ||
-              identityStatus(stored.id).provider == IdentityProvider.zeroTrust);
+      const managed = false;
       sharedNetwork = managed
           ? stored.copyWith(
               endpointIpv4: sharedNetwork.endpointIpv4,
@@ -423,17 +407,14 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> initialize() async {
-    final dataGeneration = _dataGeneration;
     _bootstrapGeneration++;
-    _preferences = await SharedPreferences.getInstance();
-    if (_disposed || dataGeneration != _dataGeneration) return;
-    onboardingComplete = _preferences?.getBool('onboarding_complete') ?? true;
-    onboardingTermsAccepted =
-        _preferences?.getBool('onboarding_terms_accepted') ?? true;
-    onboardingStep = (_preferences?.getInt('onboarding_step') ?? 0).clamp(0, 3);
-    _onboardingProfileId = _preferences?.getString('onboarding_profile_id');
-    updateChecksEnabled =
-        _preferences?.getBool('update_checks_enabled') ?? true;
+    try {
+      _preferences = await SharedPreferences.getInstance();
+    } on Object {}
+    onboardingComplete = true;
+    onboardingTermsAccepted = true;
+    onboardingStep = 3;
+    updateChecksEnabled = _preferences?.getBool('update_checks_enabled') ?? true;
     themePreference = _enumByName(
       ThemePreference.values,
       _preferences?.getString('theme'),
@@ -444,33 +425,22 @@ class AppController extends ChangeNotifier {
       _preferences?.getString('locale'),
       LocalePreference.system,
     );
-    await _refreshProfileCatalog();
-    if (_disposed || dataGeneration != _dataGeneration) {
-      return;
-    }
-    // Onboarding bypassed
-    onboardingComplete = true;
-    onboardingTermsAccepted = true;
+    try {
+      await _refreshProfileCatalog();
+    } on Object {}
     try {
       final launchTarget = await _engine.consumeLaunchTarget();
-      if (_disposed || dataGeneration != _dataGeneration) return;
       if (launchTarget == 'profiles') {
         section = AppSection.profiles;
       }
-    } on Object {
-      // A launcher shortcut is optional and must not block initialization.
-    }
+    } on Object {}
     try {
       final platformPreferences = await _engine.platformPreferences();
-      if (_disposed || dataGeneration != _dataGeneration) return;
       startOnBoot = platformPreferences.startOnBoot;
       closeToTray = platformPreferences.closeToTray;
-    } on Object {
-      // Native shell preferences are optional in unsupported test hosts.
-    }
+    } on Object {}
     try {
       final perApp = await _engine.perAppProxy();
-      if (_disposed || dataGeneration != _dataGeneration) return;
       perAppProxy = perApp;
     } on Object {
       perAppProxy = const PerAppProxySettings();
@@ -478,7 +448,6 @@ class AppController extends ChangeNotifier {
     if (_engine.supportsSnapshotEvents) {
       unawaited(_subscribeToSnapshotEvents());
     }
-    if (_disposed || dataGeneration != _dataGeneration) return;
     initialized = true;
     _notifyListeners();
     unawaited(diagnostics.restore(silent: true));

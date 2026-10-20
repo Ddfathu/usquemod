@@ -109,11 +109,7 @@ class _AdvancedSettingsScreenState extends State<AdvancedSettingsScreen> {
     });
   }
 
-  bool get _zeroTrustEndpointIpsManaged =>
-      widget.controller
-          .identityStatus(widget.controller.activeProfile.id)
-          .provider ==
-      IdentityProvider.zeroTrust;
+  bool get _zeroTrustEndpointIpsManaged => false;
 
   @override
   void initState() {

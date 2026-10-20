@@ -1012,14 +1012,7 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
 private fun execShizukuProcess(cmd: String): Int {
-        val method = Shizuku::class.java.getDeclaredMethod(
-            "newProcess",
-            Array<String>::class.java,
-            Array<String>::class.java,
-            String::class.java
-        )
-        method.isAccessible = true
-        val process = method.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+        val process = Shizuku.newProcess(arrayOf("sh", "-c", cmd), null, null)
         return process.waitFor()
     }
 

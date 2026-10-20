@@ -228,16 +228,26 @@ class AppController extends ChangeNotifier {
     _snapshotRevision++;
     _snapshot = value;
 
-    final bool isConnecting = value.phase == ConnectionPhase.connectingH3 ||
-        value.phase == ConnectionPhase.connectingH2;
+    final bool isConnecting = value.phase == ConnectionPhase.preparing ||
+        value.phase == ConnectionPhase.connectingH3 ||
+        value.phase == ConnectionPhase.connectingH2 ||
+        value.phase == ConnectionPhase.reconnecting;
 
     if (!isConnecting) {
       _connectingTimeoutTimer?.cancel();
       _connectingTimeoutTimer = null;
     } else if (_connectingTimeoutTimer == null && !_isAutoHunting && autoReconnectTimeoutSeconds > 0) {
       _connectingTimeoutTimer = Timer(Duration(seconds: autoReconnectTimeoutSeconds), () async {
-        if (!_disposed && (snapshot.phase == ConnectionPhase.connectingH3 || snapshot.phase == ConnectionPhase.connectingH2)) {
-          await connectOrDisconnect();
+        if (!_disposed &&
+            (snapshot.phase == ConnectionPhase.preparing ||
+             snapshot.phase == ConnectionPhase.connectingH3 ||
+             snapshot.phase == ConnectionPhase.connectingH2 ||
+             snapshot.phase == ConnectionPhase.reconnecting)) {
+          try {
+            await disconnect();
+          } catch (_) {
+            await connectOrDisconnect();
+          }
           _triggerAutoIpHunter();
         }
       });

@@ -1,3 +1,4 @@
+import 'package:flutter/services.dart';
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
@@ -214,6 +215,11 @@ class AppController extends ChangeNotifier {
   ThemePreference themePreference = ThemePreference.system;
   LocalePreference localePreference = LocalePreference.system;
   AppSection section = AppSection.home;
+  // Auto IP Hunter / Auto Reconnect states
+  static const MethodChannel _reconnectChannel = MethodChannel('com.usque.dfathu/engine');
+  bool _isAutoHunting = false;
+  String autoReconnectCommand = 'airplane_root'; // Default: Airplane Mode ROOT
+
   EngineSnapshot _snapshot = const EngineSnapshot();
   EngineSnapshot get snapshot => _snapshot;
   set snapshot(EngineSnapshot value) {
@@ -226,8 +232,32 @@ class AppController extends ChangeNotifier {
         code: value.errorCode,
         details: value.warning,
       );
+      _triggerAutoIpHunter();
     }
     quality.updateConnection(value);
+  }
+
+  void _triggerAutoIpHunter() {
+    if (_isAutoHunting || autoReconnectCommand == 'disabled') return;
+    _isAutoHunting = true;
+    Future.microtask(() async {
+      try {
+        await _reconnectChannel.invokeMethod<bool>(
+          'executeReconnectCommand',
+          {'mode': autoReconnectCommand},
+        );
+        await Future.delayed(const Duration(milliseconds: 2500));
+        if (!_disposed &&
+            !snapshot.isConnected &&
+            snapshot.phase != ConnectionPhase.connectingH3 &&
+            snapshot.phase != ConnectionPhase.connectingH2) {
+          await connectOrDisconnect();
+        }
+      } catch (_) {
+      } finally {
+        _isAutoHunting = false;
+      }
+    });
   }
 
   NetworkQualitySnapshot? get networkQuality => quality.latest;

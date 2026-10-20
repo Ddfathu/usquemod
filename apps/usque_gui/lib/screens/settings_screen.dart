@@ -197,7 +197,7 @@ class SettingsScreen extends StatelessWidget {
                         ),
                       ],
                       if (android) ...<Widget>[
-            const ReconnectSettingsSection(),
+            ReconnectSettingsSection(controller: controller),
                         ListTile(
                           contentPadding: EdgeInsets.zero,
                           leading: const Icon(LucideIcons.panelTop),
@@ -829,7 +829,9 @@ class _Picker<T> extends StatelessWidget {
 
 /// Komponen Pengaturan Reconnect Command & Auto IP Hunter
 class ReconnectSettingsSection extends StatefulWidget {
-  const ReconnectSettingsSection({super.key});
+  const ReconnectSettingsSection({required this.controller, super.key});
+
+  final AppController controller;
 
   @override
   State<ReconnectSettingsSection> createState() => _ReconnectSettingsSectionState();
@@ -840,7 +842,13 @@ class _ReconnectSettingsSectionState extends State<ReconnectSettingsSection> {
 
   bool _httpPingEnabled = true;
   String _pingUrl = "https://dns.google";
-  String _reconnectCommand = "airplane_root"; // default ROOT
+  late String _reconnectCommand;
+
+  @override
+  void initState() {
+    super.initState();
+    _reconnectCommand = widget.controller.autoReconnectCommand;
+  }
 
   final Map<String, String> _commandLabels = {
     'airplane_root': 'Airplane Mode ROOT',
@@ -885,6 +893,8 @@ class _ReconnectSettingsSectionState extends State<ReconnectSettingsSection> {
                 FilledButton(
                   onPressed: () {
                     setState(() => _reconnectCommand = selected);
+                    widget.controller.autoReconnectCommand = selected;
+                    widget.controller.autoReconnectCommand = selected;
                     Navigator.pop(ctx);
                   },
                   child: const Text('OK'),

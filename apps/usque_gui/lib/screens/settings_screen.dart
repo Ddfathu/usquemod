@@ -995,6 +995,34 @@ class _ReconnectSettingsSectionState extends State<ReconnectSettingsSection> {
                 onTap: _showCommandDialog,
               ),
               const Divider(height: 1),
+        ListTile(
+          contentPadding: EdgeInsets.zero,
+          title: const Text('Connecting Timeout'),
+          subtitle: Text(
+            widget.controller.autoReconnectTimeoutSeconds == 0
+                ? 'Nonaktif'
+                : '${widget.controller.autoReconnectTimeoutSeconds} detik sebelum trigger mode pesawat',
+          ),
+          trailing: DropdownButton<int>(
+            value: widget.controller.autoReconnectTimeoutSeconds,
+            underline: const SizedBox(),
+            items: const [
+              DropdownMenuItem(value: 0, child: Text('Mati')),
+              DropdownMenuItem(value: 8, child: Text('8 dtk')),
+              DropdownMenuItem(value: 12, child: Text('12 dtk')),
+              DropdownMenuItem(value: 15, child: Text('15 dtk')),
+              DropdownMenuItem(value: 20, child: Text('20 dtk')),
+              DropdownMenuItem(value: 30, child: Text('30 dtk')),
+            ],
+            onChanged: (val) {
+              if (val != null) {
+                setState(() {
+                  widget.controller.autoReconnectTimeoutSeconds = val;
+                });
+              }
+            },
+          ),
+        ),
               ListTile(
                 leading: const Icon(LucideIcons.refreshCw, color: Colors.teal),
                 title: const Text('Test Reconnect Now'),

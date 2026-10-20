@@ -218,6 +218,8 @@ class AppController extends ChangeNotifier {
   // Auto IP Hunter / Auto Reconnect states
   static const MethodChannel _reconnectChannel = MethodChannel('com.usque.dfathu/engine');
   bool _isAutoHunting = false;
+  Timer? _connectingTimeoutTimer;
+  int autoReconnectTimeoutSeconds = 12; // Default 12 detik (0 = nonaktif)
   String autoReconnectCommand = 'airplane_root'; // Default: Airplane Mode ROOT
 
   EngineSnapshot _snapshot = const EngineSnapshot();
@@ -225,6 +227,22 @@ class AppController extends ChangeNotifier {
   set snapshot(EngineSnapshot value) {
     _snapshotRevision++;
     _snapshot = value;
+
+    final bool isConnecting = value.phase == ConnectionPhase.connectingH3 ||
+        value.phase == ConnectionPhase.connectingH2;
+
+    if (!isConnecting) {
+      _connectingTimeoutTimer?.cancel();
+      _connectingTimeoutTimer = null;
+    } else if (_connectingTimeoutTimer == null && !_isAutoHunting && autoReconnectTimeoutSeconds > 0) {
+      _connectingTimeoutTimer = Timer(Duration(seconds: autoReconnectTimeoutSeconds), () async {
+        if (!_disposed && (snapshot.phase == ConnectionPhase.connectingH3 || snapshot.phase == ConnectionPhase.connectingH2)) {
+          await connectOrDisconnect();
+          _triggerAutoIpHunter();
+        }
+      });
+    }
+
     if (value.phase == ConnectionPhase.error &&
         (value.errorCode != null || value.warning?.isNotEmpty == true)) {
       lastError = userFacingFailure(

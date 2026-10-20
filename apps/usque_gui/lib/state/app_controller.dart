@@ -243,11 +243,7 @@ class AppController extends ChangeNotifier {
              snapshot.phase == ConnectionPhase.connectingH3 ||
              snapshot.phase == ConnectionPhase.connectingH2 ||
              snapshot.phase == ConnectionPhase.reconnecting)) {
-          try {
-            await disconnect();
-          } catch (_) {
-            await connectOrDisconnect();
-          }
+          await connectOrDisconnect();
           _triggerAutoIpHunter();
         }
       });

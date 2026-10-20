@@ -25,6 +25,7 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
 import io.flutter.plugin.common.MethodChannel
 import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuProcess
 import rikka.shizuku.ShizukuProvider
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -1012,7 +1013,7 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
 private fun execShizukuProcess(cmd: String): Int {
-        val process = Shizuku.newProcess(arrayOf("sh", "-c", cmd), null, null)
+        val process = ShizukuProcess.create(arrayOf("sh", "-c", cmd), null, null)
         return process.waitFor()
     }
 

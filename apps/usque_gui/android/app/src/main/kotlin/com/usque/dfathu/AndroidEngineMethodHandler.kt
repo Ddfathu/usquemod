@@ -2809,24 +2809,21 @@ internal class AndroidEngineMethodHandler(
     }
 
     private fun consumerIdentityMetadata(identityJson: ByteArray?): ByteArray {
-        val entitlement =
-            runCatching {
-                identityJson
-                    ?.let { JSONObject(it.toString(Charsets.UTF_8)) }
-                    ?.optString("entitlement")
-            }.getOrNull()
+        val json = runCatching {
+            identityJson?.let { JSONObject(it.toString(Charsets.UTF_8)) }
+        }.getOrNull()
+
+        val provider = json?.optString("identity_provider")
+        val team = json?.optString("zero_trust_team")
+        if (provider == "zero_trust" && !team.isNullOrBlank()) {
+            return """{"version":1,"provider":"zero_trust","organization":"$team"}""".toByteArray(Charsets.UTF_8)
+        }
+
+        val entitlement = json?.optString("entitlement")
         return when (entitlement) {
-            "warp_plus" -> {
-                """{"version":1,"provider":"consumer","entitlement":"warp_plus"}"""
-            }
-
-            "free" -> {
-                """{"version":1,"provider":"consumer","entitlement":"free"}"""
-            }
-
-            else -> {
-                """{"version":1,"provider":"consumer"}"""
-            }
+            "warp_plus" -> """{"version":1,"provider":"consumer","entitlement":"warp_plus"}"""
+            "free" -> """{"version":1,"provider":"consumer","entitlement":"free"}"""
+            else -> """{"version":1,"provider":"consumer"}"""
         }.toByteArray(Charsets.UTF_8)
     }
 

@@ -24,6 +24,12 @@ class ProfilesScreen extends StatelessWidget {
       title: strings.get('profiles'),
       subtitle: strings.get('profiles_subtitle'),
       actions: <Widget>[
+        OutlinedButton.icon(
+          onPressed: () => _importProfileSecret(context),
+          icon: const Icon(LucideIcons.upload),
+          label: const Text('Import Secret'),
+        ),
+        const SizedBox(width: 8),
         FilledButton.icon(
           onPressed: () => _createProfile(context),
           icon: const Icon(LucideIcons.plus),
@@ -59,6 +65,66 @@ class ProfilesScreen extends StatelessWidget {
             .toList(growable: false),
       ),
     );
+  }
+
+  Future<void> _importProfileSecret(BuildContext context) async {
+    final nameController = TextEditingController();
+    final secretController = TextEditingController();
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('Import WARP Secret JSON'),
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: nameController,
+                decoration: const InputDecoration(
+                  labelText: 'Nama Profil (Opsional)',
+                  hintText: 'WARP Imported',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: secretController,
+                maxLines: 7,
+                decoration: const InputDecoration(
+                  labelText: 'WARP Secret JSON',
+                  hintText: 'Paste JSON secret di sini...',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogCtx).pop(false),
+            child: const Text('Batal'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogCtx).pop(true),
+            child: const Text('Import'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && secretController.text.trim().isNotEmpty) {
+      final profileName = nameController.text.trim().isEmpty ? 'WARP Imported' : nameController.text.trim();
+      final success = await controller.createProfileWithIdentity(
+        profileName,
+        method: IdentityProvisioningMethod.register,
+      );
+      if (success) {
+        final newProfileId = controller.activeProfileId;
+        if (newProfileId.isNotEmpty) {
+          await controller.importWarpSecret(newProfileId, secretController.text.trim());
+        }
+      }
+    }
   }
 
   Future<void> _createProfile(BuildContext context) async {

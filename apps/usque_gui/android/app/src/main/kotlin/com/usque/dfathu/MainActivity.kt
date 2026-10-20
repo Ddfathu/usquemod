@@ -1011,6 +1011,18 @@ class MainActivity : FlutterFragmentActivity() {
         )
     }
 
+private fun execShizukuProcess(cmd: String): Int {
+        val method = Shizuku::class.java.getDeclaredMethod(
+            "newProcess",
+            Array<String>::class.java,
+            Array<String>::class.java,
+            String::class.java
+        )
+        method.isAccessible = true
+        val process = method.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+        return process.waitFor()
+    }
+
     private fun checkShizuku(): Boolean {
         return try {
             if (!Shizuku.pingBinder()) false
@@ -1049,8 +1061,7 @@ class MainActivity : FlutterFragmentActivity() {
                             return@execute
                         }
                         val cmd = "cmd connectivity airplane-mode enable && sleep 1 && cmd connectivity airplane-mode disable"
-                        val process = Shizuku.newProcess(arrayOf("sh", "-c", cmd), null, null)
-                        process.waitFor()
+                        execShizukuProcess(cmd)
                         runOnUiThread { result.success(true) }
                     }
                     "data_shizuku" -> {
@@ -1059,8 +1070,7 @@ class MainActivity : FlutterFragmentActivity() {
                             return@execute
                         }
                         val cmd = "svc data disable && sleep 1 && svc data enable"
-                        val process = Shizuku.newProcess(arrayOf("sh", "-c", cmd), null, null)
-                        process.waitFor()
+                        execShizukuProcess(cmd)
                         runOnUiThread { result.success(true) }
                     }
                     else -> runOnUiThread { result.success(false) }

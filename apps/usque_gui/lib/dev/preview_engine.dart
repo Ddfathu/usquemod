@@ -340,6 +340,8 @@ class PreviewEngine
   @override
   Future<void> unbindLicenseKey(String profileId) async {}
   @override
+  Future<bool> importWarpSecret(String profileId, String secretJson) async => true;
+  @override
   Future<String?> exportWarpSecret(String profileId) async => _unavailable();
   @override
   Future<String?> consumeLaunchTarget() async => null;

@@ -180,8 +180,8 @@ class AppController extends ChangeNotifier {
   UpdateDownloadCancellation? _updateCancellation;
 
   bool initialized = false;
-  bool onboardingComplete = false;
-  bool onboardingTermsAccepted = false;
+  bool onboardingComplete = true;
+  bool onboardingTermsAccepted = true;
   int onboardingStep = 0;
   OnboardingPhase onboardingPhase = OnboardingPhase.idle;
   InitialIdentityState? initialIdentityState;
@@ -427,9 +427,9 @@ class AppController extends ChangeNotifier {
     _bootstrapGeneration++;
     _preferences = await SharedPreferences.getInstance();
     if (_disposed || dataGeneration != _dataGeneration) return;
-    onboardingComplete = _preferences?.getBool('onboarding_complete') ?? false;
+    onboardingComplete = _preferences?.getBool('onboarding_complete') ?? true;
     onboardingTermsAccepted =
-        _preferences?.getBool('onboarding_terms_accepted') ?? false;
+        _preferences?.getBool('onboarding_terms_accepted') ?? true;
     onboardingStep = (_preferences?.getInt('onboarding_step') ?? 0).clamp(0, 3);
     _onboardingProfileId = _preferences?.getString('onboarding_profile_id');
     updateChecksEnabled =
@@ -444,15 +444,13 @@ class AppController extends ChangeNotifier {
       _preferences?.getString('locale'),
       LocalePreference.system,
     );
-    await _loadProfiles();
+    await _refreshProfileCatalog();
     if (_disposed || dataGeneration != _dataGeneration) {
       return;
     }
-    if (!onboardingComplete) {
-      await refreshOnboardingPermissions();
-      await refreshInitialIdentityState();
-      if (_disposed || dataGeneration != _dataGeneration) return;
-    }
+    // Onboarding bypassed
+    onboardingComplete = true;
+    onboardingTermsAccepted = true;
     try {
       final launchTarget = await _engine.consumeLaunchTarget();
       if (_disposed || dataGeneration != _dataGeneration) return;
@@ -512,7 +510,7 @@ class AppController extends ChangeNotifier {
     final generation = _bootstrapGeneration;
     final intent = _connectionIntent;
     try {
-      if (!_profilesLoaded) await _loadProfiles();
+      if (!_profilesLoaded) await _refreshProfileCatalog();
       await Future.wait<void>([
         _refreshCapabilities(),
         refreshSnapshot(silent: true),
@@ -554,7 +552,7 @@ class AppController extends ChangeNotifier {
   }
 
   Future<void> _ensureConnectionInputs() async {
-    if (!_profilesLoaded) await _loadProfiles();
+    if (!_profilesLoaded) await _refreshProfileCatalog();
     if (!_profilesLoaded) {
       throw const EngineException(
         'ENGINE_UNAVAILABLE',
@@ -1404,6 +1402,20 @@ class AppController extends ChangeNotifier {
             /* Snapshot recovery reports any unconfirmed stop. */
           }),
     );
+  }
+
+  Future<bool> importWarpSecret(String profileId, String secretJson) async {
+    var imported = false;
+    final success = await _run(() async {
+      imported = await _engine.importWarpSecret(profileId, secretJson);
+    }, affectsConnection: false);
+    if (success && imported) {
+      lastNotice = 'WARP Secret imported successfully';
+      await _refreshProfileCatalog();
+      _notifyListeners();
+      return true;
+    }
+    return false;
   }
 
   Future<void> exportWarpSecret(String profileId) async {

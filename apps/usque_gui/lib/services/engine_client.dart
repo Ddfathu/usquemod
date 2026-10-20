@@ -122,6 +122,7 @@ abstract interface class EngineClient {
   Future<void> unbindLicenseKey(String profileId);
 
   Future<String?> exportWarpSecret(String profileId);
+  Future<bool> importWarpSecret(String profileId, String secretJson);
 
   Future<String?> consumeLaunchTarget();
 
@@ -789,6 +790,15 @@ class MethodChannelEngineClient
     'exportWarpSecret',
     <String, Object>{'profile_id': profileId},
   );
+
+  @override
+  Future<bool> importWarpSecret(String profileId, String secretJson) async {
+    final res = await _invoke<bool>(
+      'importWarpSecret',
+      <String, Object>{'profile_id': profileId, 'secret_json': secretJson},
+    );
+    return res ?? false;
+  }
 
   @override
   Future<EngineSnapshot> connect(UsqueProfile profile) async {

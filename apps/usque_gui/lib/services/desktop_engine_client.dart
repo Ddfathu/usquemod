@@ -428,6 +428,9 @@ class DesktopEngineClient
   }
 
   @override
+  Future<bool> importWarpSecret(String profileId, String secretJson) async => false;
+
+  @override
   Future<String?> exportWarpSecret(String profileId) async {
     final destination = await _transport.selectWarpSecretDestination();
     if (destination == null || destination.isEmpty) return null;

@@ -157,9 +157,7 @@ class _UsqueBootstrapState extends State<UsqueBootstrap> {
               : null,
           home: !view.initialized
               ? const _LoadingScreen()
-              : view.onboardingComplete
-              ? ShellScreen(controller: controller)
-              : OnboardingScreen(controller: controller),
+              : ShellScreen(controller: controller),
         );
       },
     );

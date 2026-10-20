@@ -447,6 +447,45 @@ class _IdentityManagementDialogState extends State<_IdentityManagementDialog> {
     }
   }
 
+  Future<void> _showImportSecretDialog(BuildContext context) async {
+    final textController = TextEditingController();
+    final navigator = Navigator.of(context);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('Import WARP Secret JSON'),
+        content: TextField(
+          controller: textController,
+          maxLines: 8,
+          decoration: const InputDecoration(
+            hintText: 'Paste warp secret JSON here...',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogCtx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(dialogCtx).pop(true),
+            child: const Text('Import'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true && textController.text.trim().isNotEmpty) {
+      final success = await widget.controller.importWarpSecret(
+        widget.profile.id,
+        textController.text.trim(),
+      );
+      if (success && mounted) {
+        navigator.pop();
+      }
+    }
+  }
+
   Future<void> _unbind() async {
     if (_busy) return;
     setState(() => _busy = true);
@@ -575,6 +614,13 @@ class _IdentityManagementDialogState extends State<_IdentityManagementDialog> {
                   : () => widget.controller.exportWarpSecret(widget.profile.id),
               icon: const Icon(LucideIcons.download),
               label: Text(widget.strings.get('export_warp_secret')),
+            ),
+            TextButton.icon(
+              onPressed: _busy
+                  ? null
+                  : () => _showImportSecretDialog(context),
+              icon: const Icon(LucideIcons.upload),
+              label: const Text('Import WARP Secret'),
             ),
           ],
         ],

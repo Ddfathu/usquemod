@@ -590,6 +590,10 @@ internal class AndroidEngineMethodHandler(
                 exportWarpSecret(call, result)
             }
 
+            "importWarpSecret" -> {
+                importWarpSecret(call, result)
+            }
+
             "consumeLaunchTarget" -> {
                 result.success(activityCommands.consumeLaunchTarget())
             }
@@ -1225,6 +1229,38 @@ internal class AndroidEngineMethodHandler(
                 }
             } finally {
                 license?.fill(0)
+            }
+        }
+    }
+
+    private fun importWarpSecret(
+        call: MethodCall,
+        result: MethodChannel.Result,
+    ) {
+        val profileId = call.argument<String>("profile_id")
+        val secretJson = call.argument<String>("secret_json")?.trim()
+        if (profileId.isNullOrBlank() || secretJson.isNullOrBlank()) {
+            result.error("INVALID_ARGUMENT", "Profile ID or Secret JSON is missing.", null)
+            return
+        }
+        identityExecutor.execute {
+            try {
+                val secretBytes = secretJson.toByteArray(Charsets.UTF_8)
+                val metadata = consumerIdentityMetadata(secretBytes)
+                identityStore.put(profileId, SecureIdentityStore.Record.WARP_SECRET, secretBytes)
+                identityStore.put(profileId, SecureIdentityStore.Record.MASQUE_PRIVATE_KEY, secretBytes)
+                identityStore.put(profileId, SecureIdentityStore.Record.IDENTITY_METADATA, metadata)
+                mainScheduler.post {
+                    result.success(true)
+                }
+            } catch (error: Exception) {
+                mainScheduler.post {
+                    result.error(
+                        "IMPORT_FAILED",
+                        "Failed to import WARP secret: ${error.message}",
+                        error.javaClass.simpleName,
+                    )
+                }
             }
         }
     }

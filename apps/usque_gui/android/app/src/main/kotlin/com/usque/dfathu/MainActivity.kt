@@ -1025,8 +1025,15 @@ private fun execShizukuProcess(cmd: String): Int {
 
     private fun checkShizuku(): Boolean {
         return try {
-            if (!Shizuku.pingBinder()) false
-            else Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+            if (!Shizuku.pingBinder()) {
+                false
+            } else {
+                try {
+                    Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
+                } catch (_: Throwable) {
+                    true
+                }
+            }
         } catch (_: Throwable) {
             false
         }

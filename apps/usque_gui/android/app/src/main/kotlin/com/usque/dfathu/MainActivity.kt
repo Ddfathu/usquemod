@@ -1063,19 +1063,11 @@ private fun execShizukuProcess(cmd: String): Int {
                         runOnUiThread { result.success(true) }
                     }
                     "airplane_shizuku" -> {
-                        if (!checkShizuku()) {
-                            runOnUiThread { result.error("SHIZUKU_UNAVAILABLE", "Shizuku tidak aktif atau izin ditolak.", null) }
-                            return@execute
-                        }
                         val cmd = "cmd connectivity airplane-mode enable && sleep 1 && cmd connectivity airplane-mode disable"
                         execShizukuProcess(cmd)
                         runOnUiThread { result.success(true) }
                     }
                     "data_shizuku" -> {
-                        if (!checkShizuku()) {
-                            runOnUiThread { result.error("SHIZUKU_UNAVAILABLE", "Shizuku tidak aktif atau izin ditolak.", null) }
-                            return@execute
-                        }
                         val cmd = "svc data disable && sleep 1 && svc data enable"
                         execShizukuProcess(cmd)
                         runOnUiThread { result.success(true) }

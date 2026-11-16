@@ -266,9 +266,14 @@ if ($CargoAction -eq "build") {
         New-Item -ItemType Directory -Path $injectTemp -Force | Out-Null
         $xrayVersion = "v26.11.9"
         $hevVersion = "2.20.0"
+        # Hanya arm64-v8a: Xray-core tidak merilis build Android armv7, dan
+        # build linux-arm32-v7a bertipe ET_EXEC (bukan ET_DYN) sehingga
+        # ditolak validasi ELF APK (verify_android_apk.py mewajibkan
+        # shared-object type 3 untuk semua .so). Mode Inject di APK
+        # armeabi-v7a akan melaporkan binary tidak tersedia; perangkat
+        # arm64 (mayoritas, termasuk POCO C75) tidak terpengaruh.
         $xrayAssets = @(
-            @{ Abi = "arm64-v8a"; File = "Xray-android-arm64-v8a.zip"; Sha256 = "edcefc25b9b3195b11e18624c8269a969d6aabc39c6298a9a5ab29de15d46f3b" },
-            @{ Abi = "armeabi-v7a"; File = "Xray-linux-arm32-v7a.zip"; Sha256 = "19c51e08a6562705fb1cb032a84fd87df21d7e27b194f035be7e754dbe3a97b3" }
+            @{ Abi = "arm64-v8a"; File = "Xray-android-arm64-v8a.zip"; Sha256 = "edcefc25b9b3195b11e18624c8269a969d6aabc39c6298a9a5ab29de15d46f3b" }
         )
         foreach ($asset in $xrayAssets) {
             $destDir = Join-Path $jniRoot $asset.Abi

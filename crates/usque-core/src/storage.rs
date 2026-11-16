@@ -299,6 +299,7 @@ impl AppConfig {
                         id: profile.id,
                         name: profile.name,
                         managed_endpoint_ips,
+                        endpoint_override: None,
                     }
                 })
                 .collect(),

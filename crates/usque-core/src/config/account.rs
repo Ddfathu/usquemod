@@ -43,6 +43,12 @@ pub struct Account {
         skip_serializing_if = "Option::is_none"
     )]
     pub managed_endpoint_ips: Option<ManagedEndpointIps>,
+    /// User-chosen endpoint IPv4/IPv6 override for a managed (Zero Trust)
+    /// account. Registration values stay in `managed_endpoint_ips`; when an
+    /// override is present it wins at hydrate time so the user's endpoint
+    /// edit survives reloads instead of silently reverting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_override: Option<ManagedEndpointIps>,
 }
 
 impl Account {
@@ -51,6 +57,7 @@ impl Account {
             id,
             name: name.into(),
             managed_endpoint_ips: None,
+            endpoint_override: None,
         }
     }
 

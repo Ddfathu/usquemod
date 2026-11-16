@@ -187,6 +187,7 @@ impl AppConfig {
                     id,
                     name,
                     managed_endpoint_ips: None,
+                    endpoint_override: None,
                 });
             }
             Some(index) => {
@@ -223,6 +224,7 @@ impl AppConfig {
             id,
             name,
             managed_endpoint_ips,
+            endpoint_override: None,
         });
         let profile = self
             .runtime_profile(id)
@@ -239,6 +241,24 @@ impl AppConfig {
         self.account_mut(id)
             .ok_or(ConfigError::MissingActiveProfile(id))?
             .managed_endpoint_ips = Some(managed_endpoint_ips);
+        let profile = self
+            .runtime_profile(id)
+            .ok_or(ConfigError::MissingActiveProfile(id))?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    /// Store (or clear, when `endpoint_override` is `None`) the user's
+    /// endpoint override for an account. Registration-owned addresses in
+    /// `managed_endpoint_ips` are left untouched.
+    pub fn set_endpoint_override(
+        &mut self,
+        id: Uuid,
+        endpoint_override: Option<ManagedEndpointIps>,
+    ) -> Result<Profile, ConfigError> {
+        self.account_mut(id)
+            .ok_or(ConfigError::MissingActiveProfile(id))?
+            .endpoint_override = endpoint_override;
         let profile = self
             .runtime_profile(id)
             .ok_or(ConfigError::MissingActiveProfile(id))?;

@@ -1612,9 +1612,22 @@ fn apply_profile_command(config_path: &str, request_json: &str) -> Result<String
             let binding = parse_identity_binding(identity_provider, organization)?;
             let profile = android_profile_to_core(*profile)?;
             let profile_id = profile.id;
-            let managed_endpoint_ips =
-                matches!(binding.as_ref(), Some(IdentityProvider::ZeroTrust { .. }))
-                    .then(|| ManagedEndpointIps::from_endpoint(&profile.endpoint));
+            // Only a first sync may seed the registration-owned endpoint.
+            // Later syncs carry the hydrated profile, whose endpoint may be
+            // the user's override; overwriting `managed_endpoint_ips` with
+            // it would corrupt the registration record and break the
+            // "edit back to clear the override" behaviour.
+            let managed_endpoint_ips = matches!(
+                binding.as_ref(),
+                Some(IdentityProvider::ZeroTrust { .. })
+            )
+            .then(|| ManagedEndpointIps::from_endpoint(&profile.endpoint))
+            .filter(|ips| ips.matches_zero_trust_contract())
+            .filter(|_| {
+                config
+                    .account(profile_id)
+                    .is_none_or(|account| account.managed_endpoint_ips.is_none())
+            });
             if let (Some(existing), Some(incoming)) =
                 (config.identity_bindings.get(&profile.id), binding.as_ref())
                 && existing != incoming
@@ -1733,7 +1746,8 @@ fn apply_profile_command(config_path: &str, request_json: &str) -> Result<String
             let profile = android_profile_to_core(*profile)?;
             let managed_endpoint_ips =
                 matches!(binding.as_ref(), Some(IdentityProvider::ZeroTrust { .. }))
-                    .then(|| ManagedEndpointIps::from_endpoint(&profile.endpoint));
+                    .then(|| ManagedEndpointIps::from_endpoint(&profile.endpoint))
+                    .filter(|ips| ips.matches_zero_trust_contract());
             if !config.pending_identity_creations.contains(&profile.id) {
                 return Err("profile identity creation was not prepared".to_owned());
             }
@@ -1820,7 +1834,8 @@ fn apply_profile_command(config_path: &str, request_json: &str) -> Result<String
             }
             let managed_endpoint_ips =
                 matches!(binding.as_ref(), Some(IdentityProvider::ZeroTrust { .. }))
-                    .then(|| ManagedEndpointIps::from_endpoint(&profile.endpoint));
+                    .then(|| ManagedEndpointIps::from_endpoint(&profile.endpoint))
+                    .filter(|ips| ips.matches_zero_trust_contract());
             if let (Some(existing), Some(incoming)) =
                 (config.identity_bindings.get(&profile_id), binding.as_ref())
                 && existing != incoming

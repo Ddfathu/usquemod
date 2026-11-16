@@ -221,6 +221,49 @@ class AppController extends ChangeNotifier {
   Timer? _connectingTimeoutTimer;
   int autoReconnectTimeoutSeconds = 12; // Default 12 detik (0 = nonaktif)
   String autoReconnectCommand = 'airplane_root'; // Default: Airplane Mode ROOT
+  bool httpPingEnabled = true;
+  String httpPingUrl = 'https://dns.google';
+
+  /// Satu master gate untuk semua pemicu Auto IP Hunter: fitur hanya aktif
+  /// kalau timeout > 0 DAN command bukan 'disabled'. Dulu dua pemicu
+  /// (timer timeout dan fase error) masing-masing cuma mengecek salah satu,
+  /// jadi mode pesawat tetap ke-trigger walau user sudah mematikan salah
+  /// satunya — dan karena nilainya tidak pernah disimpan, restart app
+  /// mengembalikan default ON.
+  bool get autoIpHunterEnabled =>
+      autoReconnectTimeoutSeconds > 0 && autoReconnectCommand != 'disabled';
+
+  Future<void> setAutoReconnectTimeout(int value) async {
+    autoReconnectTimeoutSeconds = value;
+    if (!autoIpHunterEnabled) {
+      _connectingTimeoutTimer?.cancel();
+      _connectingTimeoutTimer = null;
+    }
+    _notifyListeners();
+    await _preferences?.setInt('auto_reconnect_timeout_seconds', value);
+  }
+
+  Future<void> setAutoReconnectCommand(String value) async {
+    autoReconnectCommand = value;
+    if (!autoIpHunterEnabled) {
+      _connectingTimeoutTimer?.cancel();
+      _connectingTimeoutTimer = null;
+    }
+    _notifyListeners();
+    await _preferences?.setString('auto_reconnect_command', value);
+  }
+
+  Future<void> setHttpPingEnabled(bool value) async {
+    httpPingEnabled = value;
+    _notifyListeners();
+    await _preferences?.setBool('http_ping_enabled', value);
+  }
+
+  Future<void> setHttpPingUrl(String value) async {
+    httpPingUrl = value;
+    _notifyListeners();
+    await _preferences?.setString('http_ping_url', value);
+  }
 
   EngineSnapshot _snapshot = const EngineSnapshot();
   EngineSnapshot get snapshot => _snapshot;
@@ -236,9 +279,12 @@ class AppController extends ChangeNotifier {
     if (!isConnecting) {
       _connectingTimeoutTimer?.cancel();
       _connectingTimeoutTimer = null;
-    } else if (_connectingTimeoutTimer == null && !_isAutoHunting && autoReconnectTimeoutSeconds > 0) {
+    } else if (_connectingTimeoutTimer == null && !_isAutoHunting && autoIpHunterEnabled) {
       _connectingTimeoutTimer = Timer(Duration(seconds: autoReconnectTimeoutSeconds), () async {
+        // Cek ulang master gate saat timer benar-benar jalan: user bisa
+        // saja mematikan fitur setelah timer ini terjadwal.
         if (!_disposed &&
+            autoIpHunterEnabled &&
             (snapshot.phase == ConnectionPhase.preparing ||
              snapshot.phase == ConnectionPhase.connectingH3 ||
              snapshot.phase == ConnectionPhase.connectingH2 ||
@@ -262,7 +308,7 @@ class AppController extends ChangeNotifier {
   }
 
   void _triggerAutoIpHunter() {
-    if (_isAutoHunting || autoReconnectCommand == 'disabled') return;
+    if (_isAutoHunting || !autoIpHunterEnabled) return;
     _isAutoHunting = true;
     Future.microtask(() async {
       try {
@@ -415,6 +461,12 @@ class AppController extends ChangeNotifier {
     onboardingTermsAccepted = true;
     onboardingStep = 3;
     updateChecksEnabled = _preferences?.getBool('update_checks_enabled') ?? true;
+    autoReconnectTimeoutSeconds =
+        _preferences?.getInt('auto_reconnect_timeout_seconds') ?? 12;
+    autoReconnectCommand =
+        _preferences?.getString('auto_reconnect_command') ?? 'airplane_root';
+    httpPingEnabled = _preferences?.getBool('http_ping_enabled') ?? true;
+    httpPingUrl = _preferences?.getString('http_ping_url') ?? 'https://dns.google';
     themePreference = _enumByName(
       ThemePreference.values,
       _preferences?.getString('theme'),

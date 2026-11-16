@@ -7,7 +7,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{AppConfig, ConnectionPhase, Profile, ReconfigureClass, SharedNetworkSettings};
+use crate::{
+    AppConfig, ConnectionPhase, ManagedEndpointIps, Profile, ReconfigureClass,
+    SharedNetworkSettings,
+};
 
 macro_rules! network_fields {
     ($consumer:ident) => {
@@ -197,14 +200,17 @@ pub fn merge_patch(
         .account(patch.account_id)
         .is_some_and(|account| account.managed_endpoint_ips.is_some())
         || config.is_zero_trust_account(patch.account_id);
+    let endpoint_edited = patch
+        .changed_fields
+        .iter()
+        .any(|field| field == "endpoint.ipv4" || field == "endpoint.ipv6");
     for field in &patch.changed_fields {
-        if managed
-            && matches!(
-                field.as_str(),
-                "endpoint.ipv4" | "endpoint.ipv6" | "endpoint.selection"
-            )
-        {
-            return Err(SettingsError::ManagedEndpoint);
+        // Endpoint selection is not meaningful for a managed account:
+        // hydrate always reports it as Custom. Ignore the field instead of
+        // rejecting the whole save, which used to make every edit on a
+        // Zero Trust profile fail or silently revert.
+        if managed && field == "endpoint.selection" {
+            continue;
         }
         copy_field(&mut profile, &patch.values, field)?;
     }
@@ -216,6 +222,27 @@ pub fn merge_patch(
         network.endpoint.selection = config.network.endpoint.selection;
     }
     config.network = network;
+    if managed && endpoint_edited {
+        // Persist the user's endpoint edit as a per-account override. The
+        // shared network settings keep the previous endpoint so consumer
+        // accounts are unaffected, and the registration-owned addresses
+        // stay intact for reauthentication and rollback.
+        let managed_ips = config
+            .account(patch.account_id)
+            .and_then(|account| account.managed_endpoint_ips.clone());
+        let edited = ManagedEndpointIps {
+            ipv4: profile.endpoint.ipv4,
+            ipv6: profile.endpoint.ipv6,
+        };
+        let override_ips = if managed_ips.as_ref() == Some(&edited) {
+            None
+        } else {
+            Some(edited)
+        };
+        if let Some(account) = config.account_mut(patch.account_id) {
+            account.endpoint_override = override_ips;
+        }
+    }
     Ok(profile)
 }
 
@@ -542,11 +569,61 @@ mod tests {
             config.network.endpoint.selection,
             crate::EndpointSelection::Automatic
         );
+        // Selection edits on a managed account are ignored, not rejected:
+        // the save succeeds and hydrate keeps reporting Custom while the
+        // shared network mode is preserved.
         let edit = patch(&config, &["endpoint.selection"]);
-        assert!(matches!(
-            merge_patch(&mut config, &edit),
-            Err(SettingsError::ManagedEndpoint)
-        ));
+        let stored = merge_patch(&mut config, &edit).unwrap();
+        assert_eq!(stored.endpoint.selection, crate::EndpointSelection::Custom);
+        assert_eq!(
+            config.network.endpoint.selection,
+            crate::EndpointSelection::Automatic
+        );
+    }
+
+    #[test]
+    fn managed_account_endpoint_edit_is_stored_as_override() {
+        let mut config = AppConfig::default();
+        let id = config.active_profile_id.unwrap();
+        config
+            .set_managed_endpoint_ips(
+                id,
+                crate::ManagedEndpointIps {
+                    ipv4: "162.159.197.2".parse().unwrap(),
+                    ipv6: "2606:4700:102::2".parse().unwrap(),
+                },
+            )
+            .unwrap();
+        let mut edit = patch(&config, &["endpoint.ipv4", "endpoint.ipv6"]);
+        edit.values.endpoint.ipv4 = "162.159.198.5".parse().unwrap();
+        edit.values.endpoint.ipv6 = "2606:4700:103::5".parse().unwrap();
+        let stored = merge_patch(&mut config, &edit).unwrap();
+        assert_eq!(stored.endpoint.ipv4.to_string(), "162.159.198.5");
+        // The override survives a fresh runtime-profile read (hydrate).
+        let reread = config.active_profile().unwrap();
+        assert_eq!(reread.endpoint.ipv4.to_string(), "162.159.198.5");
+        assert_eq!(reread.endpoint.ipv6.to_string(), "2606:4700:103::5");
+        // Registration-owned addresses and the shared network endpoint are
+        // untouched by the user's override.
+        let account = config.account(id).unwrap();
+        assert_eq!(
+            account.managed_endpoint_ips.as_ref().unwrap().ipv4.to_string(),
+            "162.159.197.2"
+        );
+        assert_eq!(
+            account.endpoint_override.as_ref().unwrap().ipv4.to_string(),
+            "162.159.198.5"
+        );
+        assert_ne!(
+            config.network.endpoint.ipv4.to_string(),
+            "162.159.198.5"
+        );
+        // Editing back to the registration addresses clears the override.
+        let mut edit = patch(&config, &["endpoint.ipv4", "endpoint.ipv6"]);
+        edit.values.endpoint.ipv4 = "162.159.197.2".parse().unwrap();
+        edit.values.endpoint.ipv6 = "2606:4700:102::2".parse().unwrap();
+        merge_patch(&mut config, &edit).unwrap();
+        assert!(config.account(id).unwrap().endpoint_override.is_none());
     }
 
     #[test]

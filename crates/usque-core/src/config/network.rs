@@ -88,6 +88,14 @@ impl SharedNetworkSettings {
             endpoint.ipv6 = managed.ipv6;
             endpoint.selection = super::EndpointSelection::Custom;
         }
+        // A user endpoint override wins over the registration-owned
+        // addresses; without it a Zero Trust account's endpoint could never
+        // be changed because hydrate would always substitute `managed`.
+        if let Some(overridden) = &account.endpoint_override {
+            endpoint.ipv4 = overridden.ipv4;
+            endpoint.ipv6 = overridden.ipv6;
+            endpoint.selection = super::EndpointSelection::Custom;
+        }
         let mut profile = Profile {
             id: account.id,
             name: account.name.clone(),

@@ -840,14 +840,19 @@ class ReconnectSettingsSection extends StatefulWidget {
 class _ReconnectSettingsSectionState extends State<ReconnectSettingsSection> {
   static const MethodChannel _platform = MethodChannel('com.usque.dfathu/engine');
 
-  bool _httpPingEnabled = true;
-  String _pingUrl = "https://dns.google";
+  late bool _httpPingEnabled;
+  late String _pingUrl;
   late String _reconnectCommand;
 
   @override
   void initState() {
     super.initState();
     _reconnectCommand = widget.controller.autoReconnectCommand;
+    // Ambil dari controller (yang memuat nilai tersimpan), bukan default
+    // lokal — dulu dua field ini state lokal widget sehingga selalu reset
+    // dan tidak pernah tersimpan.
+    _httpPingEnabled = widget.controller.httpPingEnabled;
+    _pingUrl = widget.controller.httpPingUrl;
   }
 
   final Map<String, String> _commandLabels = {
@@ -893,8 +898,7 @@ class _ReconnectSettingsSectionState extends State<ReconnectSettingsSection> {
                 FilledButton(
                   onPressed: () {
                     setState(() => _reconnectCommand = selected);
-                    widget.controller.autoReconnectCommand = selected;
-                    widget.controller.autoReconnectCommand = selected;
+                    widget.controller.setAutoReconnectCommand(selected);
                     Navigator.pop(ctx);
                   },
                   child: const Text('OK'),
@@ -962,7 +966,10 @@ class _ReconnectSettingsSectionState extends State<ReconnectSettingsSection> {
                 title: const Text('HTTP Ping'),
                 subtitle: const Text('Enable http ping after connected'),
                 value: _httpPingEnabled,
-                onChanged: (val) => setState(() => _httpPingEnabled = val),
+                onChanged: (val) {
+                  setState(() => _httpPingEnabled = val);
+                  widget.controller.setHttpPingEnabled(val);
+                },
               ),
               const Divider(height: 1),
               ListTile(
@@ -984,6 +991,7 @@ class _ReconnectSettingsSectionState extends State<ReconnectSettingsSection> {
                   );
                   if (newUrl != null && newUrl.isNotEmpty) {
                     setState(() => _pingUrl = newUrl);
+                    widget.controller.setHttpPingUrl(newUrl);
                   }
                 },
               ),
@@ -1017,7 +1025,7 @@ class _ReconnectSettingsSectionState extends State<ReconnectSettingsSection> {
             onChanged: (val) {
               if (val != null) {
                 setState(() {
-                  widget.controller.autoReconnectTimeoutSeconds = val;
+                  widget.controller.setAutoReconnectTimeout(val);
                 });
               }
             },

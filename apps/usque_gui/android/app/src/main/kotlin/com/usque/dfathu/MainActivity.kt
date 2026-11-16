@@ -51,6 +51,7 @@ class MainActivity : FlutterFragmentActivity() {
     }
 
     private val identityExecutor = Executors.newSingleThreadExecutor()
+    private val reconnectExecutor = Executors.newSingleThreadExecutor()
 
     // Doctor cannot queue behind registration or account I/O. Only one active
     // session and its cancellation completion can occupy this executor.
@@ -1048,37 +1049,41 @@ private fun execShizukuProcess(cmd: String): Int {
     }
 
     private fun executeReconnect(mode: String, result: MethodChannel.Result) {
-        Executors.newSingleThreadExecutor().execute {
+        // Executor bersama: dulu setiap trigger membuat executor baru yang
+        // tidak pernah ditutup (bocor thread pelan-pelan).
+        reconnectExecutor.execute {
             try {
+                // Kode exit perintah sekarang dicek: dulu waitFor() diabaikan
+                // dan UI selalu menerima success(true) walau root ditolak.
                 when (mode) {
                     "airplane_root" -> {
                         // Toggle Airplane Mode via root cmd connectivity
                         val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "cmd connectivity airplane-mode enable && sleep 3 && cmd connectivity airplane-mode disable"))
-                        p.waitFor()
-                        runOnUiThread { result.success(true) }
+                        val exit = p.waitFor()
+                        runOnUiThread { result.success(exit == 0) }
                     }
                     "airplane_legacy_root" -> {
                         // Legacy Android settings put global + broadcast intent
                         val cmd = "settings put global airplane_mode_on 1 && am broadcast -a android.intent.action.AIRPLANE_MODE --ez state true && sleep 3 && settings put global airplane_mode_on 0 && am broadcast -a android.intent.action.AIRPLANE_MODE --ez state false"
                         val p = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
-                        p.waitFor()
-                        runOnUiThread { result.success(true) }
+                        val exit = p.waitFor()
+                        runOnUiThread { result.success(exit == 0) }
                     }
                     "data_root" -> {
                         // Toggle Mobile Data via root svc
                         val p = Runtime.getRuntime().exec(arrayOf("su", "-c", "svc data disable && sleep 3 && svc data enable"))
-                        p.waitFor()
-                        runOnUiThread { result.success(true) }
+                        val exit = p.waitFor()
+                        runOnUiThread { result.success(exit == 0) }
                     }
                     "airplane_shizuku" -> {
                         val cmd = "cmd connectivity airplane-mode enable && sleep 3 && cmd connectivity airplane-mode disable"
-                        execShizukuProcess(cmd)
-                        runOnUiThread { result.success(true) }
+                        val exit = execShizukuProcess(cmd)
+                        runOnUiThread { result.success(exit == 0) }
                     }
                     "data_shizuku" -> {
                         val cmd = "svc data disable && sleep 3 && svc data enable"
-                        execShizukuProcess(cmd)
-                        runOnUiThread { result.success(true) }
+                        val exit = execShizukuProcess(cmd)
+                        runOnUiThread { result.success(exit == 0) }
                     }
                     else -> runOnUiThread { result.success(false) }
                 }

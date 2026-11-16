@@ -7,6 +7,7 @@ import '../state/app_controller.dart';
 import '../widgets/controller_selector.dart';
 import '../widgets/section_navigator.dart';
 import 'chain_proxy_screen.dart';
+import 'inject_screen.dart';
 import 'proxy_screen.dart';
 
 /// The Proxy section and its chain-proxy subpage.
@@ -31,6 +32,7 @@ class ProxySection extends StatefulWidget {
 class ProxySectionState extends State<ProxySection> {
   late final _active = ValueNotifier(widget.active);
   MaterialPageRoute<void>? _gateRoute;
+  MaterialPageRoute<void>? _injectRoute;
 
   @override
   void didUpdateWidget(covariant ProxySection oldWidget) {
@@ -65,6 +67,23 @@ class ProxySectionState extends State<ProxySection> {
     }
   }
 
+  Future<void> openInject() async {
+    final section = widget.navigatorKey.currentState;
+    final navigator = section?.navigator;
+    if (_injectRoute != null || navigator == null || section!.closing) return;
+    final route = MaterialPageRoute<void>(
+      settings: const RouteSettings(name: '/proxy/inject'),
+      builder: (context) => const InjectScreen(),
+    );
+    _injectRoute = route;
+    try {
+      await navigator.push(route);
+      await route.completed;
+    } finally {
+      if (_injectRoute == route) _injectRoute = null;
+    }
+  }
+
   @override
   Widget build(BuildContext context) => SectionNavigator(
     key: widget.navigatorKey,
@@ -78,6 +97,7 @@ class ProxySectionState extends State<ProxySection> {
       builder: (context, _) => ProxyScreen(
         controller: widget.controller,
         onOpenVpnGate: () => unawaited(openVpnGate()),
+        onOpenInject: () => unawaited(openInject()),
       ),
     ),
   );

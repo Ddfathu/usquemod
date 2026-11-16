@@ -16,6 +16,7 @@ import '../widgets/common.dart';
 import '../widgets/local_proxy_outputs.dart';
 import '../widgets/save_changes_bar.dart';
 import 'chain_proxy_screen.dart';
+import 'inject_screen.dart';
 
 ({String key, bool username})? proxyAuthError(
   String username,
@@ -38,9 +39,15 @@ import 'chain_proxy_screen.dart';
 }
 
 class ProxyScreen extends StatefulWidget {
-  const ProxyScreen({required this.controller, this.onOpenVpnGate, super.key});
+  const ProxyScreen({
+    required this.controller,
+    this.onOpenVpnGate,
+    this.onOpenInject,
+    super.key,
+  });
   final AppController controller;
   final VoidCallback? onOpenVpnGate;
+  final VoidCallback? onOpenInject;
   @override
   State<ProxyScreen> createState() => _ProxyScreenState();
 }
@@ -319,6 +326,15 @@ class _ProxyScreenState extends State<ProxyScreen> {
                                 builder: (_) => ChainProxyScreen(
                                   controller: widget.controller,
                                 ),
+                              ),
+                            ),
+                      ),
+                      InjectEntry(
+                        onOpen:
+                            widget.onOpenInject ??
+                            () => Navigator.of(context).push<void>(
+                              MaterialPageRoute(
+                                builder: (_) => const InjectScreen(),
                               ),
                             ),
                       ),

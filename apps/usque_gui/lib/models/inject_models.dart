@@ -171,6 +171,22 @@ class XrayLink {
     'flow': flow,
     'remark': remark,
   };
+
+  factory XrayLink.fromMap(Map<String, dynamic> map) {
+    return XrayLink(
+      protocol: '${map['protocol'] ?? ''}',
+      address: '${map['address'] ?? ''}',
+      port: (map['port'] as num?)?.toInt() ?? 0,
+      id: '${map['id'] ?? ''}',
+      security: '${map['security'] ?? ''}',
+      transportType: '${map['transport_type'] ?? 'tcp'}',
+      host: '${map['host'] ?? ''}',
+      path: '${map['path'] ?? ''}',
+      sni: '${map['sni'] ?? ''}',
+      flow: '${map['flow'] ?? ''}',
+      remark: '${map['remark'] ?? ''}',
+    );
+  }
 }
 
 /// Akun SSH untuk mode SSH (tunnel -D / SOCKS lokal + payload opsional).

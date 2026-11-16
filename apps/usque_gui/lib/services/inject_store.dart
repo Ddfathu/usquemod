@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -43,6 +44,33 @@ abstract final class InjectStore {
   static Future<void> saveSelected(int index) async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(_selectedKey, index);
+  }
+
+  /// true bila teks impor berupa satu URL http(s) subscription
+  /// (mis. endpoint /sub panel) yang harus diunduh dulu isinya.
+  static bool looksLikeSubscriptionUrl(String text) {
+    final trimmed = text.trim();
+    return !trimmed.contains('\n') &&
+        (trimmed.startsWith('https://') || trimmed.startsWith('http://')) &&
+        !trimmed.contains(' ');
+  }
+
+  /// Unduh isi subscription dari [uri]; hasilnya teks mentah (blob
+  /// base64 atau daftar link) yang kemudian diolah [parseImport].
+  static Future<String> fetchSubscriptionText(Uri uri) async {
+    final client = HttpClient();
+    client.connectionTimeout = const Duration(seconds: 15);
+    client.userAgent = 'UsqueMod-Inject/1.0';
+    try {
+      final request = await client.getUrl(uri);
+      final response = await request.close();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException('HTTP ${response.statusCode}', uri: uri);
+      }
+      return await response.transform(utf8.decoder).join();
+    } finally {
+      client.close();
+    }
   }
 
   /// Parse teks impor: banyak link (satu per baris) atau satu blob

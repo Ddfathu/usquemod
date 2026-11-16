@@ -182,7 +182,7 @@ class _InjectScreenState extends State<InjectScreen> {
 
   Future<void> _showImportDialog() async {
     final textController = TextEditingController();
-    final imported = await showDialog<List<XrayLink>>(
+    final raw = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Import Config'),
@@ -191,8 +191,9 @@ class _InjectScreenState extends State<InjectScreen> {
           maxLines: 8,
           decoration: const InputDecoration(
             hintText:
-                'Tempel link vless:// / vmess:// / trojan:// / ss:// '
-                '(satu per baris) atau teks subscription base64…',
+                'Tempel URL subscription (mis. /sub panel kamu), atau link '
+                'vless:// / vmess:// / trojan:// / ss:// (satu per baris), '
+                'atau teks subscription base64…',
             border: OutlineInputBorder(),
           ),
         ),
@@ -202,14 +203,36 @@ class _InjectScreenState extends State<InjectScreen> {
             child: const Text('Batal'),
           ),
           FilledButton(
-            onPressed: () =>
-                Navigator.pop(ctx, InjectStore.parseImport(textController.text)),
+            onPressed: () => Navigator.pop(ctx, textController.text),
             child: const Text('Import'),
           ),
         ],
       ),
     );
-    if (imported == null || !mounted) return;
+    if (raw == null || raw.trim().isEmpty || !mounted) return;
+    var text = raw;
+    if (InjectStore.looksLikeSubscriptionUrl(raw)) {
+      showDialog<void>(
+        context: context,
+        barrierDismissible: false,
+        builder: (_) => const Center(child: CircularProgressIndicator()),
+      );
+      try {
+        text = await InjectStore.fetchSubscriptionText(
+          Uri.parse(raw.trim()),
+        );
+      } on Object catch (error) {
+        if (mounted) {
+          Navigator.of(context, rootNavigator: true).pop();
+          _showSnack('Gagal mengambil subscription: $error');
+        }
+        return;
+      }
+      if (!mounted) return;
+      Navigator.of(context, rootNavigator: true).pop();
+    }
+    final imported = InjectStore.parseImport(text);
+    if (!mounted) return;
     if (imported.isEmpty) {
       _showSnack('Tidak ada link valid yang terbaca.');
       return;

@@ -256,6 +256,83 @@ try {
     Pop-Location
 }
 
+# --- Inject mode natives (Fase 2a): Xray core + hev-socks5-tunnel ---------
+# Best-effort: kegagalan di blok ini tidak boleh menjatuhkan build utama
+# (MASQUE). Bila binary tidak terpasang, mode Inject di aplikasi akan
+# melaporkan "binary tidak tersedia" secara jujur.
+if ($CargoAction -eq "build") {
+    try {
+        $injectTemp = Join-Path ([System.IO.Path]::GetTempPath()) "usque-inject-natives"
+        New-Item -ItemType Directory -Path $injectTemp -Force | Out-Null
+        $xrayVersion = "v26.11.9"
+        $hevVersion = "2.20.0"
+        $xrayAssets = @(
+            @{ Abi = "arm64-v8a"; File = "Xray-android-arm64-v8a.zip"; Sha256 = "edcefc25b9b3195b11e18624c8269a969d6aabc39c6298a9a5ab29de15d46f3b" },
+            @{ Abi = "armeabi-v7a"; File = "Xray-linux-arm32-v7a.zip"; Sha256 = "19c51e08a6562705fb1cb032a84fd87df21d7e27b194f035be7e754dbe3a97b3" }
+        )
+        foreach ($asset in $xrayAssets) {
+            $destDir = Join-Path $jniRoot $asset.Abi
+            $destFile = Join-Path $destDir "libxray.so"
+            if (-not (Test-Path -LiteralPath $destFile)) {
+                $zipPath = Join-Path $injectTemp $asset.File
+                Invoke-WebRequest -Uri "https://github.com/XTLS/Xray-core/releases/download/$xrayVersion/$($asset.File)" -OutFile $zipPath
+                $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+                if ($hash -ne $asset.Sha256) {
+                    throw "SHA256 mismatch for $($asset.File): $hash"
+                }
+                New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+                $extractDir = Join-Path $injectTemp "xray-$($asset.Abi)"
+                Expand-Archive -LiteralPath $zipPath -DestinationPath $extractDir -Force
+                Copy-Item -LiteralPath (Join-Path $extractDir "xray") -Destination $destFile -Force
+            }
+            Write-Output "INJECT_XRAY_READY=$($asset.Abi)"
+        }
+
+        $hevLibName = "libhev-socks5-tunnel.so"
+        $hevMissing = $false
+        foreach ($abi in @("arm64-v8a", "armeabi-v7a")) {
+            if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $jniRoot $abi) $hevLibName))) {
+                $hevMissing = $true
+            }
+        }
+        if ($hevMissing) {
+            $hevTar = Join-Path $injectTemp "hev.tar.xz"
+            Invoke-WebRequest -Uri "https://github.com/heiher/hev-socks5-tunnel/releases/download/$hevVersion/hev-socks5-tunnel-$hevVersion.tar.xz" -OutFile $hevTar
+            $hevHash = (Get-FileHash -LiteralPath $hevTar -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hevHash -ne "bc2ce746a0beeb71030d3ffe299f5a9d48e2895902d3883c2cac1a551ee128e9") {
+                throw "SHA256 mismatch for hev tarball: $hevHash"
+            }
+            $hevSrc = Join-Path $injectTemp "hev-src"
+            New-Item -ItemType Directory -Path $hevSrc -Force | Out-Null
+            & tar -xf $hevTar -C $hevSrc --strip-components=1
+            if ($LASTEXITCODE -ne 0) {
+                throw "tar extract hev failed with exit code $LASTEXITCODE"
+            }
+            $ndkBuild = Join-Path $NdkRoot "build/ndk-build"
+            if (-not (Test-Path -LiteralPath $ndkBuild)) {
+                $ndkBuild = "$ndkBuild.cmd"
+            }
+            if (-not (Test-Path -LiteralPath $ndkBuild)) {
+                throw "ndk-build not found under $NdkRoot"
+            }
+            $hevLibs = Join-Path $injectTemp "hev-libs"
+            foreach ($abi in @("arm64-v8a", "armeabi-v7a")) {
+                $hevOut = Join-Path $injectTemp "hev-out-$abi"
+                & $ndkBuild -C $hevSrc "NDK_PROJECT_PATH=$hevSrc" "APP_BUILD_SCRIPT=$(Join-Path $hevSrc 'Android.mk')" "NDK_APPLICATION_MK=$(Join-Path $hevSrc 'Application.mk')" "NDK_OUT=$hevOut" "NDK_LIBS_OUT=$hevLibs" "APP_ABI=$abi" "-j4"
+                if ($LASTEXITCODE -ne 0) {
+                    throw "ndk-build hev failed for $abi with exit code $LASTEXITCODE"
+                }
+                $destDir = Join-Path $jniRoot $abi
+                New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+                Copy-Item -LiteralPath (Join-Path (Join-Path $hevLibs $abi) $hevLibName) -Destination (Join-Path $destDir $hevLibName) -Force
+                Write-Output "INJECT_HEV_READY=$abi"
+            }
+        }
+    } catch {
+        Write-Warning "Inject natives tidak terpasang (mode Inject akan nonaktif di APK ini): $($_.Exception.Message)"
+    }
+}
+
 if ($CargoAction -eq "clippy") {
     Write-Output "RUST_ANDROID_CLIPPY_OK=arm64-v8a"
 } else {

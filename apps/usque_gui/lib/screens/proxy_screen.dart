@@ -334,7 +334,8 @@ class _ProxyScreenState extends State<ProxyScreen> {
                             widget.onOpenInject ??
                             () => Navigator.of(context).push<void>(
                               MaterialPageRoute(
-                                builder: (_) => const InjectScreen(),
+                                builder: (_) =>
+                                    InjectScreen(controller: widget.controller),
                               ),
                             ),
                       ),

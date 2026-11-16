@@ -1,11 +1,15 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../models/app_models.dart';
 import '../models/inject_models.dart';
 import '../services/inject_store.dart';
 import '../services/xray_config.dart';
+import '../services/xray_engine.dart';
+import '../state/app_controller.dart';
 
 /// Pintu masuk mode Inject dari section Proxy (pola yang sama dengan
 /// ChainProxyEntry di proxy_screen.dart).
@@ -25,9 +29,7 @@ class InjectEntry extends StatelessWidget {
       child: ListTile(
         leading: const Icon(Icons.bolt_outlined),
         title: const Text('Inject — Xray'),
-        subtitle: const Text(
-          'Config VLESS / VMess / Trojan / SS (Fase 2a: import & config)',
-        ),
+        subtitle: const Text('Config VLESS / VMess / Trojan / SS'),
         trailing: const Icon(Icons.chevron_right),
         onTap: onOpen,
       ),
@@ -35,14 +37,16 @@ class InjectEntry extends StatelessWidget {
   }
 }
 
-/// Layar daftar config Xray untuk mode Inject (Fase 2a, lapis 1).
+/// Layar mode Inject (Fase 2a): daftar config Xray + koneksi VPN.
 ///
-/// Yang sudah jalan: import link / subscription, simpan lokal, pilih
-/// config aktif, dan hasilkan config JSON Xray yang siap dipakai.
-/// Yang belum: menjalankan xray-core native dan mengambil alih TUN —
-/// itu langkah berikutnya dan ditandai jujur di UI.
+/// Import link/subscription, simpan lokal, pilih config, lalu hubungkan:
+/// config JSON digenerate dari link terpilih dan dijalankan oleh
+/// XrayVpnService (xray-core native + hev tun2socks). Mode ini eksklusif
+/// terhadap MASQUE — tombol konek nonaktif selama MASQUE tersambung.
 class InjectScreen extends StatefulWidget {
-  const InjectScreen({super.key});
+  const InjectScreen({this.controller, super.key});
+
+  final AppController? controller;
 
   @override
   State<InjectScreen> createState() => _InjectScreenState();
@@ -52,11 +56,25 @@ class _InjectScreenState extends State<InjectScreen> {
   List<XrayLink> _links = const [];
   int _selected = -1;
   bool _loading = true;
+  bool _xrayRunning = false;
+  bool _xrayBusy = false;
+  String? _xrayError;
+
+  bool get _masqueActive {
+    final phase = widget.controller?.snapshot.phase;
+    if (phase == null) return false;
+    return phase != ConnectionPhase.disconnected &&
+        phase != ConnectionPhase.error;
+  }
+
+  XrayLink? get _selectedLink =>
+      _selected >= 0 && _selected < _links.length ? _links[_selected] : null;
 
   @override
   void initState() {
     super.initState();
     _load();
+    _refreshXrayStatus();
   }
 
   Future<void> _load() async {
@@ -68,6 +86,21 @@ class _InjectScreenState extends State<InjectScreen> {
       _selected = selected >= 0 && selected < links.length ? selected : -1;
       _loading = false;
     });
+  }
+
+  Future<void> _refreshXrayStatus() async {
+    try {
+      final status = await XrayEngine.status();
+      if (!mounted) return;
+      setState(() {
+        _xrayRunning = status.running;
+        _xrayError = status.error;
+      });
+    } on MissingPluginException {
+      // Platform tanpa channel Xray (mis. desktop); abaikan.
+    } on PlatformException {
+      // Channel belum siap; abaikan.
+    }
   }
 
   Future<void> _select(int index) async {
@@ -89,6 +122,62 @@ class _InjectScreenState extends State<InjectScreen> {
     });
     await InjectStore.saveLinks(links);
     await InjectStore.saveSelected(selected);
+  }
+
+  Future<void> _connect() async {
+    final link = _selectedLink;
+    if (link == null || _xrayBusy) return;
+    setState(() {
+      _xrayBusy = true;
+      _xrayError = null;
+    });
+    try {
+      final granted = await XrayEngine.prepare();
+      if (!mounted) return;
+      if (!granted) {
+        _showSnack('Izin VPN tidak diberikan.');
+        return;
+      }
+      final result = XrayConfig.generate(link);
+      final configJson = jsonEncode(result.config);
+      final label = link.remark.isEmpty
+          ? '${link.protocol} ${link.address}:${link.port}'
+          : link.remark;
+      await XrayEngine.start(configJson, label);
+      if (result.warnings.isNotEmpty && mounted) {
+        _showSnack(result.warnings.join(' '));
+      }
+      // Beri waktu service start (xray + TUN + hev), lalu baca status.
+      await Future<void>.delayed(const Duration(milliseconds: 1500));
+      await _refreshXrayStatus();
+      if (mounted && _xrayError != null) {
+        _showSnack(_xrayError!);
+      }
+    } on PlatformException catch (error) {
+      if (mounted) _showSnack(error.message ?? 'Gagal memulai mode Xray.');
+    } finally {
+      if (mounted) setState(() => _xrayBusy = false);
+    }
+  }
+
+  Future<void> _disconnect() async {
+    if (_xrayBusy) return;
+    setState(() => _xrayBusy = true);
+    try {
+      await XrayEngine.stop();
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      await _refreshXrayStatus();
+    } on PlatformException catch (error) {
+      if (mounted) _showSnack(error.message ?? 'Gagal menghentikan mode Xray.');
+    } finally {
+      if (mounted) setState(() => _xrayBusy = false);
+    }
+  }
+
+  void _showSnack(String message) {
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   Future<void> _showImportDialog() async {
@@ -113,10 +202,8 @@ class _InjectScreenState extends State<InjectScreen> {
             child: const Text('Batal'),
           ),
           FilledButton(
-            onPressed: () => Navigator.pop(
-              ctx,
-              InjectStore.parseImport(textController.text),
-            ),
+            onPressed: () =>
+                Navigator.pop(ctx, InjectStore.parseImport(textController.text)),
             child: const Text('Import'),
           ),
         ],
@@ -124,18 +211,14 @@ class _InjectScreenState extends State<InjectScreen> {
     );
     if (imported == null || !mounted) return;
     if (imported.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Tidak ada link valid yang terbaca.')),
-      );
+      _showSnack('Tidak ada link valid yang terbaca.');
       return;
     }
     final links = [..._links, ...imported];
     setState(() => _links = links);
     await InjectStore.saveLinks(links);
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('${imported.length} config ditambahkan.')),
-    );
+    _showSnack('${imported.length} config ditambahkan.');
   }
 
   void _showConfigJson(XrayLink link) {
@@ -157,9 +240,7 @@ class _InjectScreenState extends State<InjectScreen> {
                     padding: const EdgeInsets.only(bottom: 8),
                     child: Text(
                       result.warnings.join('\n'),
-                      style: TextStyle(
-                        color: Theme.of(ctx).colorScheme.error,
-                      ),
+                      style: TextStyle(color: Theme.of(ctx).colorScheme.error),
                     ),
                   ),
                 SelectableText(
@@ -187,6 +268,70 @@ class _InjectScreenState extends State<InjectScreen> {
     );
   }
 
+  Widget _statusCard(BuildContext context) {
+    final theme = Theme.of(context);
+    final String statusText;
+    if (_xrayRunning) {
+      statusText = 'Mode Xray: TERHUBUNG';
+    } else if (_xrayError != null) {
+      statusText = 'Mode Xray: gagal — $_xrayError';
+    } else if (_masqueActive) {
+      statusText = 'MASQUE sedang aktif. Putuskan dulu untuk memakai Xray.';
+    } else {
+      statusText = 'Mode Xray: tidak terhubung';
+    }
+    final canConnect =
+        !_xrayRunning && !_xrayBusy && !_masqueActive && _selectedLink != null;
+    return Card(
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        side: BorderSide(color: theme.colorScheme.outlineVariant),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  _xrayRunning ? Icons.check_circle : Icons.circle_outlined,
+                  color: _xrayRunning ? Colors.green : null,
+                ),
+                const SizedBox(width: 8),
+                Expanded(child: Text(statusText)),
+              ],
+            ),
+            const SizedBox(height: 12),
+            if (_xrayRunning)
+              FilledButton.icon(
+                onPressed: _xrayBusy ? null : _disconnect,
+                icon: const Icon(Icons.stop_circle_outlined),
+                label: const Text('Putuskan'),
+              )
+            else
+              FilledButton.icon(
+                onPressed: canConnect ? _connect : null,
+                icon: _xrayBusy
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.play_circle_outline),
+                label: Text(
+                  _selectedLink == null
+                      ? 'Pilih config dulu'
+                      : 'Hubungkan config terpilih',
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -204,14 +349,9 @@ class _InjectScreenState extends State<InjectScreen> {
           ? const Center(child: CircularProgressIndicator())
           : Column(
               children: [
-                const Padding(
-                  padding: EdgeInsets.fromLTRB(16, 12, 16, 4),
-                  child: Text(
-                    'Fase 2a (lapis 1): import, simpan, dan hasilkan config '
-                    'sudah jalan. Menjalankan xray-core native + TUN '
-                    'menyusul di langkah berikutnya.',
-                    style: TextStyle(fontSize: 12),
-                  ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
+                  child: _statusCard(context),
                 ),
                 Expanded(
                   child: _links.isEmpty

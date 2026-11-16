@@ -73,7 +73,7 @@ class ProxySectionState extends State<ProxySection> {
     if (_injectRoute != null || navigator == null || section!.closing) return;
     final route = MaterialPageRoute<void>(
       settings: const RouteSettings(name: '/proxy/inject'),
-      builder: (context) => const InjectScreen(),
+      builder: (context) => InjectScreen(controller: widget.controller),
     );
     _injectRoute = route;
     try {

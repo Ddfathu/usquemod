@@ -43,6 +43,7 @@ import java.util.concurrent.TimeUnit
 class MainActivity : FlutterFragmentActivity() {
     internal companion object {
         const val CHANNEL = "com.usque.dfathu/engine"
+        const val XRAY_CHANNEL = "com.usque.dfathu/xray"
         const val EVENT_CHANNEL = "com.usque.dfathu/engine_events"
         const val CREATE_DIAGNOSTICS_REQUEST = 1049
         const val ACTION_SHORTCUT_CONNECT = "com.usque.dfathu.SHORTCUT_CONNECT"
@@ -116,6 +117,14 @@ class MainActivity : FlutterFragmentActivity() {
         )
     private var pendingDiagnosticsResult: MethodChannel.Result? = null
     private var pendingChainFileResult: MethodChannel.Result? = null
+    private var xrayMethodChannel: MethodChannel? = null
+    private var pendingXrayPrepareResult: MethodChannel.Result? = null
+    private val xrayVpnPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { activityResult ->
+            val pending = pendingXrayPrepareResult
+            pendingXrayPrepareResult = null
+            pending?.success(activityResult.resultCode == Activity.RESULT_OK)
+        }
     private val chainFilePicker =
         registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
             val result = pendingChainFileResult
@@ -446,6 +455,57 @@ class MainActivity : FlutterFragmentActivity() {
             }
         } catch (_: Throwable) {}
         ensureEngineComponents()
+        xrayMethodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, XRAY_CHANNEL)
+        xrayMethodChannel?.setMethodCallHandler { call, result ->
+            when (call.method) {
+                "prepare" -> {
+                    val permissionIntent = VpnService.prepare(this)
+                    when {
+                        permissionIntent == null -> result.success(true)
+                        pendingXrayPrepareResult != null ->
+                            result.error(
+                                "XRAY_PREPARE_BUSY",
+                                "Permintaan izin VPN lain sedang berjalan.",
+                                null,
+                            )
+                        else -> {
+                            pendingXrayPrepareResult = result
+                            try {
+                                xrayVpnPermissionLauncher.launch(permissionIntent)
+                            } catch (error: Exception) {
+                                pendingXrayPrepareResult = null
+                                result.error("XRAY_PREPARE_FAILED", error.message, null)
+                            }
+                        }
+                    }
+                }
+                "start" -> {
+                    val config = call.argument<String>("config")
+                    val label = call.argument<String>("label") ?: "Xray"
+                    if (config.isNullOrBlank()) {
+                        result.error("XRAY_CONFIG_EMPTY", "Config Xray kosong.", null)
+                    } else {
+                        ContextCompat.startForegroundService(
+                            this,
+                            Intent(this, XrayVpnService::class.java)
+                                .setAction(XrayVpnService.ACTION_START)
+                                .putExtra(XrayVpnService.EXTRA_CONFIG_JSON, config)
+                                .putExtra(XrayVpnService.EXTRA_LABEL, label),
+                        )
+                        result.success(null)
+                    }
+                }
+                "stop" -> {
+                    startService(
+                        Intent(this, XrayVpnService::class.java)
+                            .setAction(XrayVpnService.ACTION_STOP),
+                    )
+                    result.success(null)
+                }
+                "status" -> result.success(XrayVpnService.status())
+                else -> result.notImplemented()
+            }
+        }
         engineMethodChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
         engineMethodChannel?.setMethodCallHandler { call, result ->
             if (call.method == "readChainConfigurations") {
@@ -552,6 +612,8 @@ class MainActivity : FlutterFragmentActivity() {
         cancelPendingUpdateOperation()
         AndroidUpdateInstaller.terminalListener = null
         engineMethodChannel = null
+        xrayMethodChannel = null
+        pendingXrayPrepareResult = null
         eventSink = null
         if (::controlClient.isInitialized) {
             controlClient.destroy()

@@ -79,6 +79,18 @@
                 android:value="Cloudflare WARP or experimental Zero Trust VPN tunnel or local proxy service" />
         </service>
         <service
+            android:name=".XrayVpnService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse|systemExempted"
+            android:permission="android.permission.BIND_VPN_SERVICE">
+            <intent-filter>
+                <action android:name="android.net.VpnService" />
+            </intent-filter>
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Xray inject VPN tunnel (Fase 2a)" />
+        </service>
+        <service
             android:name=".UsqueTileService"
             android:enabled="true"
             android:exported="true"

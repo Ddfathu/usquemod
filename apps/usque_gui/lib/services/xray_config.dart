@@ -142,12 +142,21 @@ abstract final class XrayConfig {
     }
     if (link.security == 'tls') {
       stream['security'] = 'tls';
+      // ALPN wajib cocok transport: WebSocket dan HTTPUpgrade hanya bisa
+      // HTTP/1.1 — bila 'h2' ikut ditawarkan, CDN seperti Cloudflare akan
+      // memilih h2 dan membalas frame HTTP/2, sehingga dial WebSocket
+      // gagal ("protocol h2 was given but is not supported").
+      final alpn = switch (link.transportType) {
+        'ws' || 'httpupgrade' => ['http/1.1'],
+        'grpc' => ['h2'],
+        _ => ['h2', 'http/1.1'],
+      };
       stream['tlsSettings'] = {
         'serverName': link.sni.isNotEmpty
             ? link.sni
             : (link.host.isNotEmpty ? link.host : link.address),
         'fingerprint': 'chrome',
-        'alpn': ['h2', 'http/1.1'],
+        'alpn': alpn,
       };
     } else if (link.security == 'reality') {
       warnings.add(

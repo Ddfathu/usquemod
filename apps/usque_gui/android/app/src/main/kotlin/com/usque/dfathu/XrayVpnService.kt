@@ -82,7 +82,14 @@ misc:
                     stopSelf()
                     return START_NOT_STICKY
                 }
-                startForeground(NOTIFICATION_ID, buildNotification(label))
+                try {
+                    startForeground(NOTIFICATION_ID, buildNotification(label))
+                } catch (t: Throwable) {
+                    lastError =
+                        "Gagal masuk foreground: ${t.javaClass.simpleName}: ${t.message ?: t.toString()}"
+                    stopSelf()
+                    return START_NOT_STICKY
+                }
                 startTunnel(configJson, label)
                 return START_STICKY
             }
@@ -114,6 +121,12 @@ misc:
                 if (!xrayBin.exists()) {
                     throw IllegalStateException(
                         "Binary Xray tidak tersedia untuk ABI perangkat ini.",
+                    )
+                }
+                val hevLib = File(applicationInfo.nativeLibraryDir, "libhev-socks5-tunnel.so")
+                if (!hevLib.exists()) {
+                    throw IllegalStateException(
+                        "Library hev tun2socks tidak ada di APK ini; artifact build tidak lengkap.",
                     )
                 }
                 val processBuilder =
@@ -172,12 +185,22 @@ misc:
                         )
                 tunDescriptor = descriptor
                 val fd = descriptor.detachFd()
-                if (!TProxyService.TProxyStartService(hevFile.absolutePath, fd)) {
+                val hevStarted =
+                    try {
+                        TProxyService.TProxyStartService(hevFile.absolutePath, fd)
+                    } catch (t: Throwable) {
+                        throw IllegalStateException(
+                            "hev tun2socks gagal dimuat: ${t.javaClass.simpleName}: ${t.message ?: t.toString()}",
+                            t,
+                        )
+                    }
+                if (!hevStarted) {
                     throw IllegalStateException("hev tun2socks gagal start.")
                 }
                 isRunning = true
-            } catch (error: Exception) {
-                lastError = error.message ?: error.toString()
+            } catch (error: Throwable) {
+                lastError =
+                    "${error.javaClass.simpleName}: ${error.message ?: error.toString()}"
                 stopTunnel()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()

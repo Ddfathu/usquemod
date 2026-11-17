@@ -62,6 +62,36 @@ misc:
         var lastError: String? = null
             private set
 
+        @Volatile
+        private var hevLoadTried: Boolean = false
+
+        @Volatile
+        private var hevLoadError: String? = null
+
+        /**
+         * Memuat libhev-socks5-tunnel secara eksplisit dan menangkap pesan
+         * dlopen aslinya. Tanpa ini, kegagalan load pertama tertelan di
+         * stopTunnel dan akses berikutnya hanya melaporkan
+         * NoClassDefFoundError tanpa penyebab. Mengembalikan null bila
+         * library berhasil dimuat.
+         */
+        fun hevLoadFailure(): String? {
+            if (!hevLoadTried) {
+                synchronized(this) {
+                    if (!hevLoadTried) {
+                        hevLoadTried = true
+                        try {
+                            System.loadLibrary("hev-socks5-tunnel")
+                        } catch (t: Throwable) {
+                            hevLoadError =
+                                "${t.javaClass.simpleName}: ${t.message ?: t.toString()}"
+                        }
+                    }
+                }
+            }
+            return hevLoadError
+        }
+
         fun status(): Map<String, Any?> =
             mapOf(
                 "running" to isRunning,
@@ -71,6 +101,8 @@ misc:
 
     private var xrayProcess: Process? = null
     private var tunDescriptor: ParcelFileDescriptor? = null
+    private var tunFd: Int = -1
+    private var hevRunning: Boolean = false
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
@@ -129,6 +161,11 @@ misc:
                         "Library hev tun2socks tidak ada di APK ini; artifact build tidak lengkap.",
                     )
                 }
+                hevLoadFailure()?.let { failure ->
+                    throw IllegalStateException(
+                        "Library hev gagal dimuat di perangkat ini: $failure",
+                    )
+                }
                 val processBuilder =
                     ProcessBuilder(
                         xrayBin.absolutePath,
@@ -185,6 +222,7 @@ misc:
                         )
                 tunDescriptor = descriptor
                 val fd = descriptor.detachFd()
+                tunFd = fd
                 val hevStarted =
                     try {
                         TProxyService.TProxyStartService(hevFile.absolutePath, fd)
@@ -197,6 +235,7 @@ misc:
                 if (!hevStarted) {
                     throw IllegalStateException("hev tun2socks gagal start.")
                 }
+                hevRunning = true
                 isRunning = true
             } catch (error: Throwable) {
                 lastError =
@@ -226,15 +265,26 @@ misc:
 
     private fun stopTunnel() {
         isRunning = false
-        try {
-            if (TProxyService.TProxyIsRunning()) {
-                TProxyService.TProxyStopService()
+        if (hevRunning) {
+            try {
+                if (TProxyService.TProxyIsRunning()) {
+                    TProxyService.TProxyStopService()
+                }
+            } catch (_: Throwable) {
+                // Library gagal dimuat atau sudah berhenti; abaikan.
             }
-        } catch (_: Throwable) {
-            // Library belum termuat atau sudah berhenti; abaikan.
+            hevRunning = false
         }
         xrayProcess?.destroy()
         xrayProcess = null
+        if (tunFd >= 0) {
+            try {
+                ParcelFileDescriptor.adoptFd(tunFd).close()
+            } catch (_: Exception) {
+                // Fd sudah tertutup; abaikan.
+            }
+            tunFd = -1
+        }
         try {
             tunDescriptor?.close()
         } catch (_: Exception) {

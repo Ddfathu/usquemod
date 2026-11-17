@@ -51,7 +51,7 @@ socks5:
   udp: 'udp'
 
 misc:
-  log-level: warn
+  log-level: info
 """
 
         @Volatile
@@ -92,10 +92,30 @@ misc:
             return hevLoadError
         }
 
+        private val logLock = Any()
+        private val logLines = mutableListOf<String>()
+
+        /** Menambah satu baris ke buffer log yang dibaca panel Log di UI. */
+        fun appendLog(line: String) {
+            synchronized(logLock) {
+                logLines.add(line)
+                while (logLines.size > 300) {
+                    logLines.removeAt(0)
+                }
+            }
+        }
+
+        fun logText(): String = synchronized(logLock) { logLines.joinToString("\n") }
+
+        fun clearLog() {
+            synchronized(logLock) { logLines.clear() }
+        }
+
         fun status(): Map<String, Any?> =
             mapOf(
                 "running" to isRunning,
                 "error" to lastError,
+                "log" to logText(),
             )
     }
 
@@ -141,6 +161,8 @@ misc:
     private fun startTunnel(configJson: String, label: String) {
         stopTunnel()
         lastError = null
+        clearLog()
+        appendLog("[app] Memulai mode Inject: $label")
         thread(name = "xray-vpn-start") {
             try {
                 val dir = File(filesDir, "xray").apply { mkdirs() }
@@ -179,16 +201,10 @@ misc:
                 val process = processBuilder.start()
                 xrayProcess = process
 
-                val output = StringBuilder()
                 thread(name = "xray-output") {
                     try {
                         process.inputStream.bufferedReader().forEachLine { line ->
-                            synchronized(output) {
-                                output.append(line).append('\n')
-                                if (output.length > 8192) {
-                                    output.delete(0, output.length - 8192)
-                                }
-                            }
+                            appendLog(line)
                         }
                     } catch (_: Exception) {
                         // Proses berhenti; pembaca output selesai.
@@ -196,12 +212,13 @@ misc:
                 }
 
                 if (!awaitSocksReady(process)) {
-                    val tail = synchronized(output) { output.toString().trim() }
+                    val tail = logText().trim()
                     throw IllegalStateException(
                         "Xray gagal start." +
                             if (tail.isEmpty()) "" else " Log: ${tail.takeLast(400)}",
                     )
                 }
+                appendLog("[app] Xray berjalan; SOCKS 127.0.0.1:$SOCKS_PORT siap.")
 
                 val vpnBuilder =
                     Builder()
@@ -221,6 +238,7 @@ misc:
                             "VpnService.establish() gagal; izin VPN belum diberikan?",
                         )
                 tunDescriptor = descriptor
+                appendLog("[app] TUN terbentuk: $TUN_ADDRESS/30, DNS 1.1.1.1, MTU $TUN_MTU.")
                 val fd = descriptor.detachFd()
                 tunFd = fd
                 val hevStarted =
@@ -237,9 +255,11 @@ misc:
                 }
                 hevRunning = true
                 isRunning = true
+                appendLog("[app] hev tun2socks aktif — mode Inject tersambung.")
             } catch (error: Throwable) {
                 lastError =
                     "${error.javaClass.simpleName}: ${error.message ?: error.toString()}"
+                appendLog("[app] GAGAL: $lastError")
                 stopTunnel()
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
@@ -264,7 +284,11 @@ misc:
     }
 
     private fun stopTunnel() {
+        val wasActive = isRunning || hevRunning || xrayProcess != null
         isRunning = false
+        if (wasActive) {
+            appendLog("[app] Tunnel dihentikan.")
+        }
         if (hevRunning) {
             try {
                 if (TProxyService.TProxyIsRunning()) {

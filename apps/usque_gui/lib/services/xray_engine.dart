@@ -6,7 +6,7 @@ import 'package:flutter/services.dart';
 /// - `prepare` → izin VpnService (true bila sudah/baru diberikan)
 /// - `start`   → mulai service dengan config JSON hasil [XrayConfig]
 /// - `stop`    → hentikan service
-/// - `status`  → {running: bool, error: String?}
+/// - `status`  → {running: bool, error: String?, log: String}
 abstract final class XrayEngine {
   static const MethodChannel _channel = MethodChannel('com.usque.dfathu/xray');
 
@@ -26,9 +26,13 @@ abstract final class XrayEngine {
     await _channel.invokeMethod<void>('stop');
   }
 
-  static Future<({bool running, String? error})> status() async {
+  static Future<({bool running, String? error, String log})> status() async {
     final raw = await _channel.invokeMethod<Map<dynamic, dynamic>>('status');
-    if (raw == null) return (running: false, error: null);
-    return (running: raw['running'] == true, error: raw['error'] as String?);
+    if (raw == null) return (running: false, error: null, log: '');
+    return (
+      running: raw['running'] == true,
+      error: raw['error'] as String?,
+      log: (raw['log'] as String?) ?? '',
+    );
   }
 }

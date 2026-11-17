@@ -59,6 +59,8 @@ class _InjectScreenState extends State<InjectScreen> {
   bool _xrayRunning = false;
   bool _xrayBusy = false;
   String? _xrayError;
+  String _xrayLog = '';
+  Timer? _logTimer;
 
   bool get _masqueActive {
     final phase = widget.controller?.snapshot.phase;
@@ -75,6 +77,16 @@ class _InjectScreenState extends State<InjectScreen> {
     super.initState();
     _load();
     _refreshXrayStatus();
+    _logTimer = Timer.periodic(
+      const Duration(seconds: 2),
+      (_) => _refreshXrayStatus(),
+    );
+  }
+
+  @override
+  void dispose() {
+    _logTimer?.cancel();
+    super.dispose();
   }
 
   Future<void> _load() async {
@@ -95,6 +107,7 @@ class _InjectScreenState extends State<InjectScreen> {
       setState(() {
         _xrayRunning = status.running;
         _xrayError = status.error;
+        _xrayLog = status.log;
       });
     } on MissingPluginException {
       // Platform tanpa channel Xray (mis. desktop); abaikan.
@@ -355,6 +368,71 @@ class _InjectScreenState extends State<InjectScreen> {
     );
   }
 
+  Widget _logCard(BuildContext context) {
+    final theme = Theme.of(context);
+    return Card(
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        side: BorderSide(color: theme.colorScheme.outlineVariant),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 8, 8, 12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.terminal, size: 18),
+                const SizedBox(width: 8),
+                const Expanded(child: Text('Log Xray')),
+                IconButton(
+                  icon: const Icon(Icons.refresh, size: 20),
+                  tooltip: 'Muat ulang log',
+                  onPressed: _refreshXrayStatus,
+                ),
+                IconButton(
+                  icon: const Icon(Icons.copy_outlined, size: 20),
+                  tooltip: 'Salin log',
+                  onPressed: _xrayLog.isEmpty
+                      ? null
+                      : () async {
+                          await Clipboard.setData(
+                            ClipboardData(text: _xrayLog),
+                          );
+                          if (context.mounted) {
+                            ScaffoldMessenger.of(context).showSnackBar(
+                              const SnackBar(content: Text('Log disalin.')),
+                            );
+                          }
+                        },
+                ),
+              ],
+            ),
+            Container(
+              height: 180,
+              width: double.infinity,
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surfaceContainerHighest,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: SingleChildScrollView(
+                reverse: true,
+                child: SelectableText(
+                  _xrayLog.isEmpty
+                      ? '(log kosong — hubungkan config untuk melihat log)'
+                      : _xrayLog,
+                  style: const TextStyle(fontFamily: 'monospace', fontSize: 11),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -375,6 +453,10 @@ class _InjectScreenState extends State<InjectScreen> {
                 Padding(
                   padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
                   child: _statusCard(context),
+                ),
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 4, 16, 4),
+                  child: _logCard(context),
                 ),
                 Expanded(
                   child: _links.isEmpty

@@ -20,7 +20,11 @@ abstract final class XrayConfig {
   static XrayConfigResult generate(XrayLink link, {int socksPort = 10808}) {
     final warnings = <String>[];
     final config = <String, dynamic>{
-      'log': {'loglevel': 'warning'},
+      'log': {'loglevel': 'info'},
+      'dns': {
+        'servers': ['1.1.1.1', '8.8.8.8'],
+        'queryStrategy': 'UseIPv4',
+      },
       'inbounds': [
         {
           'tag': 'socks-in',
@@ -32,7 +36,11 @@ abstract final class XrayConfig {
       ],
       'outbounds': [
         _outbound(link, warnings),
-        {'tag': 'direct', 'protocol': 'freedom'},
+        {
+          'tag': 'direct',
+          'protocol': 'freedom',
+          'settings': {'domainStrategy': 'UseIPv4'},
+        },
       ],
       'routing': {
         'rules': [
